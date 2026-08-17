@@ -1,0 +1,51 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+
+# CMake and compiled output
+build/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+CTestTestfile.cmake
+Testing/
+*.obj
+*.o
+*.exe
+*.dll
+*.lib
+*.pdb
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.user
+*.suo
+
+# Local Agent and RAG runtime state
+.agent/
+.rag/
+.cache/
+vector_store/
+runtime_data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs and temporary files
+logs/
+tmp/
+temp/
+*.log
+*.tmp
+
+# Windows metadata
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
