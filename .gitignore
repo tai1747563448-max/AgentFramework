@@ -25,6 +25,7 @@ Testing/
 # Editors and IDEs
 .idea/
 .vscode/
+.worktrees/
 *.user
 *.suo
 
