@@ -33,8 +33,12 @@ target_include_directories(dotenv_header_only INTERFACE
 add_library(agent_kernel STATIC
     src/domain/value.cpp
     src/domain/runtime_event.cpp
-    src/application/state_reducer.cpp)
+    src/application/state_reducer.cpp
+    src/adapters/json/value_json.cpp
+    src/adapters/persistence/event_json.cpp
+    src/adapters/persistence/jsonl_event_store.cpp)
 target_include_directories(agent_kernel PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(agent_kernel PUBLIC nlohmann_json::nlohmann_json)
 if(MSVC)
     target_compile_options(agent_kernel PRIVATE /W4 /permissive- /utf-8)
 endif()
@@ -52,3 +56,4 @@ endfunction()
 add_agent_test(domain_primitives_tests tests/domain/value_result_test.cpp)
 add_agent_test(runtime_event_tests tests/domain/runtime_event_test.cpp)
 add_agent_test(state_reducer_tests tests/application/state_reducer_test.cpp)
+add_agent_test(jsonl_event_store_tests tests/adapters/jsonl_event_store_test.cpp)
