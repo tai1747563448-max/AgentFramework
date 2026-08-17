@@ -4,6 +4,8 @@
 #include "domain/runtime_event.h"
 #include "domain/task_state.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 
@@ -45,6 +47,12 @@ private:
     RuntimeResult append_event(std::optional<TaskState>& state,
                                const std::string& task_id,
                                EventPayload payload);
+    RuntimeResult guard_external_call(std::optional<TaskState>& state,
+                                      const std::string& task_id,
+                                      std::int64_t started_at_ms,
+                                      const char* count_budget_name = nullptr,
+                                      std::size_t count = 0,
+                                      std::size_t limit = 0);
 
     ModelClient& model_;
     ToolGateway& tools_;
