@@ -309,7 +309,8 @@ Json model_request_to_json(const ModelRequest& request) {
     return {{"system_prompt", request.system_prompt},
             {"messages", std::move(messages)},
             {"tools", std::move(tools)},
-            {"timeout_ms", request.timeout_ms}};
+            {"timeout_ms", request.timeout_ms},
+            {"evidence", evidence_pack_to_json(request.evidence)}};
 }
 
 ModelRequest model_request_from_json(const Json& json) {
@@ -321,6 +322,7 @@ ModelRequest model_request_from_json(const Json& json) {
     ModelRequest request;
     request.system_prompt = required_string(json, "system_prompt");
     request.timeout_ms = signed_integer(json.at("timeout_ms"));
+    request.evidence = evidence_pack_from_json(json.at("evidence"));
     request.messages.reserve(messages_json.size());
     for (const auto& message : messages_json) {
         request.messages.push_back(message_from_json(message));

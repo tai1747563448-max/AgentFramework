@@ -77,6 +77,8 @@ Domain 保存不依赖基础设施的核心类型：
 - `RuntimeError`；
 - `RuntimeBudgets` 与使用量。
 
+`ModelRequest` 单独保存结构化 `EvidencePack`。Evidence 的 source ID、content、metadata 与顺序不得在 Application 层被压平成伪造的用户消息。
+
 `StateReducer` 是纯函数：给定旧状态和一个合法事件，返回新状态。相同初始状态和相同事件序列必须得到相同最终状态。
 
 ### 5.3 Application
@@ -100,6 +102,8 @@ Domain 保存不依赖基础设施的核心类型：
 #### ModelClient
 
 接受统一的 `ModelRequest`，返回统一的 `ModelResponse`。内部响应必须表达最终文本、工具调用、停止原因、用量和 Provider 请求标识。Provider 的原始 JSON 不进入 Domain。
+
+`ModelRequest` 中的结构化 Evidence 由具体 Provider Adapter 显式映射；RuntimeEngine 只复制持久状态中的 `EvidencePack`，不规定 Provider 文本格式。
 
 #### ToolGateway
 
@@ -234,7 +238,7 @@ runtime_data/tasks/<task_id>/events.jsonl
 1. CLI 接收 Issue、workspace 与预算。
 2. Engine 持久化并应用 `TaskStarted`。
 3. Engine 检查取消与预算，持久化 `ContextPreparationStarted`，再调用 KnowledgeProvider；调用失败时只持久化 `ContextPreparationFailed`，由该事件直接进入 `Failed`。
-4. Engine 持久化 `ContextPrepared`，组装 ModelRequest。
+4. Engine 持久化 `ContextPrepared`，再从当前持久状态组装 ModelRequest：对话消息保持为真实的 user/assistant/tool 对话，EvidencePack 保持结构化并原样复制。
 5. Engine 持久化 `ModelCallStarted`，再调用模型。
 6. 成功响应映射为内部类型并持久化 `ModelCallSucceeded`；协议或调用失败只持久化 `ModelCallFailed`，由该事件直接进入 `Failed`。
 7. 最终文本产生 `TaskCompleted`。

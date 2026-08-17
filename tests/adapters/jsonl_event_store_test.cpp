@@ -67,7 +67,10 @@ agent::ModelRequest request() {
     };
     std::vector<agent::ToolDefinition> tools = {
         {"read_file", u8"读取文件", input_schema}};
-    return {u8"你是编码代理。", std::move(messages), std::move(tools), 30'000};
+    agent::ModelRequest result{
+        u8"你是编码代理。", std::move(messages), std::move(tools), 30'000};
+    result.evidence = evidence();
+    return result;
 }
 
 agent::ToolCall tool_call() {
@@ -202,6 +205,10 @@ TEST_CASE(event_json_uses_the_versioned_wire_keys_and_names) {
     REQUIRE(json.at("event_type") == "model_call_started");
     REQUIRE(json.at("correlation_id") == "corr-4");
     REQUIRE(json.at("payload").at("request").at("timeout_ms") == 30'000);
+    REQUIRE(json.at("payload").at("request").at("evidence").at("items").size() ==
+            1);
+    REQUIRE(json.at("payload").at("request").at("evidence").at("items").at(0)
+                .at("source_id") == u8"源码-一");
 }
 
 TEST_CASE(event_json_rejects_an_unexpected_top_level_key) {

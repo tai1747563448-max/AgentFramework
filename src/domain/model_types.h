@@ -70,6 +70,7 @@ struct ModelRequest {
     std::vector<Message> messages;
     std::vector<ToolDefinition> tools;
     std::int64_t timeout_ms{120'000};
+    EvidencePack evidence;
 };
 
 enum class StopReason { EndTurn, ToolUse, MaxTokens, StopSequence, Unknown };
@@ -125,7 +126,8 @@ inline bool operator==(const EvidencePack& left, const EvidencePack& right) {
 
 inline bool operator==(const ModelRequest& left, const ModelRequest& right) {
     return left.system_prompt == right.system_prompt && left.messages == right.messages &&
-           left.tools == right.tools && left.timeout_ms == right.timeout_ms;
+           left.tools == right.tools && left.timeout_ms == right.timeout_ms &&
+           left.evidence == right.evidence;
 }
 
 inline bool operator==(const ModelResponse& left, const ModelResponse& right) {

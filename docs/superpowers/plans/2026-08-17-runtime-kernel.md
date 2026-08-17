@@ -325,6 +325,8 @@ Expected: compilation fails because `domain/runtime_event.h` does not exist.
 
 Use `std::variant<TextBlock, ToolUseBlock, ToolResultBlock>` for `ContentBlock`. `ToolCall.arguments`, `ToolDefinition.input_schema`, and Evidence metadata use `Value`. `ModelResponse` contains ordered content blocks, `StopReason`, usage counts, and provider request ID.
 
+`ModelRequest` contains a structured `EvidencePack evidence` field in addition to the system prompt, conversation messages, tool definitions, and timeout. Evidence source IDs and metadata remain structured Domain data; Application must not flatten them into a synthetic conversation message.
+
 Use these task structures:
 
 ```cpp
@@ -762,6 +764,8 @@ Implement one private operation that constructs the next sequence, appends the e
 
 For `ModelClient` or `KnowledgeProvider` failures, append only the specific failure event; reducing that event stores its error and directly enters `Failed`. Reserve `TaskFailed` for generic Runtime failures that have no specialized failure event. For a response with no tool calls, concatenate TextBlocks in order; an empty final response becomes `ProtocolFailure`, not a successful empty answer.
 
+Build `ModelRequest` from the current durable state: copy `TaskState::messages` as the actual conversation, copy `TaskState::evidence` unchanged into the structured evidence field, preserve `ToolGateway::definitions()` order, and use the request system prompt and durable model timeout.
+
 - [ ] **Step 4: Run engine and full tests**
 
 Run:
@@ -951,6 +955,8 @@ public:
 `AnthropicConfig` must require nonempty base URL/model/credential, exactly one `CredentialKind`, API version `2023-06-01`, and positive max tokens. Strip one trailing slash from base URL before adding `/v1/messages`.
 
 Map internal TextBlock, ToolUseBlock, and ToolResultBlock explicitly. Reject unknown response block types and responses with no usable content. Map `end_turn`, `tool_use`, `max_tokens`, and `stop_sequence`; preserve unknown stop text as `StopReason::Unknown` plus its raw name in a non-secret field.
+
+Map `ModelRequest::evidence` explicitly at this Provider adapter boundary while preserving source IDs, content, metadata, and order. Do not prescribe or embed a provider text format in RuntimeEngine; the Task 7 adapter tests must define the exact provider request representation.
 
 `CprHttpTransport` maps cpr network errors to `TransportFailure`, timeout to `RequestTimeout`, and successful transport to `HttpResponse`. No adapter error may include request headers, credential values, or raw response body.
 

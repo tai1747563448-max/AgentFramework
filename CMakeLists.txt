@@ -34,6 +34,7 @@ add_library(agent_kernel STATIC
     src/domain/value.cpp
     src/domain/runtime_event.cpp
     src/application/state_reducer.cpp
+    src/application/runtime_engine.cpp
     src/adapters/json/value_json.cpp
     src/adapters/persistence/event_json.cpp
     src/adapters/persistence/jsonl_event_store.cpp)
@@ -56,4 +57,5 @@ endfunction()
 add_agent_test(domain_primitives_tests tests/domain/value_result_test.cpp)
 add_agent_test(runtime_event_tests tests/domain/runtime_event_test.cpp)
 add_agent_test(state_reducer_tests tests/application/state_reducer_test.cpp)
+add_agent_test(runtime_engine_tests tests/application/runtime_engine_test.cpp)
 add_agent_test(jsonl_event_store_tests tests/adapters/jsonl_event_store_test.cpp)
