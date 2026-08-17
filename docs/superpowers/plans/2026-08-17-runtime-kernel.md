@@ -443,7 +443,7 @@ if ((git rev-parse HEAD) -ne $remote) { throw "backup commit mismatch" }
 
 - [ ] **Step 1: Write failing transition and replay tests**
 
-Cover a text-completion trace, a two-tool trace, invalid sequence, invalid task ID, incomplete tools, and terminal-state rejection. The core assertions are:
+Cover a text-completion trace, a two-tool trace, invalid sequence, invalid task ID, incomplete tools, terminal-state rejection, and each specialized failure directly entering `Failed` with its exact `terminal_error`. The core assertions are:
 
 ```cpp
 TEST_CASE(replay_text_completion_is_deterministic) {
@@ -484,16 +484,16 @@ Enforce this exact transition table:
 | `TaskStarted` | no state, sequence 1 | create `Created`, add initial user text message |
 | `ContextPreparationStarted` | `Created` or fully processed `AwaitingTool` | flush all pending tool results into one user message, clear pending fields, set `PreparingContext` |
 | `ContextPrepared` | `PreparingContext` | replace EvidencePack, set `AwaitingModel` |
-| `ContextPreparationFailed` | `PreparingContext` | retain state until `TaskFailed` |
+| `ContextPreparationFailed` | `PreparingContext` | store error and set `Failed` |
 | `ModelCallStarted` | `AwaitingModel` | increment model rounds |
 | `ModelCallSucceeded` with tools | `AwaitingModel` | append assistant message, copy ordered calls, set `AwaitingTool` |
 | `ModelCallSucceeded` without tools | `AwaitingModel` | append assistant message, retain `AwaitingModel` |
-| `ModelCallFailed` | `AwaitingModel` | retain state until `TaskFailed` |
+| `ModelCallFailed` | `AwaitingModel` | store error and set `Failed` |
 | `ToolCallStarted` | `AwaitingTool`, call equals next pending call, no active call | set `active_tool_call_id`, increment tool calls |
 | `ToolCallSucceeded` | ID matches `active_tool_call_id` | append result, clear active ID, advance `next_tool_index` |
-| `ToolCallFailed` | ID matches `active_tool_call_id` | clear active ID, retain state until `TaskFailed` |
+| `ToolCallFailed` | ID matches `active_tool_call_id` | clear active ID, store error, and set `Failed` |
 | `TaskCompleted` | `AwaitingModel`, no tool calls in last response | set final text and `Completed` |
-| `TaskFailed` | any nonterminal state | store error and set `Failed` |
+| `TaskFailed` | any nonterminal state | for a generic Runtime failure with no specialized failure event, store error and set `Failed` |
 | `TaskBudgetExceeded` | any nonterminal state | store error and set `BudgetExceeded` |
 | `TaskCancelled` | any nonterminal state | store error and set `Cancelled` |
 
@@ -725,7 +725,7 @@ TEST_CASE(event_store_failure_does_not_apply_event) {
 }
 ```
 
-Add KnowledgeProvider and ModelClient failure tests that require `ContextPreparationFailed -> TaskFailed` and `ModelCallFailed -> TaskFailed`.
+Add KnowledgeProvider and ModelClient failure tests that require one specialized terminal event: `ContextPreparationFailed` or `ModelCallFailed`, respectively. Each event must be the final event, set `TaskStatus::Failed`, preserve the exact error in `terminal_error`, and have no following `TaskFailed`.
 
 The test file owns an `EngineFixture` containing Fake Model, Tool, Knowledge, EventStore, Clock, IDs, Cancellation, and RuntimeEngine in declaration order. `fixtures::engine_with` returns that owning fixture; it must not return an engine holding references to destroyed temporaries.
 
@@ -760,7 +760,7 @@ public:
 
 Implement one private operation that constructs the next sequence, appends the event, and only then calls `reduce_event`. On append failure, return the last durable state plus fatal `PersistenceFailure`; do not attempt to record another event.
 
-For `ModelClient` or `KnowledgeProvider` failures, append the specific failure event and then `TaskFailed`. For a response with no tool calls, concatenate TextBlocks in order; an empty final response becomes `ProtocolFailure`, not a successful empty answer.
+For `ModelClient` or `KnowledgeProvider` failures, append only the specific failure event; reducing that event stores its error and directly enters `Failed`. Reserve `TaskFailed` for generic Runtime failures that have no specialized failure event. For a response with no tool calls, concatenate TextBlocks in order; an empty final response becomes `ProtocolFailure`, not a successful empty answer.
 
 - [ ] **Step 4: Run engine and full tests**
 
@@ -799,7 +799,7 @@ if ((git rev-parse HEAD) -ne $remote) { throw "backup commit mismatch" }
 
 - [ ] **Step 1: Add failing tests for tool and stop behavior**
 
-Add exact cases for two tools, a returned error result, ToolGateway infrastructure failure, model-round limit, tool-call limit, wall-time limit, cancellation, and no external call after terminal state:
+Add exact cases for two tools, a returned error result, ToolGateway infrastructure failure, model-round limit, tool-call limit, wall-time limit, cancellation, and no external call after terminal state. The infrastructure-failure case must end with exactly one `ToolCallFailed`, no following `TaskFailed`, `TaskStatus::Failed`, and the exact gateway error in `terminal_error`:
 
 ```cpp
 TEST_CASE(engine_executes_multiple_tools_in_response_order) {
@@ -842,7 +842,7 @@ For tool responses:
 1. preserve `ToolUseBlock` order;
 2. before each call append `ToolCallStarted` and increment usage through the reducer;
 3. on `Result<ToolResult>::success`, append `ToolCallSucceeded` even when `is_error == true`;
-4. on gateway `Result` failure, append `ToolCallFailed`, append `TaskFailed`, and stop;
+4. on gateway `Result` failure, append only `ToolCallFailed`; its reduction stores the error, enters `Failed`, and the engine stops;
 5. after all results, append `ContextPreparationStarted`; the reducer flushes all pending results into one user message;
 6. retrieve context and continue to the next model round.
 

@@ -70,6 +70,8 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                     return invalid_transition(
                         "context failure requires preparing context state");
                 }
+                state.terminal_error = typed_payload.error;
+                state.status = TaskStatus::Failed;
                 return Result<void>::success();
             } else if constexpr (std::is_same_v<Payload, ModelCallStartedPayload>) {
                 if (state.status != TaskStatus::AwaitingModel) {
@@ -106,6 +108,8 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                     return invalid_transition(
                         "model call failure requires awaiting model state");
                 }
+                state.terminal_error = typed_payload.error;
+                state.status = TaskStatus::Failed;
                 return Result<void>::success();
             } else if constexpr (std::is_same_v<Payload, ToolCallStartedPayload>) {
                 if (state.status != TaskStatus::AwaitingTool ||
@@ -138,6 +142,8 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                         "tool failure does not match the active tool call");
                 }
                 state.active_tool_call_id.reset();
+                state.terminal_error = typed_payload.error;
+                state.status = TaskStatus::Failed;
                 return Result<void>::success();
             } else if constexpr (std::is_same_v<Payload, TaskCompletedPayload>) {
                 if (state.status != TaskStatus::AwaitingModel ||

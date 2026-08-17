@@ -245,24 +245,67 @@ TEST_CASE(reducer_rejects_event_after_terminal_state) {
     REQUIRE(result.error().code == agent::ErrorCode::InvalidTransition);
 }
 
-TEST_CASE(failure_boundary_retains_state_until_task_failed) {
+TEST_CASE(context_failure_is_terminal_and_rejects_continuation) {
     auto events = fixtures::completed_text_trace("task-1", "fix warning", "done");
     events.resize(2);
     const agent::RuntimeError provider_error{
         agent::ErrorCode::DependencyUnavailable, "knowledge unavailable", true};
     events.push_back(fixtures::event(
         "task-1", 3, agent::ContextPreparationFailedPayload{provider_error}));
-    auto retained = agent::replay_events(events);
-    REQUIRE(retained.has_value());
-    REQUIRE(retained.value().status == agent::TaskStatus::PreparingContext);
-    REQUIRE(!retained.value().terminal_error.has_value());
-    events.push_back(fixtures::event(
-        "task-1", 4, agent::TaskFailedPayload{provider_error}));
     auto failed = agent::replay_events(events);
     REQUIRE(failed.has_value());
     REQUIRE(failed.value().status == agent::TaskStatus::Failed);
     REQUIRE(failed.value().terminal_error ==
             std::optional<agent::RuntimeError>{provider_error});
+
+    auto continuation = agent::reduce_event(
+        failed.value(), fixtures::context_prepared("task-1", 4, "source-2"));
+    REQUIRE(!continuation.has_value());
+    REQUIRE(continuation.error().code == agent::ErrorCode::InvalidTransition);
+}
+
+TEST_CASE(model_failure_is_terminal_and_rejects_continuation) {
+    const auto trace = fixtures::completed_text_trace(
+        "task-model-failure", "fix warning", "done");
+    auto events = std::vector<agent::RuntimeEvent>(trace.begin(), trace.begin() + 4);
+    const agent::RuntimeError model_error{
+        agent::ErrorCode::RequestTimeout, "model request timed out", true};
+    events.push_back(fixtures::event(
+        "task-model-failure", 5, agent::ModelCallFailedPayload{model_error}));
+    auto failed = agent::replay_events(events);
+    REQUIRE(failed.has_value());
+    REQUIRE(failed.value().status == agent::TaskStatus::Failed);
+    REQUIRE(failed.value().terminal_error ==
+            std::optional<agent::RuntimeError>{model_error});
+
+    auto continuation = agent::reduce_event(
+        failed.value(),
+        fixtures::model_succeeded("task-model-failure", 6,
+                                  {agent::TextBlock{"late response"}},
+                                  agent::StopReason::EndTurn));
+    REQUIRE(!continuation.has_value());
+    REQUIRE(continuation.error().code == agent::ErrorCode::InvalidTransition);
+}
+
+TEST_CASE(tool_failure_is_terminal_and_rejects_retry) {
+    const auto trace = fixtures::completed_two_tool_trace("task-tool-failure");
+    auto events = std::vector<agent::RuntimeEvent>(trace.begin(), trace.begin() + 6);
+    const agent::RuntimeError tool_error{
+        agent::ErrorCode::DependencyUnavailable, "tool gateway unavailable", true};
+    events.push_back(fixtures::event(
+        "task-tool-failure", 7,
+        agent::ToolCallFailedPayload{"call-1", tool_error}));
+    auto failed = agent::replay_events(events);
+    REQUIRE(failed.has_value());
+    REQUIRE(failed.value().status == agent::TaskStatus::Failed);
+    REQUIRE(failed.value().terminal_error ==
+            std::optional<agent::RuntimeError>{tool_error});
+
+    auto retry = agent::reduce_event(
+        failed.value(), fixtures::tool_started(
+                            "task-tool-failure", 8, fixtures::first_call()));
+    REQUIRE(!retry.has_value());
+    REQUIRE(retry.error().code == agent::ErrorCode::InvalidTransition);
 }
 
 TEST_CASE(first_event_must_be_version_one_task_started_at_sequence_one) {
