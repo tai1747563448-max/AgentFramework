@@ -30,7 +30,9 @@ add_library(dotenv_header_only INTERFACE)
 target_include_directories(dotenv_header_only INTERFACE
     "${dotenv_source_SOURCE_DIR}/include/laserpants/dotenv")
 
-add_library(agent_kernel STATIC src/domain/value.cpp)
+add_library(agent_kernel STATIC
+    src/domain/value.cpp
+    src/domain/runtime_event.cpp)
 target_include_directories(agent_kernel PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 if(MSVC)
     target_compile_options(agent_kernel PRIVATE /W4 /permissive- /utf-8)
@@ -47,3 +49,4 @@ function(add_agent_test target source)
     add_test(NAME ${target} COMMAND ${target})
 endfunction()
 add_agent_test(domain_primitives_tests tests/domain/value_result_test.cpp)
+add_agent_test(runtime_event_tests tests/domain/runtime_event_test.cpp)
