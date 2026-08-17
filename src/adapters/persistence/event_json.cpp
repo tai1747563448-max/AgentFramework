@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -500,6 +501,17 @@ nlohmann::json event_to_json(const RuntimeEvent& event) {
 Result<RuntimeEvent> event_from_json(const nlohmann::json& json) {
     try {
         require_object(json);
+        static constexpr std::array<const char*, 7> required_keys = {
+            "schema_version", "sequence", "task_id", "timestamp",
+            "event_type", "correlation_id", "payload"};
+        if (json.size() != required_keys.size()) {
+            throw DecodeError("unexpected top-level event keys");
+        }
+        for (const auto* key : required_keys) {
+            if (!json.contains(key)) {
+                throw DecodeError("missing top-level event key");
+            }
+        }
         const auto schema_version =
             unsigned_integer<std::uint32_t>(json.at("schema_version"));
         if (schema_version != 1) {

@@ -204,6 +204,23 @@ TEST_CASE(event_json_uses_the_versioned_wire_keys_and_names) {
     REQUIRE(json.at("payload").at("request").at("timeout_ms") == 30'000);
 }
 
+TEST_CASE(event_json_rejects_an_unexpected_top_level_key) {
+    auto json = agent::event_to_json(
+        fixtures::task_started("extra-key-task", 1, "issue"));
+    json["unexpected_extension"] = true;
+
+    const auto decoded = agent::event_from_json(json);
+    test::ScopedTempDir temp("jsonl-extra-top-level-key");
+    const auto file = temp.write_text("events.jsonl", json.dump() + "\n");
+    agent::JsonlEventStore store(temp.path());
+    const auto loaded = store.read_file(file);
+
+    REQUIRE(!decoded.has_value());
+    REQUIRE(decoded.error().code == agent::ErrorCode::PersistenceFailure);
+    REQUIRE(!loaded.has_value());
+    REQUIRE(loaded.error().code == agent::ErrorCode::PersistenceFailure);
+}
+
 TEST_CASE(event_json_preserves_the_full_unsigned_sequence_range) {
     auto original = fixtures::task_started("wide-sequence", 1, "issue");
     original.sequence = std::numeric_limits<std::uint64_t>::max();
