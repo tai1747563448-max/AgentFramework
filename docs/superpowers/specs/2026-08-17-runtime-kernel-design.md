@@ -161,6 +161,7 @@ Domain 保存不依赖基础设施的核心类型：
 - `TaskStarted` 创建初始 `Created` 状态。
 - `ContextPreparationStarted` 使 `Created` 或完成一轮工具处理后的 `AwaitingTool` 进入 `PreparingContext`。
 - `ContextPrepared` 使 `PreparingContext` 进入 `AwaitingModel`。
+- `ContextPreparationFailed` 记录 KnowledgeProvider 调用失败，随后由 `TaskFailed` 进入 `Failed`。
 - `ModelCallStarted` 表示模型调用在途，状态保持 `AwaitingModel`。
 - `ModelCallSucceeded` 返回工具调用时进入 `AwaitingTool`；返回最终文本时保持 `AwaitingModel`，随后由 `TaskCompleted` 进入 `Completed`。
 - `ModelCallFailed` 记录调用失败，随后由 `TaskFailed` 进入 `Failed`。
@@ -190,6 +191,7 @@ Domain 保存不依赖基础设施的核心类型：
 - `TaskStarted`；
 - `ContextPreparationStarted`；
 - `ContextPrepared`；
+- `ContextPreparationFailed`；
 - `ModelCallStarted`；
 - `ModelCallSucceeded`；
 - `ModelCallFailed`；
@@ -231,7 +233,7 @@ runtime_data/tasks/<task_id>/events.jsonl
 
 1. CLI 接收 Issue、workspace 与预算。
 2. Engine 持久化并应用 `TaskStarted`。
-3. Engine 检查取消与预算，持久化 `ContextPreparationStarted`，再调用 KnowledgeProvider。
+3. Engine 检查取消与预算，持久化 `ContextPreparationStarted`，再调用 KnowledgeProvider；调用失败时依次持久化 `ContextPreparationFailed` 和 `TaskFailed`。
 4. Engine 持久化 `ContextPrepared`，组装 ModelRequest。
 5. Engine 持久化 `ModelCallStarted`，再调用模型。
 6. 成功响应映射为内部类型并持久化 `ModelCallSucceeded`；协议或调用失败依次持久化 `ModelCallFailed` 和 `TaskFailed`。
@@ -278,7 +280,7 @@ Runtime 使用结构化错误码，不通过解析异常文本决定控制流。
 
 Adapter 在边界捕获库异常并映射为上述内部错误。RuntimeEngine 决定状态转移；Adapter 不直接修改 TaskState。
 
-模型非 2xx、超时、无法解析响应或缺少必需字段均先记录 `ModelCallFailed`，再记录 `TaskFailed` 并进入 `Failed`。ToolGateway 基础设施错误同样先记录 `ToolCallFailed`，再记录 `TaskFailed`。EventStore 失败是特殊情况：由于无法可靠写入终态事件，Engine 立即停止并通过 CLI 非零退出码报告。
+KnowledgeProvider 基础设施错误先记录 `ContextPreparationFailed`，再记录 `TaskFailed`。模型非 2xx、超时、无法解析响应或缺少必需字段均先记录 `ModelCallFailed`，再记录 `TaskFailed` 并进入 `Failed`。ToolGateway 基础设施错误同样先记录 `ToolCallFailed`，再记录 `TaskFailed`。EventStore 失败是特殊情况：由于无法可靠写入终态事件，Engine 立即停止并通过 CLI 非零退出码报告。
 
 CLI 输出错误码、task_id 和可操作摘要，不输出密钥、完整认证头或不受控的大型响应正文。
 
@@ -316,6 +318,7 @@ agent verify-log --events <events.jsonl>
 - 普通工具错误作为 `ToolResult{is_error=true}` 返回模型，并仍记录 `ToolCallSucceeded`；
 - ToolGateway 基础设施失败记录 `ToolCallFailed` 和 `TaskFailed`；
 - Provider、KnowledgeProvider 和 ToolGateway 基础设施失败；
+- KnowledgeProvider 失败按顺序记录 `ContextPreparationFailed` 和 `TaskFailed`；
 - 最大模型轮次、工具次数和时间预算；
 - 用户取消；
 - EventStore append 失败时状态不先行改变；
