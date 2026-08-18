@@ -5,6 +5,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+option(AGENT_ENABLE_LIVE_TESTS "Enable credentialed provider smoke test" OFF)
+
 include(FetchContent)
 FetchContent_Declare(
     nlohmann_json
@@ -91,3 +93,21 @@ add_agent_test(jsonl_event_store_tests tests/adapters/jsonl_event_store_test.cpp
 add_agent_test(anthropic_adapter_tests tests/adapters/anthropic_messages_client_test.cpp)
 add_agent_test(cli_tests tests/cli/cli_app_test.cpp)
 target_link_libraries(cli_tests PRIVATE agent_runtime)
+add_agent_test(runtime_integration_tests tests/integration/runtime_integration_test.cpp)
+target_link_libraries(runtime_integration_tests PRIVATE agent_runtime)
+
+if(AGENT_ENABLE_LIVE_TESTS)
+    add_executable(anthropic_live_smoke tests/live/anthropic_live_smoke.cpp)
+    target_link_libraries(anthropic_live_smoke PRIVATE agent_runtime)
+    if(WIN32)
+        add_custom_command(TARGET anthropic_live_smoke POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_RUNTIME_DLLS:anthropic_live_smoke>
+                $<TARGET_FILE_DIR:anthropic_live_smoke>
+            COMMAND_EXPAND_LISTS)
+    endif()
+    if(MSVC)
+        target_compile_options(anthropic_live_smoke PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME anthropic_live_smoke COMMAND anthropic_live_smoke)
+endif()
