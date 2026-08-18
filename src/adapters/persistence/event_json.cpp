@@ -4,11 +4,12 @@
 
 #include <nlohmann/json.hpp>
 
-#include <array>
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 
@@ -31,6 +32,20 @@ void require_object(const Json& json) {
 void require_array(const Json& json) {
     if (!json.is_array()) {
         throw DecodeError("expected array");
+    }
+}
+
+void require_exact_keys(
+    const Json& json,
+    std::initializer_list<std::string_view> expected_keys) {
+    require_object(json);
+    if (json.size() != expected_keys.size()) {
+        throw DecodeError("unexpected object keys");
+    }
+    for (const auto key : expected_keys) {
+        if (!json.contains(std::string(key))) {
+            throw DecodeError("missing object key");
+        }
     }
 }
 
@@ -122,7 +137,7 @@ Json runtime_error_to_json(const RuntimeError& error) {
 }
 
 RuntimeError runtime_error_from_json(const Json& json) {
-    require_object(json);
+    require_exact_keys(json, {"code", "message", "retryable"});
     return {error_code_from_name(required_string(json, "code")),
             required_string(json, "message"),
             required_bool(json, "retryable")};
@@ -171,7 +186,7 @@ Json tool_definition_to_json(const ToolDefinition& definition) {
 }
 
 ToolDefinition tool_definition_from_json(const Json& json) {
-    require_object(json);
+    require_exact_keys(json, {"name", "description", "input_schema"});
     auto schema = value_from_json(json.at("input_schema"));
     if (!schema.has_value()) {
         throw DecodeError("invalid tool input schema");
@@ -187,7 +202,7 @@ Json tool_call_to_json(const ToolCall& call) {
 }
 
 ToolCall tool_call_from_json(const Json& json) {
-    require_object(json);
+    require_exact_keys(json, {"id", "name", "arguments"});
     auto arguments = value_from_json(json.at("arguments"));
     if (!arguments.has_value()) {
         throw DecodeError("invalid tool call arguments");
@@ -203,7 +218,7 @@ Json tool_result_to_json(const ToolResult& result) {
 }
 
 ToolResult tool_result_from_json(const Json& json) {
-    require_object(json);
+    require_exact_keys(json, {"tool_call_id", "content", "is_error"});
     return {required_string(json, "tool_call_id"),
             required_string(json, "content"), required_bool(json, "is_error")};
 }
@@ -228,12 +243,15 @@ ContentBlock content_block_from_json(const Json& json) {
     require_object(json);
     const auto type = required_string(json, "type");
     if (type == "text") {
+        require_exact_keys(json, {"type", "text"});
         return TextBlock{required_string(json, "text")};
     }
     if (type == "tool_use") {
+        require_exact_keys(json, {"type", "call"});
         return ToolUseBlock{tool_call_from_json(json.at("call"))};
     }
     if (type == "tool_result") {
+        require_exact_keys(json, {"type", "result"});
         return ToolResultBlock{tool_result_from_json(json.at("result"))};
     }
     throw DecodeError("unknown content block type");
@@ -263,7 +281,7 @@ Json message_to_json(const Message& message) {
 }
 
 Message message_from_json(const Json& json) {
-    require_object(json);
+    require_exact_keys(json, {"role", "content"});
     return {role_from_name(required_string(json, "role")),
             content_from_json(json.at("content"))};
 }
@@ -279,13 +297,13 @@ Json evidence_pack_to_json(const EvidencePack& evidence) {
 }
 
 EvidencePack evidence_pack_from_json(const Json& json) {
-    require_object(json);
+    require_exact_keys(json, {"items"});
     const auto& items_json = json.at("items");
     require_array(items_json);
     EvidencePack pack;
     pack.items.reserve(items_json.size());
     for (const auto& item : items_json) {
-        require_object(item);
+        require_exact_keys(item, {"source_id", "content", "metadata"});
         auto metadata = value_from_json(item.at("metadata"));
         if (!metadata.has_value()) {
             throw DecodeError("invalid evidence metadata");
@@ -314,7 +332,8 @@ Json model_request_to_json(const ModelRequest& request) {
 }
 
 ModelRequest model_request_from_json(const Json& json) {
-    require_object(json);
+    require_exact_keys(
+        json, {"system_prompt", "messages", "tools", "timeout_ms", "evidence"});
     const auto& messages_json = json.at("messages");
     const auto& tools_json = json.at("tools");
     require_array(messages_json);
@@ -322,6 +341,9 @@ ModelRequest model_request_from_json(const Json& json) {
     ModelRequest request;
     request.system_prompt = required_string(json, "system_prompt");
     request.timeout_ms = signed_integer(json.at("timeout_ms"));
+    if (request.timeout_ms <= 0) {
+        throw DecodeError("model timeout must be positive");
+    }
     request.evidence = evidence_pack_from_json(json.at("evidence"));
     request.messages.reserve(messages_json.size());
     for (const auto& message : messages_json) {
@@ -344,7 +366,9 @@ Json model_response_to_json(const ModelResponse& response) {
 }
 
 ModelResponse model_response_from_json(const Json& json) {
-    require_object(json);
+    require_exact_keys(
+        json, {"content", "stop_reason", "raw_stop_reason", "input_tokens",
+               "output_tokens", "provider_request_id"});
     return {content_from_json(json.at("content")),
             stop_reason_from_name(required_string(json, "stop_reason")),
             required_string(json, "raw_stop_reason"),
@@ -361,11 +385,18 @@ Json budgets_to_json(const RuntimeBudgets& budgets) {
 }
 
 RuntimeBudgets budgets_from_json(const Json& json) {
-    require_object(json);
-    return {unsigned_integer<std::size_t>(json.at("max_model_rounds")),
-            unsigned_integer<std::size_t>(json.at("max_tool_calls")),
-            signed_integer(json.at("max_task_time_ms")),
-            signed_integer(json.at("model_timeout_ms"))};
+    require_exact_keys(
+        json, {"max_model_rounds", "max_tool_calls", "max_task_time_ms",
+               "model_timeout_ms"});
+    RuntimeBudgets budgets{
+        unsigned_integer<std::size_t>(json.at("max_model_rounds")),
+        unsigned_integer<std::size_t>(json.at("max_tool_calls")),
+        signed_integer(json.at("max_task_time_ms")),
+        signed_integer(json.at("model_timeout_ms"))};
+    if (!has_positive_runtime_budgets(budgets)) {
+        throw DecodeError("runtime budgets must be positive");
+    }
+    return budgets;
 }
 
 const char* event_kind_name(EventKind kind) {
@@ -436,52 +467,66 @@ Json payload_to_json(const EventPayload& payload) {
 EventPayload payload_from_json(const std::string& type, const Json& json) {
     require_object(json);
     if (type == "task_started") {
+        require_exact_keys(json, {"issue", "workspace_utf8", "budgets"});
         return TaskStartedPayload{required_string(json, "issue"),
                                   required_string(json, "workspace_utf8"),
                                   budgets_from_json(json.at("budgets"))};
     }
     if (type == "context_preparation_started") {
+        require_exact_keys(json, {});
         return ContextPreparationStartedPayload{};
     }
     if (type == "context_prepared") {
+        require_exact_keys(json, {"evidence"});
         return ContextPreparedPayload{evidence_pack_from_json(json.at("evidence"))};
     }
     if (type == "context_preparation_failed") {
+        require_exact_keys(json, {"error"});
         return ContextPreparationFailedPayload{
             runtime_error_from_json(json.at("error"))};
     }
     if (type == "model_call_started") {
+        require_exact_keys(json, {"request"});
         return ModelCallStartedPayload{model_request_from_json(json.at("request"))};
     }
     if (type == "model_call_succeeded") {
+        require_exact_keys(json, {"response"});
         return ModelCallSucceededPayload{
             model_response_from_json(json.at("response"))};
     }
     if (type == "model_call_failed") {
+        require_exact_keys(json, {"error"});
         return ModelCallFailedPayload{runtime_error_from_json(json.at("error"))};
     }
     if (type == "tool_call_started") {
+        require_exact_keys(json, {"call"});
         return ToolCallStartedPayload{tool_call_from_json(json.at("call"))};
     }
     if (type == "tool_call_succeeded") {
+        require_exact_keys(json, {"result"});
         return ToolCallSucceededPayload{tool_result_from_json(json.at("result"))};
     }
     if (type == "tool_call_failed") {
+        require_exact_keys(json, {"tool_call_id", "error"});
         return ToolCallFailedPayload{required_string(json, "tool_call_id"),
                                      runtime_error_from_json(json.at("error"))};
     }
     if (type == "task_completed") {
+        require_exact_keys(json, {"final_text"});
         return TaskCompletedPayload{required_string(json, "final_text")};
     }
     if (type == "task_failed") {
+        require_exact_keys(json, {"error"});
         return TaskFailedPayload{runtime_error_from_json(json.at("error"))};
     }
     if (type == "task_budget_exceeded") {
+        require_exact_keys(json, {"budget_name", "error"});
         return TaskBudgetExceededPayload{
             required_string(json, "budget_name"),
             runtime_error_from_json(json.at("error"))};
     }
     if (type == "task_cancelled") {
+        require_exact_keys(json, {"reason", "error"});
         return TaskCancelledPayload{required_string(json, "reason"),
                                     runtime_error_from_json(json.at("error"))};
     }
@@ -502,18 +547,9 @@ nlohmann::json event_to_json(const RuntimeEvent& event) {
 
 Result<RuntimeEvent> event_from_json(const nlohmann::json& json) {
     try {
-        require_object(json);
-        static constexpr std::array<const char*, 7> required_keys = {
-            "schema_version", "sequence", "task_id", "timestamp",
-            "event_type", "correlation_id", "payload"};
-        if (json.size() != required_keys.size()) {
-            throw DecodeError("unexpected top-level event keys");
-        }
-        for (const auto* key : required_keys) {
-            if (!json.contains(key)) {
-                throw DecodeError("missing top-level event key");
-            }
-        }
+        require_exact_keys(
+            json, {"schema_version", "sequence", "task_id", "timestamp",
+                   "event_type", "correlation_id", "payload"});
         const auto schema_version =
             unsigned_integer<std::uint32_t>(json.at("schema_version"));
         if (schema_version != 1) {

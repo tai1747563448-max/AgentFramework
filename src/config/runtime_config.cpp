@@ -123,15 +123,92 @@ Result<std::string> dotenv_filename(const std::filesystem::path& path) {
 #endif
 }
 
+#if defined(_WIN32)
+std::optional<std::wstring> utf8_to_wide(const std::string& utf8) {
+    if (utf8.empty() ||
+        utf8.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return std::nullopt;
+    }
+    const auto length = static_cast<int>(utf8.size());
+    const int wide_count = MultiByteToWideChar(
+        CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), length, nullptr, 0);
+    if (wide_count <= 0) {
+        return std::nullopt;
+    }
+    std::wstring wide(static_cast<std::size_t>(wide_count), L'\0');
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(),
+                            length, wide.data(), wide_count) != wide_count) {
+        return std::nullopt;
+    }
+    return wide;
+}
+
+std::optional<std::string> wide_to_utf8(const std::wstring& wide) {
+    if (wide.empty()) {
+        return std::string{};
+    }
+    if (wide.size() >
+        static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return std::nullopt;
+    }
+    const auto length = static_cast<int>(wide.size());
+    const int byte_count = WideCharToMultiByte(
+        CP_UTF8, WC_ERR_INVALID_CHARS, wide.data(), length, nullptr, 0,
+        nullptr, nullptr);
+    if (byte_count <= 0) {
+        return std::nullopt;
+    }
+    std::string utf8(static_cast<std::size_t>(byte_count), '\0');
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide.data(), length,
+                            utf8.data(), byte_count, nullptr,
+                            nullptr) != byte_count) {
+        return std::nullopt;
+    }
+    return utf8;
+}
+#endif
+
 }  // namespace
 
 std::optional<std::string> ProcessEnvironment::get(
     const std::string& name) const {
+#if defined(_WIN32)
+    const auto wide_name = utf8_to_wide(name);
+    if (!wide_name.has_value()) {
+        return std::nullopt;
+    }
+    SetLastError(ERROR_SUCCESS);
+    DWORD required = GetEnvironmentVariableW(wide_name->c_str(), nullptr, 0);
+    if (required == 0) {
+        if (GetLastError() == ERROR_ENVVAR_NOT_FOUND) {
+            return std::nullopt;
+        }
+        return std::string{};
+    }
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        std::wstring wide_value(static_cast<std::size_t>(required), L'\0');
+        const DWORD written = GetEnvironmentVariableW(
+            wide_name->c_str(), wide_value.data(), required);
+        if (written == 0) {
+            if (GetLastError() == ERROR_ENVVAR_NOT_FOUND) {
+                return std::nullopt;
+            }
+            return std::string{};
+        }
+        if (written < required) {
+            wide_value.resize(written);
+            return wide_to_utf8(wide_value);
+        }
+        required = written + 1;
+    }
+    return std::nullopt;
+#else
     const char* value = std::getenv(name.c_str());
     if (value == nullptr) {
         return std::nullopt;
     }
     return std::string(value);
+#endif
 }
 
 Result<RuntimeConfig> load_runtime_config(const Environment& environment) {

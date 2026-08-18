@@ -14,6 +14,7 @@
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,6 +27,29 @@ int run_agent(std::vector<std::string> args) {
         if (!startup.has_value()) {
             std::cerr << startup.error().message << '\n';
             return agent::ExitCode::InvalidInputOrConfig;
+        }
+        if (startup.value().command_args.size() > 1 &&
+            startup.value().command_args[1] == "verify-log") {
+            agent::JsonlEventStore local_events(std::filesystem::path{});
+            agent::RunCommand unavailable_run = [](const agent::RunRequest&) {
+                return agent::RuntimeResult{
+                    std::nullopt,
+                    agent::RuntimeError{agent::ErrorCode::InvalidInput,
+                                        "run command is unavailable", false}};
+            };
+            agent::VerifyCommand verify =
+                [&](const std::filesystem::path& path) {
+                    auto loaded = local_events.read_file(path);
+                    if (!loaded.has_value()) {
+                        return agent::Result<agent::TaskState>::failure(
+                            {agent::ErrorCode::PersistenceFailure,
+                             "event log validation failed", false});
+                    }
+                    return agent::replay_events(loaded.value());
+                };
+            agent::CliApp app(std::move(unavailable_run), std::move(verify),
+                              std::cout, std::cerr);
+            return app.execute(startup.value().command_args);
         }
         if (startup.value().env_file.has_value()) {
             const auto loaded =

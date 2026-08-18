@@ -166,8 +166,8 @@ Domain 保存不依赖基础设施的核心类型：
 - `ContextPreparationStarted` 使 `Created` 或完成一轮工具处理后的 `AwaitingTool` 进入 `PreparingContext`。
 - `ContextPrepared` 使 `PreparingContext` 进入 `AwaitingModel`。
 - `ContextPreparationFailed` 记录 KnowledgeProvider 调用失败，将错误写入 `terminal_error` 并直接进入 `Failed`。
-- `ModelCallStarted` 表示模型调用在途，状态保持 `AwaitingModel`。
-- `ModelCallSucceeded` 返回工具调用时进入 `AwaitingTool`；返回最终文本时保持 `AwaitingModel`，随后由 `TaskCompleted` 进入 `Completed`。
+- `ModelCallStarted` 要求当前没有模型调用在途，将 `model_call_in_flight` 从 false 置为 true 并增加模型轮次；重复 start 非法。
+- `ModelCallSucceeded` 和 `ModelCallFailed` 都要求已有模型调用在途并清除该标志；没有 start 的结果事件非法。成功返回工具调用时进入 `AwaitingTool`；接受终止文本时保持 `AwaitingModel`，随后由 `TaskCompleted` 进入 `Completed`。
 - `ModelCallFailed` 记录调用失败，将错误写入 `terminal_error` 并直接进入 `Failed`。
 - `ToolCallStarted`、`ToolCallSucceeded` 和 `ToolCallFailed` 记录单个工具调用边界；ToolGateway 基础设施失败由 `ToolCallFailed` 写入 `terminal_error` 并直接进入 `Failed`。
 - `TaskBudgetExceeded` 和 `TaskCancelled` 分别进入对应终态。
@@ -189,6 +189,8 @@ Domain 保存不依赖基础设施的核心类型：
 - `payload`。
 
 `sequence` 从 1 开始，在单个任务内连续且严格递增。`schema_version` 用于后续兼容，不在第一阶段实现迁移系统。
+
+`task_id` 固定为 `task-` 加 32 个小写十六进制字符；Reducer 的首事件和持久化边界都执行同一策略。持久化路径规范化后必须位于 `<runtime_root>/tasks` 下。
 
 ### 7.2 主要事件
 
@@ -223,7 +225,11 @@ Domain 保存不依赖基础设施的核心类型：
 
 若 append 或 flush 失败，该事件不得应用到内存状态。因为 EventStore 本身不可用，Runtime 只能向 CLI 返回 `PersistenceFailure`；不能假装已经持久化一个 `TaskFailed` 事件。
 
+“验证事件合法”由对当前状态副本的非变异 preview reduce 完成；只有 preview 成功才允许 append，append 成功后直接提交已验证的下一状态。这样既不持久化非法事件，也不在持久化成功前改变 live `TaskState`。
+
 第一阶段对缺行、重复 sequence、未知 schema、非法 JSON 或非法状态转移只报告验证失败，不自动修复或截断日志。
+
+事件 envelope 与所有 schema-owned 嵌套记录都执行精确 key 集校验，包括 payload、错误、预算、消息/内容块、模型请求/响应、工具与证据记录；工具 schema/arguments 与 evidence metadata 中的 provider-neutral `Value` object 仍允许任意用户键，工具结果字符串内容也不被解释为 schema record。
 
 ### 7.4 文件位置
 
@@ -258,6 +264,8 @@ runtime_data/tasks/<task_id>/events.jsonl
 
 每次知识、模型或工具外部调用前检查相应预算。达到预算后写入 `TaskBudgetExceeded`，不再发起调用。用户取消写入 `TaskCancelled`。终态写入后 Engine 必须立即停止。
 
+停止原因与内容严格绑定：`ToolUse` 至少包含一个 `ToolUseBlock`（可同时含有有序文本）；`EndTurn`/`StopSequence` 只能包含非空拼接文本且不得含工具，并且 `TaskCompleted.final_text` 必须精确等于该响应文本；无工具的 `MaxTokens` 先接受成功响应再以固定、非秘密的 `BudgetExceeded` 错误终止，不得完成。未知或内容不一致的停止原因直接记录 `ModelCallFailed` 协议失败。
+
 第一阶段不做自动重试。请求开始但结果未知的情况保留在事件日志中，由后续 Recovery 子项目定义处理策略。
 
 ## 10. 配置与密钥
@@ -288,6 +296,8 @@ KnowledgeProvider 基础设施错误只记录 `ContextPreparationFailed`。模�
 
 CLI 输出错误码、task_id 和可操作摘要，不输出密钥、完整认证头或不受控的大型响应正文。
 
+成功模型文本通过 UTF-8 感知的终端 renderer 输出：保留可打印 Unicode、换行与制表符，转义 C0、DEL、ESC、NUL、C1 与非法 UTF-8 字节，并在不拆分 UTF-8 的前提下将 truncation marker 前的渲染内容限制为最多 8192 字节。
+
 ## 12. CLI
 
 第一阶段提供两个行为：
@@ -298,6 +308,8 @@ agent verify-log --events <events.jsonl>
 ```
 
 `run` 执行一个前台任务并实时显示脱敏状态事件。`verify-log` 读取事件、验证 sequence 和状态转移，并输出重放后的终态。
+
+精确的 `verify-log --events <path>` 在命令分派后只组合本地读取/重放路径，不加载 env file、Provider 配置、HTTP transport 或 model client；`verify-log` 与 `--env-file` 的组合是非法输入。
 
 稳定退出码至少区分：成功、输入/配置错误、任务失败、预算结束、用户取消和持久化失败。具体数字在实施计划中固定，并由 CLI 测试锁定。
 

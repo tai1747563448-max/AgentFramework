@@ -64,15 +64,16 @@ RuntimeResult RuntimeEngine::append_event(std::optional<TaskState>& state,
     RuntimeEvent event{1, sequence, task_id, clock_.now_utc(),
                        ids_.next_correlation_id(), std::move(payload)};
 
+    auto reduced = reduce_event(state, event);
+    if (!reduced.has_value()) {
+        return {state, reduced.error()};
+    }
+
     auto appended = events_.append(event);
     if (!appended.has_value()) {
         return {state, persistence_failure(appended.error())};
     }
 
-    auto reduced = reduce_event(state, event);
-    if (!reduced.has_value()) {
-        return {state, reduced.error()};
-    }
     state = std::move(reduced.value());
     return {state, std::nullopt};
 }
@@ -191,14 +192,29 @@ RuntimeResult RuntimeEngine::run(const RunRequest& request) {
                                 ModelCallFailedPayload{response.error()});
         }
 
-        if (!contains_tool_call(response.value())) {
-            auto final_text = concatenate_text(response.value());
-            if (final_text.empty()) {
-                return append_event(
-                    state, task_id,
-                    ModelCallFailedPayload{
-                        {ErrorCode::ProtocolFailure,
-                         "model returned no tool calls and no final text", false}});
+        const bool has_tool_call = contains_tool_call(response.value());
+        const auto final_text = concatenate_text(response.value());
+        const auto protocol_failure = [&](const char* message) {
+            return append_event(
+                state, task_id,
+                ModelCallFailedPayload{
+                    {ErrorCode::ProtocolFailure, message, false}});
+        };
+
+        switch (response.value().stop_reason) {
+        case StopReason::Unknown:
+            return protocol_failure("model returned an unknown stop reason");
+        case StopReason::ToolUse:
+            if (!has_tool_call) {
+                return protocol_failure(
+                    "tool-use stop did not contain a tool-use block");
+            }
+            break;
+        case StopReason::EndTurn:
+        case StopReason::StopSequence:
+            if (has_tool_call || final_text.empty()) {
+                return protocol_failure(
+                    "terminal text stop requires nonempty text and no tools");
             }
 
             transition = append_event(
@@ -208,7 +224,30 @@ RuntimeResult RuntimeEngine::run(const RunRequest& request) {
                 return transition;
             }
             return append_event(
-                state, task_id, TaskCompletedPayload{std::move(final_text)});
+                state, task_id, TaskCompletedPayload{final_text});
+        case StopReason::MaxTokens:
+            if (has_tool_call) {
+                return protocol_failure(
+                    "max-tokens stop cannot contain tool-use blocks");
+            }
+
+            transition = append_event(
+                state, task_id,
+                ModelCallSucceededPayload{std::move(response.value())});
+            if (transition.fatal_error.has_value()) {
+                return transition;
+            }
+            return append_event(
+                state, task_id,
+                TaskBudgetExceededPayload{
+                    "max_tokens",
+                    {ErrorCode::BudgetExceeded,
+                     "model output token budget exceeded", false}});
+        }
+
+        if (!has_tool_call) {
+            return protocol_failure(
+                "model returned no tool calls for a tool-use stop");
         }
 
         transition = append_event(

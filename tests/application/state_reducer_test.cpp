@@ -11,12 +11,24 @@
 
 namespace fixtures {
 
+std::string valid_task_id(const std::string& label) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string encoded(32, '0');
+    const auto limit = label.size() < 16 ? label.size() : std::size_t{16};
+    for (std::size_t index = 0; index < limit; ++index) {
+        const auto byte = static_cast<unsigned char>(label[index]);
+        encoded[index * 2] = kHex[(byte >> 4U) & 0x0FU];
+        encoded[index * 2 + 1] = kHex[byte & 0x0FU];
+    }
+    return "task-" + encoded;
+}
+
 agent::RuntimeEvent event(std::string task_id,
                           std::uint64_t sequence,
                           agent::EventPayload payload) {
     return {1,
             sequence,
-            std::move(task_id),
+            valid_task_id(task_id),
             "2026-08-17T12:00:00.000Z",
             "corr-" + std::to_string(sequence),
             std::move(payload)};
@@ -327,4 +339,162 @@ TEST_CASE(first_event_must_be_version_one_task_started_at_sequence_one) {
     auto schema_result = agent::replay_events({wrong_schema});
     REQUIRE(!schema_result.has_value());
     REQUIRE(schema_result.error().code == agent::ErrorCode::InvalidInput);
+}
+
+TEST_CASE(model_success_and_failure_require_exactly_one_in_flight_start) {
+    const std::string task = "model-flight";
+    const std::vector<agent::RuntimeEvent> prepared_events = {
+        fixtures::task_started(task, 1, "issue"),
+        fixtures::context_started(task, 2),
+        fixtures::context_prepared(task, 3, "source"),
+    };
+    const auto prepared = agent::replay_events(prepared_events);
+    REQUIRE(prepared.has_value());
+
+    const auto missing_success = agent::reduce_event(
+        prepared.value(),
+        fixtures::model_succeeded(task, 4, {agent::TextBlock{"done"}},
+                                  agent::StopReason::EndTurn));
+    REQUIRE(!missing_success.has_value());
+    REQUIRE(missing_success.error().code == agent::ErrorCode::InvalidTransition);
+
+    const agent::RuntimeError model_error{
+        agent::ErrorCode::RequestTimeout, "timeout", true};
+    const auto missing_failure = agent::reduce_event(
+        prepared.value(),
+        fixtures::event(task, 4,
+                        agent::ModelCallFailedPayload{model_error}));
+    REQUIRE(!missing_failure.has_value());
+    REQUIRE(missing_failure.error().code == agent::ErrorCode::InvalidTransition);
+
+    const auto started = agent::reduce_event(
+        prepared.value(), fixtures::model_started(task, 4));
+    REQUIRE(started.has_value());
+    REQUIRE(started.value().usage.model_rounds == 1);
+    const auto duplicate = agent::reduce_event(
+        started.value(), fixtures::model_started(task, 5));
+    REQUIRE(!duplicate.has_value());
+    REQUIRE(duplicate.error().code == agent::ErrorCode::InvalidTransition);
+    REQUIRE(started.value().usage.model_rounds == 1);
+}
+
+TEST_CASE(replay_binds_every_stop_reason_to_its_content_shape) {
+    const std::string task = "stop-matrix";
+    const auto call = fixtures::first_call();
+    const std::vector<std::pair<agent::StopReason,
+                                std::vector<agent::ContentBlock>>> invalid = {
+        {agent::StopReason::Unknown, {agent::TextBlock{"unknown"}}},
+        {agent::StopReason::ToolUse, {agent::TextBlock{"missing tool"}}},
+        {agent::StopReason::EndTurn, {agent::ToolUseBlock{call}}},
+        {agent::StopReason::StopSequence, {agent::ToolUseBlock{call}}},
+        {agent::StopReason::MaxTokens, {agent::ToolUseBlock{call}}},
+        {agent::StopReason::EndTurn, {}},
+        {agent::StopReason::StopSequence, {}},
+    };
+    for (const auto& item : invalid) {
+        std::vector<agent::RuntimeEvent> events = {
+            fixtures::task_started(task, 1, "issue"),
+            fixtures::context_started(task, 2),
+            fixtures::context_prepared(task, 3, "source"),
+            fixtures::model_started(task, 4),
+            fixtures::model_succeeded(task, 5, item.second, item.first),
+        };
+        const auto result = agent::replay_events(events);
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == agent::ErrorCode::InvalidTransition);
+    }
+
+    auto tool_use = agent::replay_events({
+        fixtures::task_started(task, 1, "issue"),
+        fixtures::context_started(task, 2),
+        fixtures::context_prepared(task, 3, "source"),
+        fixtures::model_started(task, 4),
+        fixtures::model_succeeded(
+            task, 5,
+            {agent::TextBlock{"working"}, agent::ToolUseBlock{call}},
+            agent::StopReason::ToolUse),
+    });
+    REQUIRE(tool_use.has_value());
+    REQUIRE(tool_use.value().status == agent::TaskStatus::AwaitingTool);
+
+    for (const auto stop : {agent::StopReason::EndTurn,
+                            agent::StopReason::StopSequence}) {
+        auto terminal = agent::replay_events({
+            fixtures::task_started(task, 1, "issue"),
+            fixtures::context_started(task, 2),
+            fixtures::context_prepared(task, 3, "source"),
+            fixtures::model_started(task, 4),
+            fixtures::model_succeeded(
+                task, 5,
+                {agent::TextBlock{"fi"}, agent::TextBlock{"nal"}}, stop),
+            fixtures::task_completed(task, 6, "final"),
+        });
+        REQUIRE(terminal.has_value());
+        REQUIRE(terminal.value().status == agent::TaskStatus::Completed);
+    }
+
+    const agent::RuntimeError budget_error{
+        agent::ErrorCode::BudgetExceeded,
+        "model output token budget exceeded", false};
+    auto max_tokens = agent::replay_events({
+        fixtures::task_started(task, 1, "issue"),
+        fixtures::context_started(task, 2),
+        fixtures::context_prepared(task, 3, "source"),
+        fixtures::model_started(task, 4),
+        fixtures::model_succeeded(task, 5, {agent::TextBlock{"partial"}},
+                                  agent::StopReason::MaxTokens),
+        fixtures::event(task, 6,
+                        agent::TaskBudgetExceededPayload{
+                            "max_tokens", budget_error}),
+    });
+    REQUIRE(max_tokens.has_value());
+    REQUIRE(max_tokens.value().status == agent::TaskStatus::BudgetExceeded);
+    REQUIRE(!max_tokens.value().final_text.has_value());
+}
+
+TEST_CASE(task_completed_must_equal_the_immediately_accepted_terminal_text) {
+    auto events = fixtures::completed_text_trace(
+        "final-text-binding", "issue", "accepted");
+    events.back().payload = agent::TaskCompletedPayload{"different"};
+
+    const auto result = agent::replay_events(events);
+
+    REQUIRE(!result.has_value());
+    REQUIRE(result.error().code == agent::ErrorCode::InvalidTransition);
+}
+
+TEST_CASE(first_event_rejects_every_task_id_outside_the_exact_policy) {
+    const std::vector<std::string> invalid_ids = {
+        R"(C:\absolute\task-00000000000000000000000000000000)",
+        "task-0000000000000000/000000000000000",
+        "../task-00000000000000000000000000000000",
+        "task-0000000000000000000000000000000A",
+        "task-0000000000000000000000000000000",
+        "task-000000000000000000000000000000000",
+    };
+    for (const auto& invalid_id : invalid_ids) {
+        auto first = fixtures::task_started("valid-seed", 1, "issue");
+        first.task_id = invalid_id;
+        const auto result = agent::replay_events({first});
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == agent::ErrorCode::InvalidInput);
+    }
+}
+
+TEST_CASE(first_event_rejects_nonpositive_runtime_budgets) {
+    const std::vector<agent::RuntimeBudgets> invalid = {
+        {0, 1, 1, 1},
+        {1, 0, 1, 1},
+        {1, 1, 0, 1},
+        {1, 1, 1, 0},
+        {1, 1, -1, 1},
+        {1, 1, 1, -1},
+    };
+    for (const auto& budgets : invalid) {
+        auto first = fixtures::task_started("invalid-budget", 1, "issue");
+        std::get<agent::TaskStartedPayload>(first.payload).budgets = budgets;
+        const auto result = agent::replay_events({first});
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == agent::ErrorCode::InvalidInput);
+    }
 }

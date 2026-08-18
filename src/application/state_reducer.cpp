@@ -21,6 +21,48 @@ bool response_contains_tool_calls(const Message& message) {
     return false;
 }
 
+std::string concatenated_text(const std::vector<ContentBlock>& content) {
+    std::string text;
+    for (const auto& block : content) {
+        if (const auto* text_block = std::get_if<TextBlock>(&block)) {
+            text += text_block->text;
+        }
+    }
+    return text;
+}
+
+Result<void> validate_model_response(const ModelResponse& response) {
+    bool contains_tool_use = false;
+    for (const auto& block : response.content) {
+        contains_tool_use = contains_tool_use ||
+                            std::holds_alternative<ToolUseBlock>(block);
+    }
+    switch (response.stop_reason) {
+    case StopReason::ToolUse:
+        if (!contains_tool_use) {
+            return invalid_transition(
+                "tool-use stop requires at least one tool-use block");
+        }
+        return Result<void>::success();
+    case StopReason::EndTurn:
+    case StopReason::StopSequence:
+        if (contains_tool_use || concatenated_text(response.content).empty()) {
+            return invalid_transition(
+                "terminal text stop requires nonempty text and no tools");
+        }
+        return Result<void>::success();
+    case StopReason::MaxTokens:
+        if (contains_tool_use) {
+            return invalid_transition(
+                "max-tokens stop cannot contain tool-use blocks");
+        }
+        return Result<void>::success();
+    case StopReason::Unknown:
+        return invalid_transition("unknown model stop reason is not replayable");
+    }
+    return invalid_transition("unknown model stop reason is not replayable");
+}
+
 Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
     return std::visit(
         [&state](const auto& typed_payload) -> Result<void> {
@@ -54,6 +96,7 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                     state.next_tool_index = 0;
                     state.active_tool_call_id.reset();
                 }
+                state.accepted_model_stop_reason.reset();
                 state.status = TaskStatus::PreparingContext;
                 return Result<void>::success();
             } else if constexpr (std::is_same_v<Payload, ContextPreparedPayload>) {
@@ -74,16 +117,25 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                 state.status = TaskStatus::Failed;
                 return Result<void>::success();
             } else if constexpr (std::is_same_v<Payload, ModelCallStartedPayload>) {
-                if (state.status != TaskStatus::AwaitingModel) {
+                if (state.status != TaskStatus::AwaitingModel ||
+                    state.model_call_in_flight ||
+                    state.accepted_model_stop_reason.has_value()) {
                     return invalid_transition(
-                        "model call start requires awaiting model state");
+                        "model call start requires idle awaiting model state");
                 }
+                state.model_call_in_flight = true;
                 ++state.usage.model_rounds;
                 return Result<void>::success();
             } else if constexpr (std::is_same_v<Payload, ModelCallSucceededPayload>) {
-                if (state.status != TaskStatus::AwaitingModel) {
+                if (state.status != TaskStatus::AwaitingModel ||
+                    !state.model_call_in_flight) {
                     return invalid_transition(
-                        "model call success requires awaiting model state");
+                        "model call success requires an in-flight model call");
+                }
+                auto valid_response =
+                    validate_model_response(typed_payload.response);
+                if (!valid_response.has_value()) {
+                    return valid_response;
                 }
 
                 std::vector<ToolCall> ordered_calls;
@@ -95,6 +147,9 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
 
                 state.messages.push_back(
                     {Role::Assistant, typed_payload.response.content});
+                state.model_call_in_flight = false;
+                state.accepted_model_stop_reason =
+                    typed_payload.response.stop_reason;
                 if (!ordered_calls.empty()) {
                     state.pending_tool_calls = std::move(ordered_calls);
                     state.next_tool_index = 0;
@@ -104,10 +159,13 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                 }
                 return Result<void>::success();
             } else if constexpr (std::is_same_v<Payload, ModelCallFailedPayload>) {
-                if (state.status != TaskStatus::AwaitingModel) {
+                if (state.status != TaskStatus::AwaitingModel ||
+                    !state.model_call_in_flight) {
                     return invalid_transition(
-                        "model call failure requires awaiting model state");
+                        "model call failure requires an in-flight model call");
                 }
+                state.model_call_in_flight = false;
+                state.accepted_model_stop_reason.reset();
                 state.terminal_error = typed_payload.error;
                 state.status = TaskStatus::Failed;
                 return Result<void>::success();
@@ -147,11 +205,18 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                 return Result<void>::success();
             } else if constexpr (std::is_same_v<Payload, TaskCompletedPayload>) {
                 if (state.status != TaskStatus::AwaitingModel ||
+                    state.model_call_in_flight ||
                     !state.pending_tool_calls.empty() || state.messages.empty() ||
                     state.messages.back().role != Role::Assistant ||
-                    response_contains_tool_calls(state.messages.back())) {
+                    response_contains_tool_calls(state.messages.back()) ||
+                    !state.accepted_model_stop_reason.has_value() ||
+                    (*state.accepted_model_stop_reason != StopReason::EndTurn &&
+                     *state.accepted_model_stop_reason !=
+                         StopReason::StopSequence) ||
+                    typed_payload.final_text !=
+                        concatenated_text(state.messages.back().content)) {
                     return invalid_transition(
-                        "task completion requires a final tool-free model response");
+                        "task completion must match the accepted terminal response");
                 }
                 state.final_text = typed_payload.final_text;
                 state.status = TaskStatus::Completed;
@@ -194,6 +259,15 @@ Result<TaskState> reduce_event(const std::optional<TaskState>& current,
             return Result<TaskState>::failure(
                 {ErrorCode::InvalidTransition,
                  "first event must start the task", false});
+        }
+        if (!is_valid_task_id(event.task_id)) {
+            return Result<TaskState>::failure(
+                {ErrorCode::InvalidInput, "invalid task ID", false});
+        }
+        if (!has_positive_runtime_budgets(started->budgets)) {
+            return Result<TaskState>::failure(
+                {ErrorCode::InvalidInput,
+                 "runtime budgets must be positive", false});
         }
 
         TaskState state;

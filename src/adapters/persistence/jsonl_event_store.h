@@ -14,7 +14,8 @@ public:
     Result<void> append(const RuntimeEvent& event) override;
     Result<std::vector<RuntimeEvent>> read_file(
         const std::filesystem::path& path) const override;
-    std::filesystem::path event_path(const std::string& task_id) const;
+    Result<std::filesystem::path> event_path(
+        const std::string& task_id) const;
 
 private:
     std::filesystem::path runtime_root_;

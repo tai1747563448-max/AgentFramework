@@ -24,22 +24,68 @@ Result<std::vector<RuntimeEvent>> persistence_read_failure(std::string message) 
         {ErrorCode::PersistenceFailure, std::move(message), false});
 }
 
+Result<std::filesystem::path> persistence_path_failure(std::string message) {
+    return Result<std::filesystem::path>::failure(
+        {ErrorCode::PersistenceFailure, std::move(message), false});
+}
+
+bool is_contained_path(const std::filesystem::path& base,
+                       const std::filesystem::path& candidate) {
+    const auto relative = candidate.lexically_relative(base);
+    if (relative.empty() || relative.is_absolute()) {
+        return false;
+    }
+    const auto first = relative.begin();
+    return first != relative.end() && *first != std::filesystem::path("..");
+}
+
 }  // namespace
 
 JsonlEventStore::JsonlEventStore(std::filesystem::path runtime_root)
     : runtime_root_(std::move(runtime_root)) {}
 
-std::filesystem::path JsonlEventStore::event_path(
+Result<std::filesystem::path> JsonlEventStore::event_path(
     const std::string& task_id) const {
-    return runtime_root_ / "tasks" / std::filesystem::u8path(task_id) /
-           "events.jsonl";
+    if (!is_valid_task_id(task_id)) {
+        return persistence_path_failure("invalid task ID for event storage");
+    }
+    std::error_code error;
+    const auto tasks_root = std::filesystem::absolute(
+        runtime_root_ / "tasks", error).lexically_normal();
+    if (error) {
+        return persistence_path_failure("failed to resolve runtime root");
+    }
+    const auto candidate =
+        (tasks_root / std::filesystem::u8path(task_id) / "events.jsonl")
+            .lexically_normal();
+    if (!is_contained_path(tasks_root, candidate)) {
+        return persistence_path_failure("event path escapes runtime root");
+    }
+    return Result<std::filesystem::path>::success(candidate);
 }
 
 Result<void> JsonlEventStore::append(const RuntimeEvent& event) {
     try {
-        const auto serialized = event_to_json(event).dump();
-        const auto path = event_path(event.task_id);
+        const auto resolved = event_path(event.task_id);
+        if (!resolved.has_value()) {
+            return Result<void>::failure(resolved.error());
+        }
+        const auto& path = resolved.value();
         std::error_code error;
+        const auto canonical_tasks =
+            std::filesystem::weakly_canonical(
+                std::filesystem::absolute(runtime_root_ / "tasks", error),
+                error);
+        if (error) {
+            return persistence_failure("failed to resolve event directory");
+        }
+        const auto canonical_parent =
+            std::filesystem::weakly_canonical(path.parent_path(), error);
+        if (error || !is_contained_path(canonical_tasks, canonical_parent)) {
+            return persistence_failure("event path escapes runtime root");
+        }
+
+        const auto serialized = event_to_json(event).dump();
         std::filesystem::create_directories(path.parent_path(), error);
         if (error) {
             return persistence_failure("failed to create event directory");

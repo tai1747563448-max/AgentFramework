@@ -352,6 +352,8 @@ struct TaskState {
     RuntimeBudgets budgets;
     RuntimeUsage usage;
     std::uint64_t last_sequence{0};
+    bool model_call_in_flight{false};
+    std::optional<StopReason> accepted_model_stop_reason;
     std::vector<Message> messages;
     EvidencePack evidence;
     std::vector<ToolCall> pending_tool_calls;
@@ -487,14 +489,14 @@ Enforce this exact transition table:
 | `ContextPreparationStarted` | `Created` or fully processed `AwaitingTool` | flush all pending tool results into one user message, clear pending fields, set `PreparingContext` |
 | `ContextPrepared` | `PreparingContext` | replace EvidencePack, set `AwaitingModel` |
 | `ContextPreparationFailed` | `PreparingContext` | store error and set `Failed` |
-| `ModelCallStarted` | `AwaitingModel` | increment model rounds |
-| `ModelCallSucceeded` with tools | `AwaitingModel` | append assistant message, copy ordered calls, set `AwaitingTool` |
-| `ModelCallSucceeded` without tools | `AwaitingModel` | append assistant message, retain `AwaitingModel` |
-| `ModelCallFailed` | `AwaitingModel` | store error and set `Failed` |
+| `ModelCallStarted` | `AwaitingModel`, no call in flight | mark in flight and increment model rounds |
+| `ModelCallSucceeded` with valid `ToolUse` content | matching call in flight | clear in flight, append assistant message, copy ordered calls, set `AwaitingTool` |
+| `ModelCallSucceeded` with valid terminal/max-token content | matching call in flight | clear in flight, append assistant message, retain `AwaitingModel` and bind the accepted stop |
+| `ModelCallFailed` | matching call in flight | clear in flight, store error and set `Failed` |
 | `ToolCallStarted` | `AwaitingTool`, call equals next pending call, no active call | set `active_tool_call_id`, increment tool calls |
 | `ToolCallSucceeded` | ID matches `active_tool_call_id` | append result, clear active ID, advance `next_tool_index` |
 | `ToolCallFailed` | ID matches `active_tool_call_id` | clear active ID, store error, and set `Failed` |
-| `TaskCompleted` | `AwaitingModel`, no tool calls in last response | set final text and `Completed` |
+| `TaskCompleted` | `AwaitingModel`, accepted `EndTurn`/`StopSequence`, exact concatenated last assistant text | set final text and `Completed` |
 | `TaskFailed` | any nonterminal state | for a generic Runtime failure with no specialized failure event, store error and set `Failed` |
 | `TaskBudgetExceeded` | any nonterminal state | store error and set `BudgetExceeded` |
 | `TaskCancelled` | any nonterminal state | store error and set `Cancelled` |
@@ -633,7 +635,7 @@ public:
 };
 ```
 
-`JsonlEventStore` additionally exposes `std::filesystem::path event_path(const std::string& task_id) const` for tests and CLI reporting; this helper is not added to the abstract EventStore Port.
+`JsonlEventStore` additionally exposes `Result<std::filesystem::path> event_path(const std::string& task_id) const` for tests and CLI reporting; invalid IDs or non-contained normalized paths are reported rather than constructed. This helper is not added to the abstract EventStore Port.
 
 - [ ] **Step 4: Implement explicit JSON codecs and append/flush behavior**
 
@@ -645,7 +647,7 @@ Each payload must have explicit keys; for example:
 {
   "schema_version": 1,
   "sequence": 4,
-  "task_id": "task-1",
+  "task_id": "task-00000000000000000000000000000001",
   "timestamp": "2026-08-17T12:00:00.000Z",
   "event_type": "model_call_started",
   "correlation_id": "corr-2",
@@ -760,9 +762,9 @@ public:
 };
 ```
 
-Implement one private operation that constructs the next sequence, appends the event, and only then calls `reduce_event`. On append failure, return the last durable state plus fatal `PersistenceFailure`; do not attempt to record another event.
+Implement one private operation that constructs the next sequence, preview-reduces the event against a copy, appends only a legal event, and commits the already validated state only after append succeeds. On append failure, return the last durable state plus fatal `PersistenceFailure`; do not attempt to record another event.
 
-For `ModelClient` or `KnowledgeProvider` failures, append only the specific failure event; reducing that event stores its error and directly enters `Failed`. Reserve `TaskFailed` for generic Runtime failures that have no specialized failure event. For a response with no tool calls, concatenate TextBlocks in order; an empty final response becomes `ProtocolFailure`, not a successful empty answer.
+For `ModelClient` or `KnowledgeProvider` failures, append only the specific failure event; reducing that event stores its error and directly enters `Failed`. Reserve `TaskFailed` for generic Runtime failures that have no specialized failure event. Bind stop reasons to response content: only nonempty, tool-free `EndTurn`/`StopSequence` text completes; `ToolUse` requires a tool block; tool-free `MaxTokens` terminates through `TaskBudgetExceeded`; other combinations append `ModelCallFailed` directly.
 
 Build `ModelRequest` from the current durable state: copy `TaskState::messages` as the actual conversation, copy `TaskState::evidence` unchanged into the structured evidence field, preserve `ToolGateway::definitions()` order, and use the request system prompt and durable model timeout.
 
@@ -1074,7 +1076,7 @@ public:
 };
 ```
 
-`main.cpp` parses the optional env file, loads config, creates concrete adapters, creates RuntimeEngine, then calls CliApp. It must contain no reducer, protocol, or JSONL logic. `verify-log` calls `EventStore::read_file` and `replay_events`, prints task ID/status/last sequence, and returns 7 on validation failure.
+`main.cpp` parses startup arguments and dispatches by command before composition. `run` may then load its optional env file and compose Provider/HTTP/runtime adapters. Exact `verify-log` composes only local JSONL read/replay, rejects `--env-file`, prints task ID/status/last sequence, and returns 7 on validation failure. It must contain no reducer or Provider protocol logic.
 
 - [ ] **Step 5: Run CLI tests and an offline executable check**
 
@@ -1127,7 +1129,9 @@ TEST_CASE(fake_end_to_end_writes_and_replays_unicode_task) {
     auto runtime = fixtures::real_runtime_with(model, store);
     auto result = runtime.run(fixtures::run_request("修复 C++ 警告", temp.path()));
     REQUIRE(result.state->status == agent::TaskStatus::Completed);
-    auto loaded = store.read_file(store.event_path(result.state->task_id));
+    auto event_path = store.event_path(result.state->task_id);
+    REQUIRE(event_path.has_value());
+    auto loaded = store.read_file(event_path.value());
     REQUIRE(loaded.has_value());
     auto replayed = agent::replay_events(loaded.value());
     REQUIRE(replayed.has_value());

@@ -207,7 +207,7 @@ private:
 class FakeIds final : public agent::IdGenerator {
 public:
     std::string next_task_id() override {
-        return "task-1";
+        return "task-00000000000000000000000000000001";
     }
 
     std::string next_correlation_id() override {
@@ -294,6 +294,15 @@ agent::ModelResponse response(std::vector<agent::ContentBlock> content) {
 
 agent::ModelResponse text_response(std::string text) {
     return response({agent::TextBlock{std::move(text)}});
+}
+
+agent::ModelResponse stopped_response(std::vector<agent::ContentBlock> content,
+                                      agent::StopReason stop_reason,
+                                      std::string raw_stop_reason) {
+    auto result = response(std::move(content));
+    result.stop_reason = stop_reason;
+    result.raw_stop_reason = std::move(raw_stop_reason);
+    return result;
 }
 
 agent::ToolCall call(std::string id, std::string name) {
@@ -649,9 +658,9 @@ TEST_CASE(cancellation_wins_before_wall_time_and_count_guards) {
         test::MemoryEventStore{}, test::FakeClock({1'000, 2'000}),
         test::FakeCancellation(true));
     auto request = fixtures::run_request("inspect code");
-    request.budgets.max_task_time_ms = 0;
-    request.budgets.max_model_rounds = 0;
-    request.budgets.max_tool_calls = 0;
+    request.budgets.max_task_time_ms = 1;
+    request.budgets.max_model_rounds = 1;
+    request.budgets.max_tool_calls = 1;
 
     const auto result = fixture.run(request);
 
@@ -668,20 +677,24 @@ TEST_CASE(cancellation_wins_before_wall_time_and_count_guards) {
 
 TEST_CASE(wall_time_guard_wins_before_model_round_limit) {
     test::EngineFixture fixture(
-        test::FakeModel({fixtures::text_response("unused")}),
-        test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}),
-        test::MemoryEventStore{}, test::FakeClock({1'000, 1'000, 1'100}));
+        test::FakeModel({fixtures::tool_response(
+            {fixtures::call("call-1", "read")})}),
+        test::FakeTools({agent::ToolResult{"call-1", "contents", false}}),
+        test::FakeKnowledge(agent::EvidencePack{}), test::MemoryEventStore{},
+        test::FakeClock({1'000, 1'000, 1'000, 1'000,
+                         1'000, 1'000, 1'000, 1'100}));
     auto request = fixtures::run_request("inspect code");
     request.budgets.max_task_time_ms = 100;
-    request.budgets.max_model_rounds = 0;
+    request.budgets.max_model_rounds = 1;
 
     const auto result = fixture.run(request);
 
     REQUIRE(result.state.has_value());
     REQUIRE(result.state->status == agent::TaskStatus::BudgetExceeded);
-    REQUIRE(fixture.knowledge.retrieved_states.size() == 1);
-    REQUIRE(fixture.model.requests.empty());
-    REQUIRE(fixture.tools.definitions_calls == 0);
+    REQUIRE(fixture.knowledge.retrieved_states.size() == 2);
+    REQUIRE(fixture.model.requests.size() == 1);
+    REQUIRE(fixture.tools.definitions_calls == 1);
+    REQUIRE(fixture.tools.executed_calls.size() == 1);
     const auto* exceeded = std::get_if<agent::TaskBudgetExceededPayload>(
         &fixture.events.events.back().payload);
     REQUIRE(exceeded != nullptr);
@@ -786,6 +799,28 @@ TEST_CASE(tool_success_persistence_failure_prevents_the_next_tool) {
     REQUIRE(fixture.events.kinds().back() == agent::EventKind::ToolCallStarted);
 }
 
+TEST_CASE(illegal_successful_tool_result_is_not_appended_or_applied) {
+    test::EngineFixture fixture(
+        test::FakeModel({fixtures::tool_response(
+            {fixtures::call("call-1", "read")})}),
+        test::FakeTools(
+            {agent::ToolResult{"wrong-call", "untrusted result", false}}),
+        test::FakeKnowledge(agent::EvidencePack{}));
+
+    const auto result = fixture.run(fixtures::run_request("inspect code"));
+
+    REQUIRE(result.state.has_value());
+    REQUIRE(result.fatal_error.has_value());
+    REQUIRE(result.fatal_error->code == agent::ErrorCode::InvalidTransition);
+    REQUIRE(result.state->status == agent::TaskStatus::AwaitingTool);
+    REQUIRE(result.state->last_sequence == 6);
+    REQUIRE(result.state->active_tool_call_id ==
+            std::optional<std::string>{"call-1"});
+    REQUIRE(result.state->pending_tool_results.empty());
+    REQUIRE(fixture.events.count(agent::EventKind::ToolCallSucceeded) == 0);
+    REQUIRE(fixture.events.kinds().back() == agent::EventKind::ToolCallStarted);
+}
+
 TEST_CASE(post_tool_context_persistence_failure_prevents_later_external_calls) {
     test::EngineFixture<test::FailingEventStore> fixture(
         test::FakeModel({
@@ -828,4 +863,138 @@ TEST_CASE(terminal_guard_persistence_failure_prevents_all_external_calls) {
     REQUIRE(fixture.model.requests.empty());
     REQUIRE(fixture.tools.definitions_calls == 0);
     REQUIRE(fixture.tools.executed_calls.empty());
+}
+
+TEST_CASE(end_turn_and_stop_sequence_are_the_only_text_completion_stops) {
+    const std::vector<std::pair<agent::StopReason, std::string>> cases = {
+        {agent::StopReason::EndTurn, "end_turn"},
+        {agent::StopReason::StopSequence, "stop_sequence"},
+    };
+    for (const auto& item : cases) {
+        test::EngineFixture fixture(
+            test::FakeModel({fixtures::stopped_response(
+                {agent::TextBlock{"fi"}, agent::TextBlock{"nal"}},
+                item.first, item.second)}),
+            test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
+
+        const auto result = fixture.run(fixtures::run_request("finish"));
+
+        REQUIRE(result.state.has_value());
+        REQUIRE(!result.fatal_error.has_value());
+        REQUIRE(result.state->status == agent::TaskStatus::Completed);
+        REQUIRE(result.state->final_text ==
+                std::optional<std::string>{"final"});
+        REQUIRE(fixture.events.count(agent::EventKind::ModelCallSucceeded) == 1);
+        REQUIRE(fixture.events.count(agent::EventKind::TaskCompleted) == 1);
+    }
+}
+
+TEST_CASE(tool_use_allows_ordered_text_and_tools_but_requires_a_tool_block) {
+    test::EngineFixture allowed(
+        test::FakeModel({
+            fixtures::stopped_response(
+                {agent::TextBlock{"checking"},
+                 agent::ToolUseBlock{fixtures::call("call-1", "read")}},
+                agent::StopReason::ToolUse, "tool_use"),
+            fixtures::text_response("done")}),
+        test::FakeTools({agent::ToolResult{"call-1", "contents", false}}),
+        test::FakeKnowledge(agent::EvidencePack{}));
+
+    const auto allowed_result =
+        allowed.run(fixtures::run_request("inspect code"));
+
+    REQUIRE(allowed_result.state.has_value());
+    REQUIRE(allowed_result.state->status == agent::TaskStatus::Completed);
+    REQUIRE(allowed.tools.executed_ids() ==
+            std::vector<std::string>{"call-1"});
+    REQUIRE(allowed.model.requests.at(1).messages.at(1).content.size() == 2);
+
+    test::EngineFixture missing_tool(
+        test::FakeModel({fixtures::stopped_response(
+            {agent::TextBlock{"not actually using a tool"}},
+            agent::StopReason::ToolUse, "tool_use")}),
+        test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
+
+    const auto missing_result =
+        missing_tool.run(fixtures::run_request("inspect code"));
+
+    REQUIRE(missing_result.state.has_value());
+    REQUIRE(missing_result.state->status == agent::TaskStatus::Failed);
+    REQUIRE(missing_result.state->terminal_error.has_value());
+    REQUIRE(missing_result.state->terminal_error->code ==
+            agent::ErrorCode::ProtocolFailure);
+    REQUIRE(missing_tool.events.count(agent::EventKind::ModelCallSucceeded) == 0);
+    REQUIRE(missing_tool.events.kinds().back() ==
+            agent::EventKind::ModelCallFailed);
+}
+
+TEST_CASE(max_tokens_without_tools_is_budget_exceeded_after_accepted_response) {
+    test::EngineFixture fixture(
+        test::FakeModel({fixtures::stopped_response(
+            {agent::TextBlock{"partial"}}, agent::StopReason::MaxTokens,
+            "max_tokens")}),
+        test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
+
+    const auto result = fixture.run(fixtures::run_request("long task"));
+    const agent::RuntimeError expected{
+        agent::ErrorCode::BudgetExceeded,
+        "model output token budget exceeded", false};
+
+    REQUIRE(result.state.has_value());
+    REQUIRE(!result.fatal_error.has_value());
+    REQUIRE(result.state->status == agent::TaskStatus::BudgetExceeded);
+    REQUIRE(!result.state->final_text.has_value());
+    REQUIRE(result.state->terminal_error ==
+            std::optional<agent::RuntimeError>{expected});
+    REQUIRE(fixture.events.count(agent::EventKind::ModelCallSucceeded) == 1);
+    REQUIRE(fixture.events.count(agent::EventKind::TaskBudgetExceeded) == 1);
+    REQUIRE(fixture.events.count(agent::EventKind::TaskCompleted) == 0);
+    const auto* exceeded = std::get_if<agent::TaskBudgetExceededPayload>(
+        &fixture.events.events.back().payload);
+    REQUIRE(exceeded != nullptr);
+    REQUIRE(exceeded->budget_name == "max_tokens");
+}
+
+TEST_CASE(inconsistent_stop_and_content_rows_fail_directly_as_model_protocol) {
+    const auto call = fixtures::call("call-1", "read");
+    const std::vector<agent::ModelResponse> invalid_responses = {
+        fixtures::stopped_response({agent::TextBlock{"unknown"}},
+                                   agent::StopReason::Unknown,
+                                   "future_stop"),
+        fixtures::stopped_response({}, agent::StopReason::ToolUse,
+                                   "tool_use"),
+        fixtures::stopped_response({agent::ToolUseBlock{call}},
+                                   agent::StopReason::EndTurn,
+                                   "end_turn"),
+        fixtures::stopped_response({agent::ToolUseBlock{call}},
+                                   agent::StopReason::StopSequence,
+                                   "stop_sequence"),
+        fixtures::stopped_response({agent::ToolUseBlock{call}},
+                                   agent::StopReason::MaxTokens,
+                                   "max_tokens"),
+        fixtures::stopped_response({}, agent::StopReason::EndTurn,
+                                   "end_turn"),
+        fixtures::stopped_response({}, agent::StopReason::StopSequence,
+                                   "stop_sequence"),
+    };
+
+    for (const auto& response : invalid_responses) {
+        test::EngineFixture fixture(
+            test::FakeModel({response}), test::FakeTools{},
+            test::FakeKnowledge(agent::EvidencePack{}));
+
+        const auto result = fixture.run(fixtures::run_request("protocol"));
+
+        REQUIRE(result.state.has_value());
+        REQUIRE(!result.fatal_error.has_value());
+        REQUIRE(result.state->status == agent::TaskStatus::Failed);
+        REQUIRE(result.state->terminal_error.has_value());
+        REQUIRE(result.state->terminal_error->code ==
+                agent::ErrorCode::ProtocolFailure);
+        REQUIRE(fixture.events.count(agent::EventKind::ModelCallSucceeded) == 0);
+        REQUIRE(fixture.events.count(agent::EventKind::TaskCompleted) == 0);
+        REQUIRE(fixture.events.kinds().back() ==
+                agent::EventKind::ModelCallFailed);
+        REQUIRE(fixture.tools.executed_calls.empty());
+    }
 }

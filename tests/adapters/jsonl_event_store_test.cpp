@@ -24,6 +24,18 @@
 
 namespace fixtures {
 
+std::string valid_task_id(const std::string& label) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string encoded(32, '0');
+    const auto limit = label.size() < 16 ? label.size() : std::size_t{16};
+    for (std::size_t index = 0; index < limit; ++index) {
+        const auto byte = static_cast<unsigned char>(label[index]);
+        encoded[index * 2] = kHex[(byte >> 4U) & 0x0FU];
+        encoded[index * 2 + 1] = kHex[byte & 0x0FU];
+    }
+    return "task-" + encoded;
+}
+
 agent::RuntimeEvent event(std::string task_id,
                           std::uint64_t sequence,
                           agent::EventPayload payload) {
@@ -94,16 +106,17 @@ std::vector<agent::RuntimeEvent> completed_text_trace(
     const std::string& task_id,
     const std::string& issue,
     const std::string& final_text) {
+    const auto durable_task_id = valid_task_id(task_id);
     return {
-        task_started(task_id, 1, issue),
-        event(task_id, 2, agent::ContextPreparationStartedPayload{}),
-        event(task_id, 3, agent::ContextPreparedPayload{evidence()}),
-        event(task_id, 4, agent::ModelCallStartedPayload{request()}),
-        event(task_id, 5,
+        task_started(durable_task_id, 1, issue),
+        event(durable_task_id, 2, agent::ContextPreparationStartedPayload{}),
+        event(durable_task_id, 3, agent::ContextPreparedPayload{evidence()}),
+        event(durable_task_id, 4, agent::ModelCallStartedPayload{request()}),
+        event(durable_task_id, 5,
               agent::ModelCallSucceededPayload{
                   {{agent::TextBlock{final_text}}, agent::StopReason::EndTurn,
                    "end_turn", 120, 12, "provider-request-final"}}),
-        event(task_id, 6, agent::TaskCompletedPayload{final_text}),
+        event(durable_task_id, 6, agent::TaskCompletedPayload{final_text}),
     };
 }
 
@@ -133,15 +146,16 @@ TEST_CASE(jsonl_round_trip_preserves_replay_state_and_unicode) {
         REQUIRE(store.append(item).has_value());
     }
 
-    const auto file = store.event_path("task-unicode");
-    const auto loaded = store.read_file(file);
+    const auto file = store.event_path(events.front().task_id);
+    REQUIRE(file.has_value());
+    const auto loaded = store.read_file(file.value());
     REQUIRE(loaded.has_value());
     REQUIRE(loaded.value() == events);
     const auto state = agent::replay_events(loaded.value());
     REQUIRE(state.has_value());
     REQUIRE(state.value().final_text == std::optional<std::string>{u8"完成"});
 
-    const auto bytes = fixtures::read_all(file);
+    const auto bytes = fixtures::read_all(file.value());
     REQUIRE(!bytes.empty());
     REQUIRE(bytes.back() == '\n');
     REQUIRE(bytes.find("SENTINEL_SECRET_MUST_NOT_APPEAR") == std::string::npos);
@@ -252,7 +266,9 @@ TEST_CASE(jsonl_preserves_specialized_failure_terminal_errors) {
         for (const auto& item : events) {
             REQUIRE(store.append(item).has_value());
         }
-        const auto loaded = store.read_file(store.event_path(events.front().task_id));
+        const auto event_path = store.event_path(events.front().task_id);
+        REQUIRE(event_path.has_value());
+        const auto loaded = store.read_file(event_path.value());
         REQUIRE(loaded.has_value());
         const auto state = agent::replay_events(loaded.value());
         REQUIRE(state.has_value());
@@ -261,41 +277,44 @@ TEST_CASE(jsonl_preserves_specialized_failure_terminal_errors) {
                 std::optional<agent::RuntimeError>{expected});
     };
 
+    const auto context_task = fixtures::valid_task_id("context-failure");
     verify_trace("context-failure",
-                 {fixtures::task_started("context-failure", 1, "issue"),
-                  fixtures::event("context-failure", 2,
+                 {fixtures::task_started(context_task, 1, "issue"),
+                  fixtures::event(context_task, 2,
                                   agent::ContextPreparationStartedPayload{}),
-                  fixtures::event("context-failure", 3,
+                  fixtures::event(context_task, 3,
                                   agent::ContextPreparationFailedPayload{
                                       context_error})},
                  context_error);
+    const auto model_task = fixtures::valid_task_id("model-failure");
     verify_trace("model-failure",
-                 {fixtures::task_started("model-failure", 1, "issue"),
-                  fixtures::event("model-failure", 2,
+                 {fixtures::task_started(model_task, 1, "issue"),
+                  fixtures::event(model_task, 2,
                                   agent::ContextPreparationStartedPayload{}),
-                  fixtures::event("model-failure", 3,
+                  fixtures::event(model_task, 3,
                                   agent::ContextPreparedPayload{fixtures::evidence()}),
-                  fixtures::event("model-failure", 4,
+                  fixtures::event(model_task, 4,
                                   agent::ModelCallStartedPayload{fixtures::request()}),
-                  fixtures::event("model-failure", 5,
+                  fixtures::event(model_task, 5,
                                   agent::ModelCallFailedPayload{model_error})},
                  model_error);
 
     const auto call = fixtures::tool_call();
+    const auto tool_task = fixtures::valid_task_id("tool-failure");
     verify_trace("tool-failure",
-                 {fixtures::task_started("tool-failure", 1, "issue"),
-                  fixtures::event("tool-failure", 2,
+                 {fixtures::task_started(tool_task, 1, "issue"),
+                  fixtures::event(tool_task, 2,
                                   agent::ContextPreparationStartedPayload{}),
-                  fixtures::event("tool-failure", 3,
+                  fixtures::event(tool_task, 3,
                                   agent::ContextPreparedPayload{fixtures::evidence()}),
-                  fixtures::event("tool-failure", 4,
+                  fixtures::event(tool_task, 4,
                                   agent::ModelCallStartedPayload{fixtures::request()}),
-                  fixtures::event("tool-failure", 5,
+                  fixtures::event(tool_task, 5,
                                   agent::ModelCallSucceededPayload{
                                       fixtures::response_with_tool()}),
-                  fixtures::event("tool-failure", 6,
+                  fixtures::event(tool_task, 6,
                                   agent::ToolCallStartedPayload{call}),
-                  fixtures::event("tool-failure", 7,
+                  fixtures::event(tool_task, 7,
                                   agent::ToolCallFailedPayload{"call-1", tool_error})},
                  tool_error);
 }
@@ -346,10 +365,12 @@ TEST_CASE(jsonl_rejects_invalid_json_missing_keys_and_unknown_schema) {
 }
 
 TEST_CASE(jsonl_rejects_mixed_task_ids_and_illegal_transitions) {
-    const auto first = fixtures::task_started("task-one", 1, "issue");
-    auto mixed = fixtures::event("task-two", 2,
+    const auto first_task = fixtures::valid_task_id("task-one");
+    const auto second_task = fixtures::valid_task_id("task-two");
+    const auto first = fixtures::task_started(first_task, 1, "issue");
+    auto mixed = fixtures::event(second_task, 2,
                                  agent::ContextPreparationStartedPayload{});
-    auto illegal = fixtures::task_started("task-one", 2, "again");
+    auto illegal = fixtures::task_started(first_task, 2, "again");
     const std::vector<std::pair<std::string, std::vector<agent::RuntimeEvent>>> cases = {
         {"mixed", {first, mixed}}, {"illegal", {first, illegal}}};
 
@@ -369,8 +390,184 @@ TEST_CASE(jsonl_append_reports_unwritable_runtime_root) {
     const auto root_file = temp.write_text("not-a-directory", "occupied");
     agent::JsonlEventStore store(root_file);
     const auto result = store.append(
-        fixtures::task_started("task-write-failure", 1, "issue"));
+        fixtures::task_started(
+            fixtures::valid_task_id("task-write-failure"), 1, "issue"));
     REQUIRE(!result.has_value());
     REQUIRE(result.error().code == agent::ErrorCode::PersistenceFailure);
     REQUIRE(fixtures::read_all(root_file) == "occupied");
+}
+
+TEST_CASE(event_json_rejects_extra_keys_in_every_schema_owned_object_family) {
+    using Json = nlohmann::json;
+    std::vector<Json> invalid_records;
+
+    auto empty_payload = agent::event_to_json(fixtures::event(
+        "codec-empty", 2, agent::ContextPreparationStartedPayload{}));
+    empty_payload["payload"]["extra"] = true;
+    invalid_records.push_back(std::move(empty_payload));
+
+    auto payload = agent::event_to_json(fixtures::task_started(
+        "codec-payload", 1, "issue"));
+    payload["payload"]["extra"] = true;
+    invalid_records.push_back(std::move(payload));
+
+    auto budgets = agent::event_to_json(fixtures::task_started(
+        "codec-budgets", 1, "issue"));
+    budgets["payload"]["budgets"]["extra"] = true;
+    invalid_records.push_back(std::move(budgets));
+
+    const agent::RuntimeError error{
+        agent::ErrorCode::ProtocolFailure, "protocol", false};
+    auto runtime_error = agent::event_to_json(fixtures::event(
+        "codec-error", 5, agent::ModelCallFailedPayload{error}));
+    runtime_error["payload"]["error"]["extra"] = true;
+    invalid_records.push_back(std::move(runtime_error));
+
+    auto request = agent::event_to_json(fixtures::event(
+        "codec-request", 4,
+        agent::ModelCallStartedPayload{fixtures::request()}));
+    request["payload"]["request"]["extra"] = true;
+    invalid_records.push_back(std::move(request));
+
+    auto message = agent::event_to_json(fixtures::event(
+        "codec-message", 4,
+        agent::ModelCallStartedPayload{fixtures::request()}));
+    message["payload"]["request"]["messages"][0]["extra"] = true;
+    invalid_records.push_back(std::move(message));
+
+    auto content_block = agent::event_to_json(fixtures::event(
+        "codec-block", 4,
+        agent::ModelCallStartedPayload{fixtures::request()}));
+    content_block["payload"]["request"]["messages"][0]["content"][0]
+                 ["extra"] = true;
+    invalid_records.push_back(std::move(content_block));
+
+    auto tool_definition = agent::event_to_json(fixtures::event(
+        "codec-tool-definition", 4,
+        agent::ModelCallStartedPayload{fixtures::request()}));
+    tool_definition["payload"]["request"]["tools"][0]["extra"] = true;
+    invalid_records.push_back(std::move(tool_definition));
+
+    auto evidence_pack = agent::event_to_json(fixtures::event(
+        "codec-evidence-pack", 4,
+        agent::ModelCallStartedPayload{fixtures::request()}));
+    evidence_pack["payload"]["request"]["evidence"]["extra"] = true;
+    invalid_records.push_back(std::move(evidence_pack));
+
+    auto evidence_item = agent::event_to_json(fixtures::event(
+        "codec-evidence-item", 4,
+        agent::ModelCallStartedPayload{fixtures::request()}));
+    evidence_item["payload"]["request"]["evidence"]["items"][0]["extra"] =
+        true;
+    invalid_records.push_back(std::move(evidence_item));
+
+    auto response = agent::event_to_json(fixtures::event(
+        "codec-response", 5,
+        agent::ModelCallSucceededPayload{fixtures::response_with_tool()}));
+    response["payload"]["response"]["extra"] = true;
+    invalid_records.push_back(std::move(response));
+
+    auto tool_call = agent::event_to_json(fixtures::event(
+        "codec-tool-call", 6,
+        agent::ToolCallStartedPayload{fixtures::tool_call()}));
+    tool_call["payload"]["call"]["extra"] = true;
+    invalid_records.push_back(std::move(tool_call));
+
+    auto tool_result = agent::event_to_json(fixtures::event(
+        "codec-tool-result", 7,
+        agent::ToolCallSucceededPayload{
+            {"call-1", "contents", false}}));
+    tool_result["payload"]["result"]["extra"] = true;
+    invalid_records.push_back(std::move(tool_result));
+
+    for (const auto& json : invalid_records) {
+        const auto decoded = agent::event_from_json(json);
+        REQUIRE(!decoded.has_value());
+        REQUIRE(decoded.error().code == agent::ErrorCode::PersistenceFailure);
+    }
+}
+
+TEST_CASE(event_json_keeps_provider_neutral_value_maps_open) {
+    auto json = agent::event_to_json(fixtures::event(
+        "codec-open-values", 4,
+        agent::ModelCallStartedPayload{fixtures::request()}));
+    json["payload"]["request"]["tools"][0]["input_schema"]
+        ["future_schema_keyword"] = "allowed";
+    json["payload"]["request"]["evidence"]["items"][0]["metadata"]
+        ["future_metadata"] = 42;
+    auto tool_call_json = agent::event_to_json(fixtures::event(
+        "codec-open-arguments", 6,
+        agent::ToolCallStartedPayload{fixtures::tool_call()}));
+    tool_call_json["payload"]["call"]["arguments"]["future_argument"] =
+        true;
+
+    const auto decoded = agent::event_from_json(json);
+    const auto decoded_tool_call = agent::event_from_json(tool_call_json);
+
+    REQUIRE(decoded.has_value());
+    REQUIRE(decoded_tool_call.has_value());
+    const auto& decoded_request =
+        std::get<agent::ModelCallStartedPayload>(decoded.value().payload).request;
+    REQUIRE(decoded_request.tools.at(0).input_schema.at("future_schema_keyword") ==
+            agent::Value("allowed"));
+    REQUIRE(decoded_request.evidence.items.at(0).metadata.at("future_metadata") ==
+            agent::Value(std::int64_t{42}));
+    const auto& decoded_call = std::get<agent::ToolCallStartedPayload>(
+        decoded_tool_call.value().payload).call;
+    REQUIRE(decoded_call.arguments.at("future_argument") == agent::Value(true));
+}
+
+TEST_CASE(event_json_rejects_nonpositive_decoded_budgets_and_timeouts) {
+    const std::vector<std::string> fields = {
+        "max_model_rounds", "max_tool_calls", "max_task_time_ms",
+        "model_timeout_ms"};
+    for (const auto& field : fields) {
+        auto json = agent::event_to_json(fixtures::task_started(
+            "codec-invalid-budget", 1, "issue"));
+        json["payload"]["budgets"][field] = 0;
+        const auto decoded = agent::event_from_json(json);
+        REQUIRE(!decoded.has_value());
+        REQUIRE(decoded.error().code == agent::ErrorCode::PersistenceFailure);
+    }
+
+    auto request = agent::event_to_json(fixtures::event(
+        "codec-invalid-timeout", 4,
+        agent::ModelCallStartedPayload{fixtures::request()}));
+    request["payload"]["request"]["timeout_ms"] = 0;
+    const auto decoded = agent::event_from_json(request);
+    REQUIRE(!decoded.has_value());
+    REQUIRE(decoded.error().code == agent::ErrorCode::PersistenceFailure);
+}
+
+TEST_CASE(jsonl_persistence_rejects_unsafe_task_ids_before_path_creation) {
+    test::ScopedTempDir temp("jsonl-task-id-policy");
+    agent::JsonlEventStore store(temp.path() / "runtime");
+    const auto escaped_absolute = temp.path() / "escaped-absolute";
+    const std::vector<std::string> invalid_ids = {
+        escaped_absolute.generic_u8string(),
+        "task-0000000000000000/000000000000000",
+        "../escaped-parent",
+        "task-0000000000000000000000000000000A",
+        "task-0000000000000000000000000000000",
+        "task-000000000000000000000000000000000",
+    };
+
+    for (const auto& invalid_id : invalid_ids) {
+        const auto appended = store.append(
+            fixtures::task_started(invalid_id, 1, "issue"));
+        REQUIRE(!appended.has_value());
+        REQUIRE(appended.error().code == agent::ErrorCode::PersistenceFailure);
+    }
+
+    REQUIRE(!std::filesystem::exists(escaped_absolute / "events.jsonl"));
+    REQUIRE(!std::filesystem::exists(temp.path() / "runtime" /
+                                     "escaped-parent" / "events.jsonl"));
+
+    const auto valid_id =
+        std::string{"task-0000000000000000000000000000000a"};
+    const auto appended = store.append(
+        fixtures::task_started(valid_id, 1, "issue"));
+    REQUIRE(appended.has_value());
+    REQUIRE(std::filesystem::exists(temp.path() / "runtime" / "tasks" /
+                                    valid_id / "events.jsonl"));
 }

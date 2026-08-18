@@ -169,7 +169,8 @@ TEST_CASE(fake_end_to_end_writes_and_replays_unicode_task) {
     REQUIRE(result.state->status == agent::TaskStatus::Completed);
     REQUIRE(result.state->final_text == std::optional<std::string>{u8"已完成"});
     const auto event_path = store.event_path(result.state->task_id);
-    const auto loaded = store.read_file(event_path);
+    REQUIRE(event_path.has_value());
+    const auto loaded = store.read_file(event_path.value());
     REQUIRE(loaded.has_value());
     const auto replayed = agent::replay_events(loaded.value());
     REQUIRE(replayed.has_value());
@@ -220,7 +221,8 @@ TEST_CASE(provider_secret_never_reaches_cli_events_or_errors) {
     REQUIRE(captured_result->state->terminal_error->message.find(sentinel) ==
             std::string::npos);
     const auto event_path = store.event_path(captured_result->state->task_id);
-    const auto persisted = fixtures::read_all(event_path);
+    REQUIRE(event_path.has_value());
+    const auto persisted = fixtures::read_all(event_path.value());
     REQUIRE(!persisted.empty());
     REQUIRE(output.str().find(sentinel) == std::string::npos);
     REQUIRE(error.str().find(sentinel) == std::string::npos);

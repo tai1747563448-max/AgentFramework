@@ -95,6 +95,13 @@ add_agent_test(cli_tests tests/cli/cli_app_test.cpp)
 target_link_libraries(cli_tests PRIVATE agent_runtime)
 add_agent_test(runtime_integration_tests tests/integration/runtime_integration_test.cpp)
 target_link_libraries(runtime_integration_tests PRIVATE agent_runtime)
+add_test(
+    NAME verify_log_process_credential_free
+    COMMAND ${CMAKE_COMMAND}
+        "-DAGENT_EXE=$<TARGET_FILE:agent>"
+        "-DEVENT_LOG=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/valid-completed-events.jsonl"
+        "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/verify-log-process"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/verify_log_process_test.cmake")
 
 if(AGENT_ENABLE_LIVE_TESTS)
     add_executable(anthropic_live_smoke tests/live/anthropic_live_smoke.cpp)

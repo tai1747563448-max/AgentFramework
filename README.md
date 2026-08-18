@@ -11,21 +11,31 @@ The dependency direction points inward:
 - `src/domain` owns typed values, model/tool data, task state, errors, and
   runtime events. It does not depend on CPR, dotenv-cpp, nlohmann/json, the
   CLI, or filesystem I/O.
-- `src/application` owns the reducer and `RuntimeEngine`. Every state change is
-  appended to the `EventStore` before it is reduced into memory.
+- `src/application` owns the reducer and `RuntimeEngine`. Every candidate event
+  is preview-reduced without mutating live state, appended and flushed, and
+  only then committed to memory.
 - `src/ports` defines model, tool, knowledge, event-store, clock, ID, and
   cancellation interfaces.
 - `src/adapters` supplies Anthropic Messages HTTP, JSONL persistence, empty
   tool/knowledge adapters, and system clock/ID/cancellation implementations.
 - `src/main.cpp` is the composition root; `src/cli` parses `run` and
   `verify-log`, uses fixed failure messages, and bounds the fields printed by
-  log verification. A successful `run` prints the model's final text.
+  log verification. A successful `run` renders final text as UTF-8, visibly
+  escapes terminal controls and invalid bytes, and truncates only at code-point
+  boundaries after at most 8192 rendered bytes.
 
 Tool calls are sequential and retain provider response order. A returned
 `ToolResult{is_error=true}` is a completed tool call, while infrastructure
 failure is a failed gateway call. Cancellation and budgets stop the runtime
 before the next external call. JSONL replay validates schema, contiguous
-sequence, task identity, and state transitions; it does not repair a log.
+sequence, the exact `task-` plus 32 lowercase hexadecimal ID format, strict
+schema-owned nested records, and state transitions; arbitrary `Value` maps
+remain open. Replay does not repair a log.
+
+`ModelCallStarted` records the single call in flight. `tool_use` requires a
+tool block; `end_turn` and `stop_sequence` require nonempty tool-free text;
+`max_tokens` terminates as `BudgetExceeded`; unknown or inconsistent stops are
+direct `ModelCallFailed` protocol failures.
 
 This milestone does not provide real coding tools, real RAG, crash recovery,
 automatic retry, parallel execution, multiple agents, a second provider, an
@@ -68,18 +78,19 @@ only a short category message.
 ## Verify an event log
 
 Each task is stored under
-`<AGENT_RUNTIME_ROOT>/tasks/<task-id>/events.jsonl`. With configuration loaded,
-verify a specific file using the exact binding:
+`<AGENT_RUNTIME_ROOT>/tasks/<task-id>/events.jsonl`. Verification is a local,
+credential-independent path: it does not load an env file, provider
+configuration, HTTP transport, or model client. Use the exact binding:
 
 ```powershell
-& .\build\vs2022\Debug\agent.exe --env-file .env verify-log `
+& .\build\vs2022\Debug\agent.exe verify-log `
   --events .\runtime_data\tasks\<task-id>\events.jsonl
 ```
 
 Verification prints only the validated task ID, terminal status, and last
 sequence. It rejects malformed JSON, unknown schema, noncontiguous or mixed
 task sequences, invalid transitions, and unsafe task IDs without modifying the
-file.
+file. Combining `verify-log` with `--env-file` is invalid input.
 
 Event files are local audit records, not public logs. They can contain the
 issue, workspace path, prompts, evidence, tool inputs/results, model text, and

@@ -24,6 +24,11 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 namespace test {
 
 class MapEnvironment final : public agent::Environment {
@@ -43,6 +48,47 @@ public:
 private:
     std::map<std::string, std::string> values_;
 };
+
+#if defined(_WIN32)
+std::optional<std::wstring> wide_environment_value(const wchar_t* name) {
+    SetLastError(ERROR_SUCCESS);
+    const DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
+    if (required == 0) {
+        if (GetLastError() == ERROR_ENVVAR_NOT_FOUND) {
+            return std::nullopt;
+        }
+        return std::wstring{};
+    }
+    std::wstring value(required, L'\0');
+    const DWORD written =
+        GetEnvironmentVariableW(name, value.data(), required);
+    if (written >= required) {
+        return std::nullopt;
+    }
+    value.resize(written);
+    return value;
+}
+
+class ScopedWideEnvironment final {
+public:
+    ScopedWideEnvironment(std::wstring name, std::wstring value)
+        : name_(std::move(name)), previous_(wide_environment_value(name_.c_str())) {
+        REQUIRE(SetEnvironmentVariableW(name_.c_str(), value.c_str()) != FALSE);
+    }
+
+    ~ScopedWideEnvironment() {
+        SetEnvironmentVariableW(
+            name_.c_str(), previous_.has_value() ? previous_->c_str() : nullptr);
+    }
+
+    ScopedWideEnvironment(const ScopedWideEnvironment&) = delete;
+    ScopedWideEnvironment& operator=(const ScopedWideEnvironment&) = delete;
+
+private:
+    std::wstring name_;
+    std::optional<std::wstring> previous_;
+};
+#endif
 
 agent::TaskState terminal_state(agent::TaskStatus status) {
     agent::TaskState state;
@@ -114,6 +160,82 @@ TEST_CASE(cli_maps_completed_task_to_zero_and_forwards_user_input) {
     REQUIRE(requests.front().workspace_utf8 == u8"E:/工作区");
     REQUIRE(requests.front().issue == u8"修复警告");
     REQUIRE(out.str().find("done") != std::string::npos);
+    REQUIRE(err.str().empty());
+}
+
+TEST_CASE(cli_sanitizes_controls_invalid_utf8_and_embedded_nul) {
+    std::string unsafe = "safe";
+    unsafe.push_back('\x1b');
+    unsafe += "[31m";
+    unsafe.push_back('\0');
+    unsafe += " red ";
+    unsafe.push_back(static_cast<char>(0xF0));
+    unsafe.push_back('(');
+    unsafe.push_back(static_cast<char>(0x8C));
+    unsafe.push_back('(');
+    auto completed = test::terminal_result(agent::TaskStatus::Completed);
+    completed.state->final_text = unsafe;
+    std::ostringstream out;
+    std::ostringstream err;
+    agent::CliApp app(
+        [completed](const agent::RunRequest&) { return completed; },
+        [](const std::filesystem::path&) {
+            return test::verified_state(agent::TaskStatus::Completed);
+        },
+        out, err);
+
+    const auto code = app.execute(
+        {"agent", "run", "--workspace", ".", "--issue", "test"});
+
+    REQUIRE(code == agent::ExitCode::Success);
+    REQUIRE(out.str() ==
+            "safe\\u001B[31m\\u0000 red \\xF0(\\x8C(\n");
+    REQUIRE(err.str().empty());
+}
+
+TEST_CASE(cli_preserves_printable_unicode_newline_and_tab) {
+    auto completed = test::terminal_result(agent::TaskStatus::Completed);
+    completed.state->final_text = u8"中文🙂\n\t完成";
+    std::ostringstream out;
+    std::ostringstream err;
+    agent::CliApp app(
+        [completed](const agent::RunRequest&) { return completed; },
+        [](const std::filesystem::path&) {
+            return test::verified_state(agent::TaskStatus::Completed);
+        },
+        out, err);
+
+    REQUIRE(app.execute(
+                {"agent", "run", "--workspace", ".", "--issue", "test"}) ==
+            agent::ExitCode::Success);
+    REQUIRE(out.str() == std::string{u8"中文🙂\n\t完成\n"});
+    REQUIRE(err.str().empty());
+}
+
+TEST_CASE(cli_truncates_at_a_utf8_boundary_after_at_most_8192_rendered_bytes) {
+    std::string oversized(8191, 'a');
+    oversized += u8"中";
+    oversized += std::string(100, 'b');
+    auto completed = test::terminal_result(agent::TaskStatus::Completed);
+    completed.state->final_text = std::move(oversized);
+    std::ostringstream out;
+    std::ostringstream err;
+    agent::CliApp app(
+        [completed](const agent::RunRequest&) { return completed; },
+        [](const std::filesystem::path&) {
+            return test::verified_state(agent::TaskStatus::Completed);
+        },
+        out, err);
+
+    REQUIRE(app.execute(
+                {"agent", "run", "--workspace", ".", "--issue", "test"}) ==
+            agent::ExitCode::Success);
+    const auto marker = out.str().find("\n[output truncated]");
+    REQUIRE(marker != std::string::npos);
+    REQUIRE(marker <= 8192);
+    REQUIRE(marker == 8191);
+    REQUIRE(out.str().substr(0, marker) == std::string(8191, 'a'));
+    REQUIRE(out.str().find(u8"中") == std::string::npos);
     REQUIRE(err.str().empty());
 }
 
@@ -418,14 +540,12 @@ TEST_CASE(startup_parser_extracts_one_explicit_env_file_before_command_dispatch)
                                       "--issue", "test"}));
 }
 
-TEST_CASE(startup_parser_accepts_env_file_after_command_and_rejects_bad_forms) {
-    const auto accepted = agent::parse_startup_arguments(
+TEST_CASE(startup_parser_rejects_env_file_with_verify_log_and_bad_forms) {
+    const auto verify_with_env = agent::parse_startup_arguments(
         {"agent", "verify-log", "--events", "events.jsonl", "--env-file",
          "agent.env"});
-    REQUIRE(accepted.has_value());
-    REQUIRE((accepted.value().command_args ==
-             std::vector<std::string>{"agent", "verify-log",
-                                      "--events", "events.jsonl"}));
+    REQUIRE(!verify_with_env.has_value());
+    REQUIRE(verify_with_env.error().code == agent::ErrorCode::InvalidInput);
 
     const std::vector<std::vector<std::string>> rejected = {
         {"agent", "--env-file"},
@@ -489,6 +609,33 @@ TEST_CASE(explicit_env_loader_reads_a_file_under_a_unicode_path) {
     REQUIRE(loaded.has_value());
     REQUIRE(observed == std::optional<std::string>{"loaded"});
 }
+
+#if defined(_WIN32)
+TEST_CASE(process_environment_reads_unicode_runtime_root_and_prompt_as_utf8) {
+    test::ScopedWideEnvironment base_url(
+        L"AGENT_BASE_URL", L"https://provider.example");
+    test::ScopedWideEnvironment model(L"AGENT_MODEL", L"model-id");
+    test::ScopedWideEnvironment api_key(L"AGENT_API_KEY", L"test-key");
+    test::ScopedWideEnvironment auth_token(L"AGENT_AUTH_TOKEN", L"");
+    test::ScopedWideEnvironment runtime_root(
+        L"AGENT_RUNTIME_ROOT", L"E:/运行根/🙂");
+    test::ScopedWideEnvironment prompt(
+        L"AGENT_SYSTEM_PROMPT", L"只保留中文提示🙂");
+    agent::ProcessEnvironment environment;
+
+    const auto observed_root = environment.get("AGENT_RUNTIME_ROOT");
+    const auto observed_prompt = environment.get("AGENT_SYSTEM_PROMPT");
+    const auto config = agent::load_runtime_config(environment);
+
+    REQUIRE(observed_root == std::optional<std::string>{u8"E:/运行根/🙂"});
+    REQUIRE(observed_prompt ==
+            std::optional<std::string>{u8"只保留中文提示🙂"});
+    REQUIRE(config.has_value());
+    REQUIRE(config.value().runtime_root ==
+            std::filesystem::u8path(u8"E:/运行根/🙂"));
+    REQUIRE(config.value().system_prompt == u8"只保留中文提示🙂");
+}
+#endif
 
 TEST_CASE(empty_adapters_expose_no_tools_and_no_evidence) {
     agent::EmptyToolGateway tools;
