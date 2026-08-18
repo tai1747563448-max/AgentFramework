@@ -1,6 +1,7 @@
 #include "adapters/empty/empty_knowledge_provider.h"
 #include "adapters/empty/empty_tool_gateway.h"
 #include "adapters/system/random_id_generator.h"
+#include "adapters/system/signal_cancellation.h"
 #include "adapters/system/system_clock.h"
 #include "cli/cli_app.h"
 #include "config/runtime_config.h"
@@ -8,10 +9,12 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <optional>
@@ -215,15 +218,17 @@ TEST_CASE(cli_dispatches_verify_log_and_prints_only_summary_fields) {
         [&](const std::filesystem::path& path) {
             paths.push_back(path);
             auto state = test::terminal_state(agent::TaskStatus::Failed);
+            state.task_id = "task-0123456789abcdef0123456789abcdef";
             return agent::Result<agent::TaskState>::success(std::move(state));
         },
         out, err);
 
-    REQUIRE(app.execute({"agent", "verify-log", u8"E:/运行/事件.jsonl"}) ==
-            agent::ExitCode::Success);
+    REQUIRE(app.execute({"agent", "verify-log", "--events",
+                         u8"E:/运行/事件.jsonl"}) == agent::ExitCode::Success);
     REQUIRE(paths == std::vector<std::filesystem::path>{
                          std::filesystem::u8path(u8"E:/运行/事件.jsonl")});
-    REQUIRE(out.str().find("task-cli") != std::string::npos);
+    REQUIRE(out.str().find("task-0123456789abcdef0123456789abcdef") !=
+            std::string::npos);
     REQUIRE(out.str().find("Failed") != std::string::npos);
     REQUIRE(out.str().find("9") != std::string::npos);
     REQUIRE(out.str().find("SENTINEL_PRIVATE_FAILURE_DETAIL") ==
@@ -244,11 +249,55 @@ TEST_CASE(cli_maps_verify_failure_to_invalid_event_log_without_leaking_details) 
                  "SENTINEL_INVALID_LOG_DETAIL", false});
         },
         out, err);
-    REQUIRE(app.execute({"agent", "verify-log", "events.jsonl"}) ==
+    REQUIRE(app.execute(
+                {"agent", "verify-log", "--events", "events.jsonl"}) ==
             agent::ExitCode::InvalidEventLog);
     REQUIRE(out.str().find("SENTINEL_INVALID_LOG_DETAIL") == std::string::npos);
     REQUIRE(err.str().find("SENTINEL_INVALID_LOG_DETAIL") ==
             std::string::npos);
+}
+
+TEST_CASE(cli_rejects_verify_log_without_the_events_binding) {
+    std::size_t verify_calls = 0;
+    std::ostringstream out;
+    std::ostringstream err;
+    agent::CliApp app(
+        [](const agent::RunRequest&) {
+            return test::terminal_result(agent::TaskStatus::Completed);
+        },
+        [&](const std::filesystem::path&) {
+            ++verify_calls;
+            return test::verified_state(agent::TaskStatus::Completed);
+        },
+        out, err);
+
+    REQUIRE(app.execute({"agent", "verify-log", "events.jsonl"}) ==
+            agent::ExitCode::InvalidInputOrConfig);
+    REQUIRE(verify_calls == 0);
+}
+
+TEST_CASE(cli_rejects_an_unsafe_replayed_task_id_without_printing_it) {
+    const std::string unsafe_task_id =
+        "task-0123456789abcdef\r\nINJECTED=" + std::string(4096, 'x');
+    std::ostringstream out;
+    std::ostringstream err;
+    agent::CliApp app(
+        [](const agent::RunRequest&) {
+            return test::terminal_result(agent::TaskStatus::Completed);
+        },
+        [&](const std::filesystem::path&) {
+            auto state = test::terminal_state(agent::TaskStatus::Failed);
+            state.task_id = unsafe_task_id;
+            return agent::Result<agent::TaskState>::success(std::move(state));
+        },
+        out, err);
+
+    REQUIRE(app.execute(
+                {"agent", "verify-log", "--events", "events.jsonl"}) ==
+            agent::ExitCode::InvalidEventLog);
+    REQUIRE(out.str().empty());
+    REQUIRE(err.str().find("INJECTED") == std::string::npos);
+    REQUIRE(err.str().size() < 128);
 }
 
 TEST_CASE(config_loads_defaults_and_api_key_authentication) {
@@ -371,11 +420,12 @@ TEST_CASE(startup_parser_extracts_one_explicit_env_file_before_command_dispatch)
 
 TEST_CASE(startup_parser_accepts_env_file_after_command_and_rejects_bad_forms) {
     const auto accepted = agent::parse_startup_arguments(
-        {"agent", "verify-log", "events.jsonl", "--env-file", "agent.env"});
+        {"agent", "verify-log", "--events", "events.jsonl", "--env-file",
+         "agent.env"});
     REQUIRE(accepted.has_value());
     REQUIRE((accepted.value().command_args ==
              std::vector<std::string>{"agent", "verify-log",
-                                      "events.jsonl"}));
+                                      "--events", "events.jsonl"}));
 
     const std::vector<std::vector<std::string>> rejected = {
         {"agent", "--env-file"},
@@ -388,6 +438,20 @@ TEST_CASE(startup_parser_accepts_env_file_after_command_and_rejects_bad_forms) {
         REQUIRE(parsed.error().code == agent::ErrorCode::InvalidInput);
     }
 }
+
+#if defined(_WIN32)
+TEST_CASE(windows_wide_arguments_are_converted_to_utf8_at_the_entry_boundary) {
+    const wchar_t* wide_args[] = {
+        L"agent.exe", L"run", L"--workspace", L"E:/工作区/项目",
+        L"--issue", L"修复警告\U0001F642"};
+    const auto converted = agent::utf8_arguments_from_windows(
+        static_cast<int>(std::size(wide_args)), wide_args);
+
+    REQUIRE(converted.has_value());
+    REQUIRE(converted.value().at(3) == u8"E:/工作区/项目");
+    REQUIRE(converted.value().at(5) == u8"修复警告🙂");
+}
+#endif
 
 TEST_CASE(explicit_env_loader_does_not_print_malformed_secret_lines) {
     test::ScopedTempDir temp("explicit-env-file");
@@ -458,4 +522,16 @@ TEST_CASE(system_clock_and_random_ids_follow_public_formats) {
     REQUIRE(std::regex_match(correlation_id,
                              std::regex(R"(^corr-[0-9a-f]{32}$)")));
     REQUIRE(task_id.substr(5) != correlation_id.substr(5));
+}
+
+TEST_CASE(signal_cancellation_observes_sigint_process_wide) {
+    agent::SignalCancellation first;
+    agent::SignalCancellation second;
+    REQUIRE(!first.requested());
+    REQUIRE(!second.requested());
+
+    REQUIRE(std::raise(SIGINT) == 0);
+
+    REQUIRE(first.requested());
+    REQUIRE(second.requested());
 }

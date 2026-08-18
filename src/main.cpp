@@ -18,14 +18,10 @@
 #include <utility>
 #include <vector>
 
-int main(int argc, char* argv[]) {
-    try {
-        std::vector<std::string> args;
-        args.reserve(static_cast<std::size_t>(argc));
-        for (int index = 0; index < argc; ++index) {
-            args.emplace_back(argv[index]);
-        }
+namespace {
 
+int run_agent(std::vector<std::string> args) {
+    try {
         auto startup = agent::parse_startup_arguments(args);
         if (!startup.has_value()) {
             std::cerr << startup.error().message << '\n';
@@ -85,3 +81,26 @@ int main(int argc, char* argv[]) {
         return agent::ExitCode::InvalidInputOrConfig;
     }
 }
+
+}  // namespace
+
+#if defined(_WIN32)
+int wmain(int argc, wchar_t* argv[]) {
+    const auto converted =
+        agent::utf8_arguments_from_windows(argc, argv);
+    if (!converted.has_value()) {
+        std::cerr << converted.error().message << '\n';
+        return agent::ExitCode::InvalidInputOrConfig;
+    }
+    return run_agent(std::move(converted.value()));
+}
+#else
+int main(int argc, char* argv[]) {
+    std::vector<std::string> args;
+    args.reserve(static_cast<std::size_t>(argc));
+    for (int index = 0; index < argc; ++index) {
+        args.emplace_back(argv[index]);
+    }
+    return run_agent(std::move(args));
+}
+#endif

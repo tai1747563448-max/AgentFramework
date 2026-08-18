@@ -35,6 +35,12 @@ struct StartupArguments {
 Result<StartupArguments> parse_startup_arguments(
     const std::vector<std::string>& args);
 
+#if defined(_WIN32)
+Result<std::vector<std::string>> utf8_arguments_from_windows(
+    int argc,
+    const wchar_t* const argv[]);
+#endif
+
 class CliApp {
 public:
     CliApp(RunCommand run,
