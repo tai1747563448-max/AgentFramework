@@ -36,10 +36,12 @@ add_library(agent_kernel STATIC
     src/application/state_reducer.cpp
     src/application/runtime_engine.cpp
     src/adapters/json/value_json.cpp
+    src/adapters/anthropic/cpr_http_transport.cpp
+    src/adapters/anthropic/anthropic_messages_client.cpp
     src/adapters/persistence/event_json.cpp
     src/adapters/persistence/jsonl_event_store.cpp)
 target_include_directories(agent_kernel PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_link_libraries(agent_kernel PUBLIC nlohmann_json::nlohmann_json)
+target_link_libraries(agent_kernel PUBLIC nlohmann_json::nlohmann_json PRIVATE cpr::cpr)
 if(MSVC)
     target_compile_options(agent_kernel PRIVATE /W4 /permissive- /utf-8)
 endif()
@@ -59,3 +61,4 @@ add_agent_test(runtime_event_tests tests/domain/runtime_event_test.cpp)
 add_agent_test(state_reducer_tests tests/application/state_reducer_test.cpp)
 add_agent_test(runtime_engine_tests tests/application/runtime_engine_test.cpp)
 add_agent_test(jsonl_event_store_tests tests/adapters/jsonl_event_store_test.cpp)
+add_agent_test(anthropic_adapter_tests tests/adapters/anthropic_messages_client_test.cpp)
