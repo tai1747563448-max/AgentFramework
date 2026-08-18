@@ -46,6 +46,33 @@ if(MSVC)
     target_compile_options(agent_kernel PRIVATE /W4 /permissive- /utf-8)
 endif()
 
+add_library(agent_runtime STATIC
+    src/adapters/empty/empty_tool_gateway.cpp
+    src/adapters/empty/empty_knowledge_provider.cpp
+    src/adapters/system/system_clock.cpp
+    src/adapters/system/random_id_generator.cpp
+    src/adapters/system/signal_cancellation.cpp
+    src/config/runtime_config.cpp
+    src/cli/cli_app.cpp)
+target_include_directories(agent_runtime PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(agent_runtime PUBLIC agent_kernel PRIVATE dotenv_header_only)
+if(MSVC)
+    target_compile_options(agent_runtime PRIVATE /W4 /permissive- /utf-8)
+    target_compile_definitions(agent_runtime PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_executable(agent src/main.cpp)
+target_link_libraries(agent PRIVATE agent_runtime)
+if(WIN32)
+    add_custom_command(TARGET agent POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_RUNTIME_DLLS:agent> $<TARGET_FILE_DIR:agent>
+        COMMAND_EXPAND_LISTS)
+endif()
+if(MSVC)
+    target_compile_options(agent PRIVATE /W4 /permissive- /utf-8)
+endif()
+
 enable_testing()
 function(add_agent_test target source)
     add_executable(${target} tests/test_main.cpp ${source})
@@ -62,3 +89,5 @@ add_agent_test(state_reducer_tests tests/application/state_reducer_test.cpp)
 add_agent_test(runtime_engine_tests tests/application/runtime_engine_test.cpp)
 add_agent_test(jsonl_event_store_tests tests/adapters/jsonl_event_store_test.cpp)
 add_agent_test(anthropic_adapter_tests tests/adapters/anthropic_messages_client_test.cpp)
+add_agent_test(cli_tests tests/cli/cli_app_test.cpp)
+target_link_libraries(cli_tests PRIVATE agent_runtime)
