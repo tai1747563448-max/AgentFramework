@@ -227,6 +227,28 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                 return Result<void>::success();
             } else if constexpr (
                 std::is_same_v<Payload, TaskBudgetExceededPayload>) {
+                const bool follows_max_tokens =
+                    state.accepted_model_stop_reason == StopReason::MaxTokens;
+                const bool follows_text_completion =
+                    state.accepted_model_stop_reason == StopReason::EndTurn ||
+                    state.accepted_model_stop_reason == StopReason::StopSequence;
+                if (typed_payload.budget_name == "max_tokens") {
+                    const RuntimeError expected_error{
+                        ErrorCode::BudgetExceeded,
+                        "model output token budget exceeded", false};
+                    if (state.status != TaskStatus::AwaitingModel ||
+                        state.model_call_in_flight || !follows_max_tokens ||
+                        state.messages.empty() ||
+                        state.messages.back().role != Role::Assistant ||
+                        response_contains_tool_calls(state.messages.back()) ||
+                        !(typed_payload.error == expected_error)) {
+                        return invalid_transition(
+                            "task budget terminal does not match accepted response");
+                    }
+                } else if (follows_max_tokens || follows_text_completion) {
+                    return invalid_transition(
+                        "task budget terminal does not match accepted response");
+                }
                 state.terminal_error = typed_payload.error;
                 state.status = TaskStatus::BudgetExceeded;
                 return Result<void>::success();

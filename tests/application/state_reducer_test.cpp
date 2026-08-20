@@ -452,6 +452,173 @@ TEST_CASE(replay_binds_every_stop_reason_to_its_content_shape) {
     REQUIRE(!max_tokens.value().final_text.has_value());
 }
 
+TEST_CASE(max_tokens_budget_terminal_requires_exact_prior_response_and_payload) {
+    const std::string task = "max-tokens-binding";
+    const agent::TaskBudgetExceededPayload exact{
+        "max_tokens",
+        {agent::ErrorCode::BudgetExceeded,
+         "model output token budget exceeded", false}};
+    const std::vector<agent::RuntimeEvent> accepted_max_tokens = {
+        fixtures::task_started(task, 1, "issue"),
+        fixtures::context_started(task, 2),
+        fixtures::context_prepared(task, 3, "source"),
+        fixtures::model_started(task, 4),
+        fixtures::model_succeeded(task, 5, {agent::TextBlock{"partial"}},
+                                  agent::StopReason::MaxTokens),
+    };
+
+    auto exact_trace = accepted_max_tokens;
+    exact_trace.push_back(fixtures::event(task, 6, exact));
+    const auto exact_result = agent::replay_events(exact_trace);
+    REQUIRE(exact_result.has_value());
+    REQUIRE(exact_result.value().status == agent::TaskStatus::BudgetExceeded);
+    REQUIRE(exact_result.value().terminal_error ==
+            std::optional<agent::RuntimeError>{exact.error});
+
+    const auto require_invalid = [](std::vector<agent::RuntimeEvent> events) {
+        const auto result = agent::replay_events(events);
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == agent::ErrorCode::InvalidTransition);
+    };
+
+    require_invalid({
+        fixtures::task_started(task, 1, "issue"),
+        fixtures::event(task, 2, exact),
+    });
+    require_invalid({
+        fixtures::task_started(task, 1, "issue"),
+        fixtures::context_started(task, 2),
+        fixtures::context_prepared(task, 3, "source"),
+        fixtures::model_started(task, 4),
+        fixtures::event(task, 5, exact),
+    });
+    require_invalid({
+        fixtures::task_started(task, 1, "issue"),
+        fixtures::context_started(task, 2),
+        fixtures::context_prepared(task, 3, "source"),
+        fixtures::model_started(task, 4),
+        fixtures::model_succeeded(task, 5, {agent::TextBlock{"done"}},
+                                  agent::StopReason::EndTurn),
+        fixtures::event(
+            task, 6,
+            agent::TaskBudgetExceededPayload{
+                "max_task_time_ms",
+                {agent::ErrorCode::BudgetExceeded,
+                 "max_task_time_ms budget exceeded", false}}),
+    });
+    require_invalid({
+        fixtures::task_started(task, 1, "issue"),
+        fixtures::context_started(task, 2),
+        fixtures::context_prepared(task, 3, "source"),
+        fixtures::model_started(task, 4),
+        fixtures::model_succeeded(task, 5, {agent::TextBlock{"done"}},
+                                  agent::StopReason::StopSequence),
+        fixtures::event(
+            task, 6,
+            agent::TaskBudgetExceededPayload{
+                "max_model_rounds",
+                {agent::ErrorCode::BudgetExceeded,
+                 "max_model_rounds budget exceeded", false}}),
+    });
+    require_invalid({
+        fixtures::task_started(task, 1, "issue"),
+        fixtures::context_started(task, 2),
+        fixtures::context_prepared(task, 3, "source"),
+        fixtures::model_started(task, 4),
+        fixtures::model_succeeded(
+            task, 5, {agent::ToolUseBlock{fixtures::first_call()}},
+            agent::StopReason::ToolUse),
+        fixtures::event(task, 6, exact),
+    });
+
+    auto changed_budget_name = accepted_max_tokens;
+    changed_budget_name.push_back(fixtures::event(
+        task, 6,
+        agent::TaskBudgetExceededPayload{"max_model_rounds", exact.error}));
+    require_invalid(std::move(changed_budget_name));
+
+    auto changed_error_code = accepted_max_tokens;
+    changed_error_code.push_back(fixtures::event(
+        task, 6,
+        agent::TaskBudgetExceededPayload{
+            "max_tokens",
+            {agent::ErrorCode::InvalidInput,
+             "model output token budget exceeded", false}}));
+    require_invalid(std::move(changed_error_code));
+
+    auto changed_error_message = accepted_max_tokens;
+    changed_error_message.push_back(fixtures::event(
+        task, 6,
+        agent::TaskBudgetExceededPayload{
+            "max_tokens",
+            {agent::ErrorCode::BudgetExceeded, "token budget exceeded", false}}));
+    require_invalid(std::move(changed_error_message));
+
+    auto changed_retryable = accepted_max_tokens;
+    changed_retryable.push_back(fixtures::event(
+        task, 6,
+        agent::TaskBudgetExceededPayload{
+            "max_tokens",
+            {agent::ErrorCode::BudgetExceeded,
+             "model output token budget exceeded", true}}));
+    require_invalid(std::move(changed_retryable));
+}
+
+TEST_CASE(non_max_token_budget_guards_remain_replayable) {
+    struct LegalBudgetTrace {
+        std::vector<agent::RuntimeEvent> events;
+        agent::RuntimeError expected_error;
+    };
+
+    const std::vector<LegalBudgetTrace> traces = {
+        {{fixtures::task_started("time-budget", 1, "issue"),
+          fixtures::context_started("time-budget", 2),
+          fixtures::event(
+              "time-budget", 3,
+              agent::TaskBudgetExceededPayload{
+                  "max_task_time_ms",
+                  {agent::ErrorCode::BudgetExceeded,
+                   "max_task_time_ms budget exceeded", false}})},
+         {agent::ErrorCode::BudgetExceeded,
+          "max_task_time_ms budget exceeded", false}},
+        {{fixtures::task_started("round-budget", 1, "issue"),
+          fixtures::context_started("round-budget", 2),
+          fixtures::context_prepared("round-budget", 3, "source"),
+          fixtures::event(
+              "round-budget", 4,
+              agent::TaskBudgetExceededPayload{
+                  "max_model_rounds",
+                  {agent::ErrorCode::BudgetExceeded,
+                   "max_model_rounds budget exceeded", false}})},
+         {agent::ErrorCode::BudgetExceeded,
+          "max_model_rounds budget exceeded", false}},
+        {{fixtures::task_started("tool-budget", 1, "issue"),
+          fixtures::context_started("tool-budget", 2),
+          fixtures::context_prepared("tool-budget", 3, "source"),
+          fixtures::model_started("tool-budget", 4),
+          fixtures::model_succeeded(
+              "tool-budget", 5,
+              {agent::ToolUseBlock{fixtures::first_call()}},
+              agent::StopReason::ToolUse),
+          fixtures::event(
+              "tool-budget", 6,
+              agent::TaskBudgetExceededPayload{
+                  "max_tool_calls",
+                  {agent::ErrorCode::BudgetExceeded,
+                   "max_tool_calls budget exceeded", false}})},
+         {agent::ErrorCode::BudgetExceeded,
+          "max_tool_calls budget exceeded", false}},
+    };
+
+    for (const auto& trace : traces) {
+        const auto result = agent::replay_events(trace.events);
+        REQUIRE(result.has_value());
+        REQUIRE(result.value().status == agent::TaskStatus::BudgetExceeded);
+        REQUIRE(result.value().terminal_error ==
+                std::optional<agent::RuntimeError>{trace.expected_error});
+    }
+}
+
 TEST_CASE(task_completed_must_equal_the_immediately_accepted_terminal_text) {
     auto events = fixtures::completed_text_trace(
         "final-text-binding", "issue", "accepted");

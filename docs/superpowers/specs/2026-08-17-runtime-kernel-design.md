@@ -266,6 +266,8 @@ runtime_data/tasks/<task_id>/events.jsonl
 
 停止原因与内容严格绑定：`ToolUse` 至少包含一个 `ToolUseBlock`（可同时含有有序文本）；`EndTurn`/`StopSequence` 只能包含非空拼接文本且不得含工具，并且 `TaskCompleted.final_text` 必须精确等于该响应文本；无工具的 `MaxTokens` 先接受成功响应再以固定、非秘密的 `BudgetExceeded` 错误终止，不得完成。未知或内容不一致的停止原因直接记录 `ModelCallFailed` 协议失败。
 
+`max_tokens` 的 `TaskBudgetExceeded` 仅可紧接在已接受的 `MaxTokens ModelCallSucceeded` 之后回放，且必须携带精确、固定的 `max_tokens` payload。`EndTurn` 和 `StopSequence` 只接受 `TaskCompleted`，不接受预算终态；通用的时间、模型轮次和工具调用预算事件继续保留各自现有的合法守卫状态。
+
 第一阶段不做自动重试。请求开始但结果未知的情况保留在事件日志中，由后续 Recovery 子项目定义处理策略。
 
 ## 10. 配置与密钥
