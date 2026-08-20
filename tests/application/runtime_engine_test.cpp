@@ -1105,6 +1105,37 @@ TEST_CASE(max_tokens_without_tools_is_budget_exceeded_after_accepted_response) {
     REQUIRE(exceeded->budget_name == "max_tokens");
 }
 
+TEST_CASE(empty_max_tokens_response_is_accepted_before_exact_budget_terminal) {
+    test::EngineFixture fixture(
+        test::FakeModel({fixtures::stopped_response(
+            {}, agent::StopReason::MaxTokens, "max_tokens")}),
+        test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
+
+    const auto result = fixture.run(fixtures::run_request("long task"));
+    const agent::RuntimeError expected{
+        agent::ErrorCode::BudgetExceeded,
+        "model output token budget exceeded", false};
+
+    REQUIRE(result.state.has_value());
+    REQUIRE(!result.fatal_error.has_value());
+    REQUIRE(result.state->status == agent::TaskStatus::BudgetExceeded);
+    REQUIRE(result.state->terminal_error ==
+            std::optional<agent::RuntimeError>{expected});
+    REQUIRE(fixture.events.count(agent::EventKind::ModelCallSucceeded) == 1);
+    REQUIRE(fixture.events.count(agent::EventKind::ModelCallFailed) == 0);
+    REQUIRE(fixture.events.count(agent::EventKind::TaskBudgetExceeded) == 1);
+    REQUIRE(fixture.events.count(agent::EventKind::TaskCompleted) == 0);
+    const auto* succeeded = std::get_if<agent::ModelCallSucceededPayload>(
+        &fixture.events.events.at(4).payload);
+    REQUIRE(succeeded != nullptr);
+    REQUIRE(succeeded->response.content.empty());
+    const auto* exceeded = std::get_if<agent::TaskBudgetExceededPayload>(
+        &fixture.events.events.back().payload);
+    REQUIRE(exceeded != nullptr);
+    REQUIRE(exceeded->budget_name == "max_tokens");
+    REQUIRE(exceeded->error == expected);
+}
+
 TEST_CASE(model_tool_result_blocks_fail_before_success_or_terminal_routing) {
     const auto call = fixtures::call("call-1", "read");
     const agent::ToolResultBlock tool_result{
@@ -1177,6 +1208,12 @@ TEST_CASE(inconsistent_stop_and_content_rows_fail_directly_as_model_protocol) {
         fixtures::stopped_response({}, agent::StopReason::EndTurn,
                                    "end_turn"),
         fixtures::stopped_response({}, agent::StopReason::StopSequence,
+                                   "stop_sequence"),
+        fixtures::stopped_response({agent::TextBlock{""}},
+                                   agent::StopReason::EndTurn,
+                                   "end_turn"),
+        fixtures::stopped_response({agent::TextBlock{""}},
+                                   agent::StopReason::StopSequence,
                                    "stop_sequence"),
     };
 

@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <variant>
@@ -174,21 +175,24 @@ TEST_CASE(anthropic_adapter_maps_ordered_tool_request_and_response) {
 TEST_CASE(anthropic_adapter_rejects_tool_results_in_provider_responses) {
     const std::string block_contents = "PROVIDER_TOOL_RESULT_CONTENT";
     const std::string credential = "PROVIDER_TOOL_RESULT_CREDENTIAL";
-    test::FakeHttpTransport http(fixtures::response(
-        "[{\"type\":\"text\",\"text\":\"unexpected\"},"
-        "{\"type\":\"tool_result\",\"tool_use_id\":\"call-1\","
-        "\"content\":\"" +
-        block_contents + "\",\"is_error\":false}]"));
-    agent::AnthropicMessagesClient client(fixtures::config(credential), http);
+    const char* known_stops[] = {
+        "end_turn", "stop_sequence", "max_tokens", "tool_use"};
+    for (const auto* stop : known_stops) {
+        test::FakeHttpTransport http(fixtures::response(
+            "[{\"type\":\"tool_result\",\"content\":\"" +
+                block_contents + "\"}]",
+            stop));
+        agent::AnthropicMessagesClient client(fixtures::config(credential), http);
 
-    const auto result = client.complete(fixtures::simple_model_request());
+        const auto result = client.complete(fixtures::simple_model_request());
 
-    REQUIRE(!result.has_value());
-    REQUIRE(result.error().code == agent::ErrorCode::ProtocolFailure);
-    REQUIRE(result.error().message ==
-            "provider response contains an invalid tool-result block");
-    REQUIRE(result.error().message.find(block_contents) == std::string::npos);
-    REQUIRE(result.error().message.find(credential) == std::string::npos);
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == agent::ErrorCode::ProtocolFailure);
+        REQUIRE(result.error().message ==
+                "provider response contains an invalid tool-result block");
+        REQUIRE(result.error().message.find(block_contents) == std::string::npos);
+        REQUIRE(result.error().message.find(credential) == std::string::npos);
+    }
 }
 
 TEST_CASE(anthropic_adapter_uses_exactly_one_bearer_authentication_scheme) {
@@ -249,20 +253,100 @@ TEST_CASE(anthropic_adapter_maps_all_known_and_unknown_stop_reasons) {
     struct StopCase {
         const char* raw;
         agent::StopReason mapped;
+        const char* content;
     };
-    const StopCase cases[] = {{"end_turn", agent::StopReason::EndTurn},
-                              {"tool_use", agent::StopReason::ToolUse},
-                              {"max_tokens", agent::StopReason::MaxTokens},
-                              {"stop_sequence", agent::StopReason::StopSequence},
-                              {"provider_future_stop", agent::StopReason::Unknown}};
+    const StopCase cases[] = {
+        {"end_turn", agent::StopReason::EndTurn,
+         "[{\"type\":\"text\",\"text\":\"Done\"}]"},
+        {"tool_use", agent::StopReason::ToolUse,
+         "[{\"type\":\"tool_use\",\"id\":\"call-1\","
+         "\"name\":\"read_file\",\"input\":{}}]"},
+        {"max_tokens", agent::StopReason::MaxTokens, "[]"},
+        {"stop_sequence", agent::StopReason::StopSequence,
+         "[{\"type\":\"text\",\"text\":\"\"},"
+         "{\"type\":\"text\",\"text\":\"Done\"}]"},
+        {"provider_future_stop", agent::StopReason::Unknown,
+         "[{\"type\":\"text\",\"text\":\"Done\"}]"}};
 
     for (const auto& item : cases) {
-        test::FakeHttpTransport http(fixtures::text_response(item.raw));
+        test::FakeHttpTransport http(fixtures::response(item.content, item.raw));
         agent::AnthropicMessagesClient client(fixtures::config(), http);
         const auto result = client.complete(fixtures::simple_model_request());
         REQUIRE(result.has_value());
         REQUIRE(result.value().stop_reason == item.mapped);
         REQUIRE(result.value().raw_stop_reason == item.raw);
+    }
+}
+
+TEST_CASE(anthropic_adapter_preserves_empty_max_tokens_content) {
+    struct MaxTokensCase {
+        const char* content;
+        const char* expected_text;
+    };
+    const MaxTokensCase cases[] = {
+        {"[]", nullptr},
+        {"[{\"type\":\"text\",\"text\":\"\"}]", ""},
+        {"[{\"type\":\"text\",\"text\":\"partial\"}]", "partial"},
+    };
+
+    for (const auto& item : cases) {
+        test::FakeHttpTransport http(
+            fixtures::response(item.content, "max_tokens"));
+        agent::AnthropicMessagesClient client(fixtures::config(), http);
+
+        const auto result = client.complete(fixtures::simple_model_request());
+
+        if (!result.has_value()) {
+            throw std::runtime_error(
+                "expected max_tokens content to be preserved: " +
+                result.error().message);
+        }
+        REQUIRE(result.has_value());
+        REQUIRE(result.value().stop_reason == agent::StopReason::MaxTokens);
+        REQUIRE(result.value().raw_stop_reason == "max_tokens");
+        if (item.expected_text == nullptr) {
+            REQUIRE(result.value().content.empty());
+        } else {
+            REQUIRE(result.value().content.size() == 1);
+            REQUIRE(std::get<agent::TextBlock>(result.value().content.front()).text
+                    == item.expected_text);
+        }
+    }
+}
+
+TEST_CASE(anthropic_adapter_rejects_known_stop_content_matrix_mismatches) {
+    struct InvalidCase {
+        const char* stop_reason;
+        const char* content;
+    };
+    const InvalidCase invalid[] = {
+        {"end_turn", "[]"},
+        {"end_turn", "[{\"type\":\"text\",\"text\":\"\"}]"},
+        {"end_turn",
+         "[{\"type\":\"text\",\"text\":\"done\"},"
+         "{\"type\":\"tool_use\",\"id\":\"call-1\","
+         "\"name\":\"read_file\",\"input\":{}}]"},
+        {"stop_sequence", "[]"},
+        {"stop_sequence", "[{\"type\":\"text\",\"text\":\"\"}]"},
+        {"stop_sequence",
+         "[{\"type\":\"tool_use\",\"id\":\"call-1\","
+         "\"name\":\"read_file\",\"input\":{}}]"},
+        {"tool_use", "[]"},
+        {"tool_use", "[{\"type\":\"text\",\"text\":\"working\"}]"},
+        {"max_tokens",
+         "[{\"type\":\"tool_use\",\"id\":\"call-1\","
+         "\"name\":\"read_file\",\"input\":{}}]"},
+    };
+
+    for (const auto& item : invalid) {
+        test::FakeHttpTransport http(
+            fixtures::response(item.content, item.stop_reason));
+        agent::AnthropicMessagesClient client(fixtures::config(), http);
+
+        const auto result = client.complete(fixtures::simple_model_request());
+
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == agent::ErrorCode::ProtocolFailure);
     }
 }
 

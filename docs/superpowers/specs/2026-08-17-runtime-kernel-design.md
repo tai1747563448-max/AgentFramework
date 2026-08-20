@@ -269,7 +269,7 @@ runtime_data/tasks/<task_id>/events.jsonl
 
 每次知识、模型或工具外部调用前检查相应预算。达到预算后写入 `TaskBudgetExceeded`，不再发起调用。用户取消写入 `TaskCancelled`。终态写入后 Engine 必须立即停止。
 
-停止原因与内容严格绑定：`ToolResultBlock` 在所有模型响应中都非法；`ToolUse` 至少包含一个 `ToolUseBlock`，其余块只能是有序 `TextBlock`；`EndTurn`/`StopSequence` 只能包含一个或多个 `TextBlock`，拼接文本必须非空，并且 `TaskCompleted.final_text` 必须精确等于该响应文本；`MaxTokens` 不得包含 `ToolUseBlock` 或 `ToolResultBlock`，可以包含文本，合法响应先接受成功事件再以固定、非秘密的 `BudgetExceeded` 错误终止，不得完成。未知或内容不一致的停止原因直接记录 `ModelCallFailed` 协议失败。
+停止原因与内容严格绑定：`ToolResultBlock` 在所有模型响应中都非法；`ToolUse` 至少包含一个 `ToolUseBlock`，其余块只能是有序 `TextBlock`；`EndTurn`/`StopSequence` 只能包含一个或多个 `TextBlock`，拼接文本必须非空，并且 `TaskCompleted.final_text` 必须精确等于该响应文本；`MaxTokens` 可以是零个内容块，也可以只包含有序 `TextBlock`（包括空 `text`），但不得包含 `ToolUseBlock` 或 `ToolResultBlock`，合法响应先接受成功事件再以固定、非秘密的 `BudgetExceeded` 错误终止，不得完成。未知或内容不一致的停止原因直接记录 `ModelCallFailed` 协议失败。
 
 `max_tokens` 的 `TaskBudgetExceeded` 仅可紧接在已接受的 `MaxTokens ModelCallSucceeded` 之后回放，且必须携带精确、固定的 `max_tokens` payload。`EndTurn` 和 `StopSequence` 只接受 `TaskCompleted`，不接受预算终态；通用的时间、模型轮次和工具调用预算事件继续保留各自现有的合法守卫状态。
 
@@ -371,7 +371,8 @@ task_id=<validated> sequence=<n> event=<fixed-name> status=<fixed-name>
 通过 Fake HTTP Transport 验证：
 
 - 内部消息和工具定义映射到 Messages 请求；
-- 文本、`tool_use` 和停止原因的响应映射，以及请求侧用户 `tool_result` 的映射与响应侧拒绝；
+- 文本、`tool_use` 和停止原因的响应映射，以及请求侧用户 `tool_result` 的映射与响应侧在读取其 payload 前拒绝；
+- 已知停止原因的精确内容矩阵，包括保留空数组/空文本的 `max_tokens`，以及未知停止原因的规范化；
 - 多内容块顺序；
 - 非 2xx、超时、空正文、非法 JSON 和缺少字段；
 - 错误与日志不包含认证值。

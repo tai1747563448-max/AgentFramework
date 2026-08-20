@@ -33,6 +33,8 @@
 3. A progress callback receives `RuntimeProgress`, not `RuntimeEvent`, so the CLI cannot accidentally print payloads. `RuntimeEngine` invokes it only after the event is durable and the reduced state is committed.
 4. The callback is supplied per `run` call rather than stored as global mutable Engine state; this keeps tests deterministic and avoids coupling the core to `std::cout`. The V1 is still single-threaded, but the API does not create hidden observer lifetime state.
 5. The actual Windows-console Unicode process path remains a documented Minor evidence gap. This plan does not add a local HTTP server or test-only production mode merely to manufacture a successful live-looking `run`; existing UTF-8 argument/renderer unit evidence remains truthful and no real-provider smoke is claimed.
+6. Anthropic, Engine, and Reducer use the same stop/content matrix. In particular, `MaxTokens` may carry zero blocks or text blocks (including empty text) but never tool-use/tool-result; `EndTurn`/`StopSequence` require nonempty concatenated text only; `ToolUse` requires at least one tool-use and otherwise text only.
+7. Generic replay budgets are allowlisted and exact: `max_task_time_ms`, `max_model_rounds`, and `max_tool_calls` use `{BudgetExceeded, "<name> budget exceeded", false}`. Count guards must be reconstructibly exhausted; the time guard cannot prove monotonic elapsed time from current V1 state, so it validates only the exact payload and legal pre-external-call state.
 
 ### Task 1: Reject tool-result blocks in model responses at all three trust boundaries
 
@@ -194,6 +196,90 @@ feat: report safe runtime progress
 ```
 
 Push and verify all local/tracking/bare SHAs and a clean tracked worktree. Write the required task report with RED/GREEN/full-suite/process evidence.
+
+### Task 3: Align Anthropic MaxTokens with the exact stop/content matrix
+
+**Files:**
+- Modify: `tests/adapters/anthropic_messages_client_test.cpp`
+- Modify: `tests/application/runtime_engine_test.cpp`
+- Modify: `tests/application/state_reducer_test.cpp`
+- Modify: `src/adapters/anthropic/anthropic_messages_client.cpp`
+- Modify: `docs/superpowers/specs/2026-08-17-runtime-kernel-design.md`
+- Modify: `docs/superpowers/plans/2026-08-20-runtime-kernel-merge-review-fixes.md`
+
+**Step 1: Add a cross-layer matrix test before production changes**
+
+- Anthropic Fake HTTP responses must accept `max_tokens` with `content: []` and with one empty text block, returning the normalized response without inventing text.
+- Anthropic must reject `end_turn` / `stop_sequence` without nonempty concatenated text, `tool_use` without a tool-use block, and any known stop/content combination containing a disallowed block.
+- Engine must turn an empty-content `MaxTokens` Fake response into the existing accepted `ModelCallSucceeded` followed by exact `TaskBudgetExceeded(max_tokens)`; it must not emit `ModelCallFailed` or `TaskCompleted`.
+- Reducer/replay must accept the same empty-content `ModelCallSucceeded(MaxTokens)` followed by the exact max-token budget event, while preserving all negative stop/content cases.
+
+**Step 2: Capture RED**
+
+Build and run Anthropic/Engine/Reducer focused tests. The provider empty-MaxTokens acceptance must fail against the current adapter for the expected `provider response has no usable content` behavior; already-correct Engine/Reducer rows may be GREEN and serve as cross-layer lock tests, not fabricated RED.
+
+**Step 3: Implement the minimal Provider validation alignment**
+
+- Decode/map `stop_reason` before applying the final content-usable rule.
+- Validate known stop reasons against the exact matrix above. `MaxTokens` accepts an empty array or text-only blocks; it still rejects tool-use/tool-result. Do not synthesize content.
+- Preserve explicit response-side `tool_result` rejection before reading its payload, unknown-stop normalization for Engine handling, signed token validation, and all credential/error redaction.
+
+**Step 4: GREEN, full suite, commit, backup**
+
+Run focused executables, full Debug build and CTest; no live test. Self-review the six-path scope and exact matrix. Commit:
+
+```text
+fix: align provider stop content validation
+```
+
+Push `backup/feat/runtime-kernel`, verify local/tracking/bare SHA equality and clean tracked status, and write Task 3 report with RED/GREEN evidence.
+
+### Task 4: Bind generic budget replay to legal guards and exact payloads
+
+**Files:**
+- Modify: `tests/application/state_reducer_test.cpp`
+- Modify: `src/application/state_reducer.cpp`
+- Modify: `docs/superpowers/specs/2026-08-17-runtime-kernel-design.md`
+
+**Step 1: Replace weak positives with reconstructibly legal traces**
+
+- `max_task_time_ms`: accept only from a real pre-external-call state (`PreparingContext`, idle `AwaitingModel`, or idle `AwaitingTool`) with the exact fixed error. The test states explicitly that elapsed monotonic time is not reconstructible from V1 events.
+- `max_model_rounds`: create a complete first tool round with `max_model_rounds=1`, return through context preparation to idle `AwaitingModel`, prove `usage.model_rounds == limit`, then accept the exact budget event.
+- `max_tool_calls`: create two pending tool calls with `max_tool_calls=1`, complete the first, prove one remains and `usage.tool_calls == limit`, then accept the exact budget event.
+
+**Step 2: Add forged/tampered negatives**
+
+Use real replay events and assert `InvalidTransition` for:
+
+- unknown or empty budget name;
+- each known name with wrong error code, wrong message, or `retryable=true`;
+- each known budget from `Created`, with an in-flight model call, or with an active tool call;
+- `max_model_rounds` before `usage.model_rounds >= budgets.max_model_rounds`;
+- `max_tool_calls` before `usage.tool_calls >= budgets.max_tool_calls`, without pending work, or from the wrong status;
+- keep existing rejection after accepted MaxTokens/EndTurn/StopSequence and exact max-token payload tests.
+
+**Step 3: Capture RED**
+
+Build and run `state_reducer_tests`. The new unknown/payload/state/unexhausted cases must fail because the current generic branch accepts them.
+
+**Step 4: Implement minimal Reducer guard validation**
+
+- Before terminal mutation, allow only the three generic names and the exact fixed `RuntimeError` derived from the name.
+- Require no in-flight model call and no active tool call for all generic guards.
+- Time guard: require one of the three legal pre-external-call states; do not claim to validate elapsed time.
+- Model-round guard: require idle `AwaitingModel`, no accepted terminal stop, and `usage.model_rounds >= budgets.max_model_rounds`.
+- Tool-call guard: require idle `AwaitingTool`, accepted `ToolUse`, pending unprocessed call, and `usage.tool_calls >= budgets.max_tool_calls`.
+- Preserve the separate exact `max_tokens` causal branch and terminal mutation only after validation.
+
+**Step 5: GREEN, regressions, commit, backup**
+
+Run reducer and Engine focused executables, full Debug build/CTest, and credential-free process checks. Confirm no new state/event/field, no failure-state drift, and no live test. Commit:
+
+```text
+fix: bind generic budget replay
+```
+
+Push and verify all SHAs plus clean tracked status; write Task 4 report with genuine RED/GREEN evidence.
 
 ## Final controller and review gate
 

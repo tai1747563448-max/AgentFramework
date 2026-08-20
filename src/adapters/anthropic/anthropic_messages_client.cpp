@@ -196,7 +196,10 @@ Result<ModelResponse> decode_response(const HttpResponse& response) {
         }
 
         ModelResponse decoded;
-        bool usable = false;
+        decoded.raw_stop_reason = json.at("stop_reason").get<std::string>();
+        decoded.stop_reason = map_stop_reason(decoded.raw_stop_reason);
+        bool contains_nonempty_text = false;
+        bool contains_tool_use = false;
         for (const auto& block : json.at("content")) {
             if (!block.is_object() || !block.contains("type") ||
                 !block.at("type").is_string()) {
@@ -208,7 +211,7 @@ Result<ModelResponse> decode_response(const HttpResponse& response) {
             if (type == "text") {
                 const auto text = block.at("text").get<std::string>();
                 decoded.content.push_back(TextBlock{text});
-                usable = usable || !text.empty();
+                contains_nonempty_text = contains_nonempty_text || !text.empty();
             } else if (type == "tool_use") {
                 auto id = block.at("id").get<std::string>();
                 auto name = block.at("name").get<std::string>();
@@ -226,7 +229,7 @@ Result<ModelResponse> decode_response(const HttpResponse& response) {
                 decoded.content.push_back(
                     ToolUseBlock{{std::move(id), std::move(name),
                                   std::move(arguments.value())}});
-                usable = true;
+                contains_tool_use = true;
             } else if (type == "tool_result") {
                 return failure<ModelResponse>(
                     ErrorCode::ProtocolFailure,
@@ -237,13 +240,37 @@ Result<ModelResponse> decode_response(const HttpResponse& response) {
             }
         }
 
-        if (!usable) {
+        switch (decoded.stop_reason) {
+        case StopReason::EndTurn:
+        case StopReason::StopSequence:
+            if (contains_tool_use || !contains_nonempty_text) {
+                return failure<ModelResponse>(
+                    ErrorCode::ProtocolFailure,
+                    "provider response content does not match stop reason");
+            }
+            break;
+        case StopReason::ToolUse:
+            if (!contains_tool_use) {
+                return failure<ModelResponse>(
+                    ErrorCode::ProtocolFailure,
+                    "provider response content does not match stop reason");
+            }
+            break;
+        case StopReason::MaxTokens:
+            if (contains_tool_use) {
+                return failure<ModelResponse>(
+                    ErrorCode::ProtocolFailure,
+                    "provider response content does not match stop reason");
+            }
+            break;
+        case StopReason::Unknown:
+            if (contains_nonempty_text || contains_tool_use) {
+                break;
+            }
             return failure<ModelResponse>(ErrorCode::ProtocolFailure,
                                           "provider response has no usable content");
         }
 
-        decoded.raw_stop_reason = json.at("stop_reason").get<std::string>();
-        decoded.stop_reason = map_stop_reason(decoded.raw_stop_reason);
         const auto& usage = json.at("usage");
         decoded.input_tokens = token_count(usage.at("input_tokens"));
         decoded.output_tokens = token_count(usage.at("output_tokens"));

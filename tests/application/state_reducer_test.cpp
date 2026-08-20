@@ -390,6 +390,8 @@ TEST_CASE(replay_binds_every_stop_reason_to_its_content_shape) {
         {agent::StopReason::MaxTokens, {agent::ToolUseBlock{call}}},
         {agent::StopReason::EndTurn, {}},
         {agent::StopReason::StopSequence, {}},
+        {agent::StopReason::EndTurn, {agent::TextBlock{""}}},
+        {agent::StopReason::StopSequence, {agent::TextBlock{""}}},
     };
     for (const auto& item : invalid) {
         std::vector<agent::RuntimeEvent> events = {
@@ -450,6 +452,25 @@ TEST_CASE(replay_binds_every_stop_reason_to_its_content_shape) {
     REQUIRE(max_tokens.has_value());
     REQUIRE(max_tokens.value().status == agent::TaskStatus::BudgetExceeded);
     REQUIRE(!max_tokens.value().final_text.has_value());
+
+    auto empty_max_tokens = agent::replay_events({
+        fixtures::task_started(task, 1, "issue"),
+        fixtures::context_started(task, 2),
+        fixtures::context_prepared(task, 3, "source"),
+        fixtures::model_started(task, 4),
+        fixtures::model_succeeded(task, 5, {}, agent::StopReason::MaxTokens),
+        fixtures::event(task, 6,
+                        agent::TaskBudgetExceededPayload{
+                            "max_tokens", budget_error}),
+    });
+    REQUIRE(empty_max_tokens.has_value());
+    REQUIRE(empty_max_tokens.value().status ==
+            agent::TaskStatus::BudgetExceeded);
+    REQUIRE(empty_max_tokens.value().messages.back().role ==
+            agent::Role::Assistant);
+    REQUIRE(empty_max_tokens.value().messages.back().content.empty());
+    REQUIRE(empty_max_tokens.value().terminal_error ==
+            std::optional<agent::RuntimeError>{budget_error});
 }
 
 TEST_CASE(replay_rejects_forged_model_tool_result_blocks_for_every_stop_shape) {
