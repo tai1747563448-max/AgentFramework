@@ -29,6 +29,15 @@ bool contains_tool_call(const ModelResponse& response) {
     return false;
 }
 
+bool contains_tool_result(const ModelResponse& response) {
+    for (const auto& block : response.content) {
+        if (std::holds_alternative<ToolResultBlock>(block)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string concatenate_text(const ModelResponse& response) {
     std::string final_text;
     for (const auto& block : response.content) {
@@ -192,14 +201,19 @@ RuntimeResult RuntimeEngine::run(const RunRequest& request) {
                                 ModelCallFailedPayload{response.error()});
         }
 
-        const bool has_tool_call = contains_tool_call(response.value());
-        const auto final_text = concatenate_text(response.value());
         const auto protocol_failure = [&](const char* message) {
             return append_event(
                 state, task_id,
                 ModelCallFailedPayload{
                     {ErrorCode::ProtocolFailure, message, false}});
         };
+        if (contains_tool_result(response.value())) {
+            return protocol_failure(
+                "model response contains an invalid tool-result block");
+        }
+
+        const bool has_tool_call = contains_tool_call(response.value());
+        const auto final_text = concatenate_text(response.value());
 
         switch (response.value().stop_reason) {
         case StopReason::Unknown:

@@ -93,8 +93,7 @@ agent::ToolCall tool_call() {
 }
 
 agent::ModelResponse response_with_tool() {
-    return {{agent::TextBlock{u8"先读取"}, agent::ToolUseBlock{tool_call()},
-             agent::ToolResultBlock{{"embedded", u8"有序块", true}}},
+    return {{agent::TextBlock{u8"先读取"}, agent::ToolUseBlock{tool_call()}},
             agent::StopReason::ToolUse,
             "tool_use",
             123,

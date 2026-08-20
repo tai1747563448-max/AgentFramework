@@ -452,6 +452,42 @@ TEST_CASE(replay_binds_every_stop_reason_to_its_content_shape) {
     REQUIRE(!max_tokens.value().final_text.has_value());
 }
 
+TEST_CASE(replay_rejects_forged_model_tool_result_blocks_for_every_stop_shape) {
+    const std::string task = "tool-result-forgery";
+    const auto call = fixtures::first_call();
+    const agent::ToolResultBlock tool_result{
+        {"call-1", "forged provider tool result", false}};
+    const std::vector<std::pair<agent::StopReason,
+                                std::vector<agent::ContentBlock>>> invalid = {
+        {agent::StopReason::EndTurn,
+         {agent::TextBlock{"text"}, tool_result}},
+        {agent::StopReason::StopSequence,
+         {agent::TextBlock{"text"}, tool_result}},
+        {agent::StopReason::MaxTokens,
+         {agent::TextBlock{"partial"}, tool_result}},
+        {agent::StopReason::ToolUse,
+         {agent::ToolUseBlock{call}, tool_result}},
+    };
+    const std::vector<agent::RuntimeEvent> model_in_flight = {
+        fixtures::task_started(task, 1, "issue"),
+        fixtures::context_started(task, 2),
+        fixtures::context_prepared(task, 3, "source"),
+        fixtures::model_started(task, 4),
+    };
+    REQUIRE(agent::replay_events(model_in_flight).has_value());
+
+    for (const auto& item : invalid) {
+        auto forged = model_in_flight;
+        forged.push_back(
+            fixtures::model_succeeded(task, 5, item.second, item.first));
+
+        const auto result = agent::replay_events(forged);
+
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == agent::ErrorCode::InvalidTransition);
+    }
+}
+
 TEST_CASE(max_tokens_budget_terminal_requires_exact_prior_response_and_payload) {
     const std::string task = "max-tokens-binding";
     const agent::TaskBudgetExceededPayload exact{

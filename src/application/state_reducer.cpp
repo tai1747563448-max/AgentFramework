@@ -33,9 +33,16 @@ std::string concatenated_text(const std::vector<ContentBlock>& content) {
 
 Result<void> validate_model_response(const ModelResponse& response) {
     bool contains_tool_use = false;
+    bool contains_tool_result = false;
     for (const auto& block : response.content) {
         contains_tool_use = contains_tool_use ||
                             std::holds_alternative<ToolUseBlock>(block);
+        contains_tool_result = contains_tool_result ||
+                               std::holds_alternative<ToolResultBlock>(block);
+    }
+    if (contains_tool_result) {
+        return invalid_transition(
+            "model response contains an invalid tool-result block");
     }
     switch (response.stop_reason) {
     case StopReason::ToolUse:

@@ -228,17 +228,9 @@ Result<ModelResponse> decode_response(const HttpResponse& response) {
                                   std::move(arguments.value())}});
                 usable = true;
             } else if (type == "tool_result") {
-                auto tool_use_id = block.at("tool_use_id").get<std::string>();
-                if (tool_use_id.empty()) {
-                    return failure<ModelResponse>(
-                        ErrorCode::ProtocolFailure,
-                        "provider tool-result block is invalid");
-                }
-                decoded.content.push_back(ToolResultBlock{{
-                    std::move(tool_use_id),
-                    block.at("content").get<std::string>(),
-                    block.at("is_error").get<bool>()}});
-                usable = true;
+                return failure<ModelResponse>(
+                    ErrorCode::ProtocolFailure,
+                    "provider response contains an invalid tool-result block");
             } else {
                 return failure<ModelResponse>(ErrorCode::ProtocolFailure,
                                               "provider content block type is unknown");

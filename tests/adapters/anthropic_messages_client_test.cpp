@@ -171,6 +171,26 @@ TEST_CASE(anthropic_adapter_maps_ordered_tool_request_and_response) {
     REQUIRE(model_response.provider_request_id == "request-123");
 }
 
+TEST_CASE(anthropic_adapter_rejects_tool_results_in_provider_responses) {
+    const std::string block_contents = "PROVIDER_TOOL_RESULT_CONTENT";
+    const std::string credential = "PROVIDER_TOOL_RESULT_CREDENTIAL";
+    test::FakeHttpTransport http(fixtures::response(
+        "[{\"type\":\"text\",\"text\":\"unexpected\"},"
+        "{\"type\":\"tool_result\",\"tool_use_id\":\"call-1\","
+        "\"content\":\"" +
+        block_contents + "\",\"is_error\":false}]"));
+    agent::AnthropicMessagesClient client(fixtures::config(credential), http);
+
+    const auto result = client.complete(fixtures::simple_model_request());
+
+    REQUIRE(!result.has_value());
+    REQUIRE(result.error().code == agent::ErrorCode::ProtocolFailure);
+    REQUIRE(result.error().message ==
+            "provider response contains an invalid tool-result block");
+    REQUIRE(result.error().message.find(block_contents) == std::string::npos);
+    REQUIRE(result.error().message.find(credential) == std::string::npos);
+}
+
 TEST_CASE(anthropic_adapter_uses_exactly_one_bearer_authentication_scheme) {
     test::FakeHttpTransport http(fixtures::text_response());
     agent::AnthropicMessagesClient client(

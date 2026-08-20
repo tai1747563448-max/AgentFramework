@@ -101,7 +101,7 @@ Domain 保存不依赖基础设施的核心类型：
 
 #### ModelClient
 
-接受统一的 `ModelRequest`，返回统一的 `ModelResponse`。内部响应必须表达最终文本、工具调用、停止原因、用量和 Provider 请求标识。Provider 的原始 JSON 不进入 Domain。
+接受统一的 `ModelRequest`，返回统一的 `ModelResponse`。内部响应必须表达最终文本、工具调用、停止原因、用量和 Provider 请求标识。`ToolResultBlock` 只属于请求侧的用户工具结果消息，不得出现在 `ModelResponse`；响应只接受与停止原因匹配的 `TextBlock`/`ToolUseBlock` 形状。Provider 的原始 JSON 不进入 Domain。
 
 `ModelRequest` 中的结构化 Evidence 由具体 Provider Adapter 显式映射；RuntimeEngine 只复制持久状态中的 `EvidencePack`，不规定 Provider 文本格式。
 
@@ -246,7 +246,7 @@ runtime_data/tasks/<task_id>/events.jsonl
 3. Engine 检查取消与预算，持久化 `ContextPreparationStarted`，再调用 KnowledgeProvider；调用失败时只持久化 `ContextPreparationFailed`，由该事件直接进入 `Failed`。
 4. Engine 持久化 `ContextPrepared`，再从当前持久状态组装 ModelRequest：对话消息保持为真实的 user/assistant/tool 对话，EvidencePack 保持结构化并原样复制。
 5. Engine 持久化 `ModelCallStarted`，再调用模型。
-6. 成功响应映射为内部类型并持久化 `ModelCallSucceeded`；协议或调用失败只持久化 `ModelCallFailed`，由该事件直接进入 `Failed`。
+6. Adapter、Engine 和 Reducer 分别验证响应内容；只有合法响应才能持久化 `ModelCallSucceeded`。协议或调用失败只持久化 `ModelCallFailed`，由该事件直接进入 `Failed`。
 7. 最终文本产生 `TaskCompleted`。
 8. 工具调用按模型响应中的原始顺序逐个执行，每个调用独立产生 started 和 succeeded/failed 事件。
 9. 全部工具结果组成一个 Messages 协议用户消息，然后持久化下一轮 `ContextPreparationStarted`，进入上下文准备和下一轮模型请求。
@@ -264,7 +264,7 @@ runtime_data/tasks/<task_id>/events.jsonl
 
 每次知识、模型或工具外部调用前检查相应预算。达到预算后写入 `TaskBudgetExceeded`，不再发起调用。用户取消写入 `TaskCancelled`。终态写入后 Engine 必须立即停止。
 
-停止原因与内容严格绑定：`ToolUse` 至少包含一个 `ToolUseBlock`（可同时含有有序文本）；`EndTurn`/`StopSequence` 只能包含非空拼接文本且不得含工具，并且 `TaskCompleted.final_text` 必须精确等于该响应文本；无工具的 `MaxTokens` 先接受成功响应再以固定、非秘密的 `BudgetExceeded` 错误终止，不得完成。未知或内容不一致的停止原因直接记录 `ModelCallFailed` 协议失败。
+停止原因与内容严格绑定：`ToolResultBlock` 在所有模型响应中都非法；`ToolUse` 至少包含一个 `ToolUseBlock`，其余块只能是有序 `TextBlock`；`EndTurn`/`StopSequence` 只能包含一个或多个 `TextBlock`，拼接文本必须非空，并且 `TaskCompleted.final_text` 必须精确等于该响应文本；`MaxTokens` 不得包含 `ToolUseBlock` 或 `ToolResultBlock`，可以包含文本，合法响应先接受成功事件再以固定、非秘密的 `BudgetExceeded` 错误终止，不得完成。未知或内容不一致的停止原因直接记录 `ModelCallFailed` 协议失败。
 
 `max_tokens` 的 `TaskBudgetExceeded` 仅可紧接在已接受的 `MaxTokens ModelCallSucceeded` 之后回放，且必须携带精确、固定的 `max_tokens` payload。`EndTurn` 和 `StopSequence` 只接受 `TaskCompleted`，不接受预算终态；通用的时间、模型轮次和工具调用预算事件继续保留各自现有的合法守卫状态。
 
@@ -356,7 +356,7 @@ agent verify-log --events <events.jsonl>
 通过 Fake HTTP Transport 验证：
 
 - 内部消息和工具定义映射到 Messages 请求；
-- 文本、`tool_use`、`tool_result` 和停止原因的双向映射；
+- 文本、`tool_use` 和停止原因的响应映射，以及请求侧用户 `tool_result` 的映射与响应侧拒绝；
 - 多内容块顺序；
 - 非 2xx、超时、空正文、非法 JSON 和缺少字段；
 - 错误与日志不包含认证值。
