@@ -31,7 +31,9 @@ int run_agent(std::vector<std::string> args) {
         if (startup.value().command_args.size() > 1 &&
             startup.value().command_args[1] == "verify-log") {
             agent::JsonlEventStore local_events(std::filesystem::path{});
-            agent::RunCommand unavailable_run = [](const agent::RunRequest&) {
+            agent::RunCommand unavailable_run = [](
+                const agent::RunRequest&,
+                const agent::RuntimeProgressObserver&) {
                 return agent::RuntimeResult{
                     std::nullopt,
                     agent::RuntimeError{agent::ErrorCode::InvalidInput,
@@ -78,11 +80,13 @@ int run_agent(std::vector<std::string> args) {
         agent::RuntimeEngine engine(model, tools, knowledge, events, clock, ids,
                                     cancellation);
 
-        agent::RunCommand run = [&](const agent::RunRequest& cli_request) {
+        agent::RunCommand run = [&]
+            (const agent::RunRequest& cli_request,
+             const agent::RuntimeProgressObserver& observer) {
             auto request = cli_request;
             request.system_prompt = config.value().system_prompt;
             request.budgets = config.value().budgets;
-            return engine.run(request);
+            return engine.run(request, observer);
         };
         agent::VerifyCommand verify = [&](const std::filesystem::path& path) {
             auto loaded = events.read_file(path);

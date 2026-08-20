@@ -13,7 +13,8 @@
 
 namespace agent {
 
-using RunCommand = std::function<RuntimeResult(const RunRequest&)>;
+using RunCommand = std::function<RuntimeResult(
+    const RunRequest&, const RuntimeProgressObserver&)>;
 using VerifyCommand =
     std::function<Result<TaskState>(const std::filesystem::path&)>;
 

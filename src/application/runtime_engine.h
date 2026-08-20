@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 
@@ -31,6 +32,16 @@ struct RuntimeResult {
     std::optional<RuntimeError> fatal_error;
 };
 
+struct RuntimeProgress {
+    std::string task_id;
+    std::uint64_t sequence;
+    EventKind event_kind;
+    TaskStatus status;
+};
+
+using RuntimeProgressObserver =
+    std::function<void(const RuntimeProgress&)>;
+
 class RuntimeEngine {
 public:
     RuntimeEngine(ModelClient& model,
@@ -41,15 +52,18 @@ public:
                   IdGenerator& ids,
                   Cancellation& cancellation);
 
-    RuntimeResult run(const RunRequest& request);
+    RuntimeResult run(const RunRequest& request,
+                      const RuntimeProgressObserver& observer);
 
 private:
     RuntimeResult append_event(std::optional<TaskState>& state,
                                const std::string& task_id,
-                               EventPayload payload);
+                               EventPayload payload,
+                               const RuntimeProgressObserver& observer);
     RuntimeResult guard_external_call(std::optional<TaskState>& state,
                                       const std::string& task_id,
                                       std::int64_t started_at_ms,
+                                      const RuntimeProgressObserver& observer,
                                       const char* count_budget_name = nullptr,
                                       std::size_t count = 0,
                                       std::size_t limit = 0);

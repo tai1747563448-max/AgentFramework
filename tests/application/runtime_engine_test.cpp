@@ -1,4 +1,5 @@
 #include "application/runtime_engine.h"
+#include "application/state_reducer.h"
 #include "ports/cancellation.h"
 #include "ports/clock.h"
 #include "ports/event_store.h"
@@ -13,6 +14,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -271,7 +273,13 @@ struct EngineFixture {
     EngineFixture& operator=(EngineFixture&&) = delete;
 
     agent::RuntimeResult run(const agent::RunRequest& request) {
-        return engine.run(request);
+        return engine.run(request, {});
+    }
+
+    agent::RuntimeResult run(
+        const agent::RunRequest& request,
+        const agent::RuntimeProgressObserver& observer) {
+        return engine.run(request, observer);
     }
 };
 
@@ -365,6 +373,98 @@ TEST_CASE(engine_completes_single_model_turn) {
         agent::EventKind::ModelCallSucceeded,
         agent::EventKind::TaskCompleted};
     REQUIRE(fixture.events.kinds() == expected_kinds);
+}
+
+TEST_CASE(runtime_progress_type_is_exactly_the_safe_four_field_projection) {
+    const agent::RuntimeProgress progress{
+        "task-00000000000000000000000000000001", 7,
+        agent::EventKind::ModelCallSucceeded,
+        agent::TaskStatus::AwaitingModel};
+    const auto& [task_id, sequence, event_kind, status] = progress;
+
+    static_assert(std::is_same_v<
+                  decltype(agent::RuntimeProgress::task_id), std::string>);
+    static_assert(std::is_same_v<
+                  decltype(agent::RuntimeProgress::sequence), std::uint64_t>);
+    static_assert(std::is_same_v<
+                  decltype(agent::RuntimeProgress::event_kind),
+                  agent::EventKind>);
+    static_assert(std::is_same_v<
+                  decltype(agent::RuntimeProgress::status),
+                  agent::TaskStatus>);
+    REQUIRE(task_id == "task-00000000000000000000000000000001");
+    REQUIRE(sequence == 7);
+    REQUIRE(event_kind == agent::EventKind::ModelCallSucceeded);
+    REQUIRE(status == agent::TaskStatus::AwaitingModel);
+}
+
+TEST_CASE(engine_reports_post_reduce_progress_only_after_each_durable_append) {
+    test::EngineFixture fixture(
+        test::FakeModel({fixtures::text_response("done")}), test::FakeTools{},
+        test::FakeKnowledge(agent::EvidencePack{}));
+    std::vector<agent::RuntimeProgress> observed;
+
+    const auto result = fixture.run(
+        fixtures::run_request("fix warning"),
+        [&](const agent::RuntimeProgress& progress) {
+            REQUIRE(fixture.events.events.size() == progress.sequence);
+            const auto replayed = agent::replay_events(fixture.events.events);
+            REQUIRE(replayed.has_value());
+            REQUIRE(replayed.value().task_id == progress.task_id);
+            REQUIRE(replayed.value().last_sequence == progress.sequence);
+            REQUIRE(replayed.value().status == progress.status);
+            observed.push_back(progress);
+        });
+
+    REQUIRE(result.state.has_value());
+    REQUIRE(!result.fatal_error.has_value());
+    REQUIRE(observed.size() == fixture.events.events.size());
+    const std::vector<agent::EventKind> expected_kinds{
+        agent::EventKind::TaskStarted,
+        agent::EventKind::ContextPreparationStarted,
+        agent::EventKind::ContextPrepared,
+        agent::EventKind::ModelCallStarted,
+        agent::EventKind::ModelCallSucceeded,
+        agent::EventKind::TaskCompleted};
+    const std::vector<agent::TaskStatus> expected_statuses{
+        agent::TaskStatus::Created,
+        agent::TaskStatus::PreparingContext,
+        agent::TaskStatus::AwaitingModel,
+        agent::TaskStatus::AwaitingModel,
+        agent::TaskStatus::AwaitingModel,
+        agent::TaskStatus::Completed};
+    REQUIRE(observed.size() == expected_kinds.size());
+    for (std::size_t index = 0; index < observed.size(); ++index) {
+        REQUIRE(observed[index].task_id ==
+                "task-00000000000000000000000000000001");
+        REQUIRE(observed[index].sequence == index + 1);
+        REQUIRE(observed[index].event_kind == expected_kinds[index]);
+        REQUIRE(observed[index].status == expected_statuses[index]);
+        REQUIRE(observed[index].event_kind ==
+                agent::event_kind(fixture.events.events[index].payload));
+    }
+}
+
+TEST_CASE(engine_never_reports_a_rejected_event_store_append) {
+    auto fixture = fixtures::engine_with(test::FailingEventStore(4));
+    std::vector<agent::RuntimeProgress> observed;
+
+    const auto result = fixture.run(
+        fixtures::run_request("fix warning"),
+        [&](const agent::RuntimeProgress& progress) {
+            REQUIRE(fixture.events.events.size() == progress.sequence);
+            observed.push_back(progress);
+        });
+
+    REQUIRE(result.state.has_value());
+    REQUIRE(result.fatal_error.has_value());
+    REQUIRE(result.fatal_error->code == agent::ErrorCode::PersistenceFailure);
+    REQUIRE(fixture.events.append_attempts == 4);
+    REQUIRE(fixture.events.events.size() == 3);
+    REQUIRE(observed.size() == 3);
+    REQUIRE(observed.back().sequence == result.state->last_sequence);
+    REQUIRE(observed.back().status == result.state->status);
+    REQUIRE(observed.back().event_kind == agent::EventKind::ContextPrepared);
 }
 
 TEST_CASE(engine_builds_model_request_from_durable_inputs_in_order) {

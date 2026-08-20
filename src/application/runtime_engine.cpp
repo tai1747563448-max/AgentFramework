@@ -67,7 +67,8 @@ RuntimeEngine::RuntimeEngine(ModelClient& model,
 
 RuntimeResult RuntimeEngine::append_event(std::optional<TaskState>& state,
                                           const std::string& task_id,
-                                          EventPayload payload) {
+                                          EventPayload payload,
+                                          const RuntimeProgressObserver& observer) {
     const std::uint64_t sequence =
         state.has_value() ? state->last_sequence + 1 : 1;
     RuntimeEvent event{1, sequence, task_id, clock_.now_utc(),
@@ -84,6 +85,10 @@ RuntimeResult RuntimeEngine::append_event(std::optional<TaskState>& state,
     }
 
     state = std::move(reduced.value());
+    if (observer) {
+        observer({state->task_id, state->last_sequence,
+                  event_kind(event.payload), state->status});
+    }
     return {state, std::nullopt};
 }
 
@@ -91,6 +96,7 @@ RuntimeResult RuntimeEngine::guard_external_call(
     std::optional<TaskState>& state,
     const std::string& task_id,
     std::int64_t started_at_ms,
+    const RuntimeProgressObserver& observer,
     const char* count_budget_name,
     std::size_t count,
     std::size_t limit) {
@@ -103,7 +109,7 @@ RuntimeResult RuntimeEngine::guard_external_call(
                                  "task cancellation requested", false};
         return append_event(
             state, task_id,
-            TaskCancelledPayload{"cancellation requested", error});
+            TaskCancelledPayload{"cancellation requested", error}, observer);
     }
 
     if (clock_.monotonic_ms() - started_at_ms >=
@@ -112,7 +118,7 @@ RuntimeResult RuntimeEngine::guard_external_call(
                                  "max_task_time_ms budget exceeded", false};
         return append_event(
             state, task_id,
-            TaskBudgetExceededPayload{"max_task_time_ms", error});
+            TaskBudgetExceededPayload{"max_task_time_ms", error}, observer);
     }
 
     if (count_budget_name != nullptr && count >= limit) {
@@ -121,32 +127,37 @@ RuntimeResult RuntimeEngine::guard_external_call(
             std::string(count_budget_name) + " budget exceeded", false};
         return append_event(
             state, task_id,
-            TaskBudgetExceededPayload{count_budget_name, error});
+            TaskBudgetExceededPayload{count_budget_name, error}, observer);
     }
 
     return {state, std::nullopt};
 }
 
-RuntimeResult RuntimeEngine::run(const RunRequest& request) {
+RuntimeResult RuntimeEngine::run(
+    const RunRequest& request,
+    const RuntimeProgressObserver& observer) {
     std::optional<TaskState> state;
     const std::int64_t started_at_ms = clock_.monotonic_ms();
     const std::string task_id = ids_.next_task_id();
 
     auto transition = append_event(
         state, task_id,
-        TaskStartedPayload{request.issue, request.workspace_utf8, request.budgets});
+        TaskStartedPayload{request.issue, request.workspace_utf8, request.budgets},
+        observer);
     if (transition.fatal_error.has_value()) {
         return transition;
     }
 
     while (!is_terminal(state->status)) {
         transition =
-            append_event(state, task_id, ContextPreparationStartedPayload{});
+            append_event(state, task_id, ContextPreparationStartedPayload{},
+                         observer);
         if (transition.fatal_error.has_value()) {
             return transition;
         }
 
-        transition = guard_external_call(state, task_id, started_at_ms);
+        transition =
+            guard_external_call(state, task_id, started_at_ms, observer);
         if (transition.fatal_error.has_value() || is_terminal(state->status)) {
             return transition;
         }
@@ -155,23 +166,25 @@ RuntimeResult RuntimeEngine::run(const RunRequest& request) {
         if (!evidence.has_value()) {
             return append_event(
                 state, task_id,
-                ContextPreparationFailedPayload{evidence.error()});
+                ContextPreparationFailedPayload{evidence.error()}, observer);
         }
 
         transition = append_event(
-            state, task_id, ContextPreparedPayload{std::move(evidence.value())});
+            state, task_id, ContextPreparedPayload{std::move(evidence.value())},
+            observer);
         if (transition.fatal_error.has_value()) {
             return transition;
         }
 
         transition = guard_external_call(
-            state, task_id, started_at_ms, "max_model_rounds",
+            state, task_id, started_at_ms, observer, "max_model_rounds",
             state->usage.model_rounds, state->budgets.max_model_rounds);
         if (transition.fatal_error.has_value() || is_terminal(state->status)) {
             return transition;
         }
 
-        transition = guard_external_call(state, task_id, started_at_ms);
+        transition =
+            guard_external_call(state, task_id, started_at_ms, observer);
         if (transition.fatal_error.has_value() || is_terminal(state->status)) {
             return transition;
         }
@@ -184,13 +197,13 @@ RuntimeResult RuntimeEngine::run(const RunRequest& request) {
         model_request.evidence = state->evidence;
 
         transition = guard_external_call(
-            state, task_id, started_at_ms, "max_model_rounds",
+            state, task_id, started_at_ms, observer, "max_model_rounds",
             state->usage.model_rounds, state->budgets.max_model_rounds);
         if (transition.fatal_error.has_value() || is_terminal(state->status)) {
             return transition;
         }
         transition = append_event(
-            state, task_id, ModelCallStartedPayload{model_request});
+            state, task_id, ModelCallStartedPayload{model_request}, observer);
         if (transition.fatal_error.has_value()) {
             return transition;
         }
@@ -198,14 +211,16 @@ RuntimeResult RuntimeEngine::run(const RunRequest& request) {
         auto response = model_.complete(model_request);
         if (!response.has_value()) {
             return append_event(state, task_id,
-                                ModelCallFailedPayload{response.error()});
+                                ModelCallFailedPayload{response.error()},
+                                observer);
         }
 
         const auto protocol_failure = [&](const char* message) {
             return append_event(
                 state, task_id,
                 ModelCallFailedPayload{
-                    {ErrorCode::ProtocolFailure, message, false}});
+                    {ErrorCode::ProtocolFailure, message, false}},
+                observer);
         };
         if (contains_tool_result(response.value())) {
             return protocol_failure(
@@ -233,12 +248,13 @@ RuntimeResult RuntimeEngine::run(const RunRequest& request) {
 
             transition = append_event(
                 state, task_id,
-                ModelCallSucceededPayload{std::move(response.value())});
+                ModelCallSucceededPayload{std::move(response.value())},
+                observer);
             if (transition.fatal_error.has_value()) {
                 return transition;
             }
             return append_event(
-                state, task_id, TaskCompletedPayload{final_text});
+                state, task_id, TaskCompletedPayload{final_text}, observer);
         case StopReason::MaxTokens:
             if (has_tool_call) {
                 return protocol_failure(
@@ -247,7 +263,8 @@ RuntimeResult RuntimeEngine::run(const RunRequest& request) {
 
             transition = append_event(
                 state, task_id,
-                ModelCallSucceededPayload{std::move(response.value())});
+                ModelCallSucceededPayload{std::move(response.value())},
+                observer);
             if (transition.fatal_error.has_value()) {
                 return transition;
             }
@@ -256,7 +273,8 @@ RuntimeResult RuntimeEngine::run(const RunRequest& request) {
                 TaskBudgetExceededPayload{
                     "max_tokens",
                     {ErrorCode::BudgetExceeded,
-                     "model output token budget exceeded", false}});
+                     "model output token budget exceeded", false}},
+                observer);
         }
 
         if (!has_tool_call) {
@@ -266,14 +284,14 @@ RuntimeResult RuntimeEngine::run(const RunRequest& request) {
 
         transition = append_event(
             state, task_id,
-            ModelCallSucceededPayload{std::move(response.value())});
+            ModelCallSucceededPayload{std::move(response.value())}, observer);
         if (transition.fatal_error.has_value()) {
             return transition;
         }
 
         while (state->next_tool_index < state->pending_tool_calls.size()) {
             transition = guard_external_call(
-                state, task_id, started_at_ms, "max_tool_calls",
+                state, task_id, started_at_ms, observer, "max_tool_calls",
                 state->usage.tool_calls, state->budgets.max_tool_calls);
             if (transition.fatal_error.has_value() || is_terminal(state->status)) {
                 return transition;
@@ -282,7 +300,7 @@ RuntimeResult RuntimeEngine::run(const RunRequest& request) {
             const ToolCall call =
                 state->pending_tool_calls.at(state->next_tool_index);
             transition = append_event(
-                state, task_id, ToolCallStartedPayload{call});
+                state, task_id, ToolCallStartedPayload{call}, observer);
             if (transition.fatal_error.has_value()) {
                 return transition;
             }
@@ -291,12 +309,14 @@ RuntimeResult RuntimeEngine::run(const RunRequest& request) {
             if (!tool_result.has_value()) {
                 return append_event(
                     state, task_id,
-                    ToolCallFailedPayload{call.id, tool_result.error()});
+                    ToolCallFailedPayload{call.id, tool_result.error()},
+                    observer);
             }
 
             transition = append_event(
                 state, task_id,
-                ToolCallSucceededPayload{std::move(tool_result.value())});
+                ToolCallSucceededPayload{std::move(tool_result.value())},
+                observer);
             if (transition.fatal_error.has_value()) {
                 return transition;
             }

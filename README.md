@@ -13,14 +13,16 @@ The dependency direction points inward:
   CLI, or filesystem I/O.
 - `src/application` owns the reducer and `RuntimeEngine`. Every candidate event
   is preview-reduced without mutating live state, appended and flushed, and
-  only then committed to memory.
+  only then committed to memory. A per-run observer is notified after that
+  durable commit with only task ID, sequence, event kind, and task status.
 - `src/ports` defines model, tool, knowledge, event-store, clock, ID, and
   cancellation interfaces.
 - `src/adapters` supplies Anthropic Messages HTTP, JSONL persistence, empty
   tool/knowledge adapters, and system clock/ID/cancellation implementations.
 - `src/main.cpp` is the composition root; `src/cli` parses `run` and
   `verify-log`, uses fixed failure messages, and bounds the fields printed by
-  log verification. A successful `run` renders final text as UTF-8, visibly
+  progress and log verification. A successful `run` renders final text as
+  UTF-8, visibly
   escapes terminal controls and invalid bytes, and truncates only at code-point
   boundaries after at most 8192 rendered bytes.
 
@@ -72,8 +74,18 @@ search parent directories:
 ```
 
 Without valid provider configuration, `run` exits with code 2 before any
-provider request. Successful tasks print the final model text; failures print
-only a short category message.
+provider request. After each successful event flush and state commit, `run`
+prints exactly one safe progress line:
+
+```text
+task_id=<validated> sequence=<n> event=<fixed-name> status=<fixed-name>
+```
+
+The observer and renderer never receive an event payload. Terminal and durable
+fatal failures print only a validated task ID when available, fixed status and
+error-code names, and a fixed actionable summary; raw runtime error messages
+are not printed. Unknown enum values render as `Unknown`. Successful tasks then
+print final model text through the existing bounded UTF-8 renderer.
 
 ## Verify an event log
 
@@ -119,6 +131,13 @@ request ID. Enabling the target authorizes neither a provider charge nor a
 network call by itself; run it only with valid test credentials and explicit
 authorization. Offline CTest success does not establish that this live smoke
 passed.
+
+The default offline verification for this milestone keeps the live target
+disabled and does not make a Provider network request. The real Provider smoke
+was not run. The Unicode renderer and the real Runtime/CLI/JSONL composition
+are covered offline, but a successful Unicode `run` through a real Windows
+console process remains an explicit Minor evidence gap rather than a claimed
+fix.
 
 ## Local backup remote
 

@@ -31,6 +31,9 @@
 
 namespace test {
 
+constexpr const char* kTaskId =
+    "task-0123456789abcdef0123456789abcdef";
+
 class MapEnvironment final : public agent::Environment {
 public:
     MapEnvironment(
@@ -92,7 +95,7 @@ private:
 
 agent::TaskState terminal_state(agent::TaskStatus status) {
     agent::TaskState state;
-    state.task_id = "task-cli";
+    state.task_id = kTaskId;
     state.status = status;
     state.last_sequence = 9;
     if (status == agent::TaskStatus::Completed) {
@@ -141,8 +144,14 @@ TEST_CASE(cli_exit_codes_are_stable) {
 
 TEST_CASE(cli_maps_completed_task_to_zero_and_forwards_user_input) {
     std::vector<agent::RunRequest> requests;
-    agent::RunCommand run = [&](const agent::RunRequest& request) {
+    agent::RunCommand run = [&]
+        (const agent::RunRequest& request,
+         const agent::RuntimeProgressObserver& observer) {
         requests.push_back(request);
+        observer({test::kTaskId, 1, agent::EventKind::TaskStarted,
+                  agent::TaskStatus::Created});
+        observer({test::kTaskId, 2, agent::EventKind::TaskCompleted,
+                  agent::TaskStatus::Completed});
         return test::terminal_result(agent::TaskStatus::Completed);
     };
     agent::VerifyCommand verify = [](const std::filesystem::path&) {
@@ -159,7 +168,94 @@ TEST_CASE(cli_maps_completed_task_to_zero_and_forwards_user_input) {
     REQUIRE(requests.size() == 1);
     REQUIRE(requests.front().workspace_utf8 == u8"E:/工作区");
     REQUIRE(requests.front().issue == u8"修复警告");
-    REQUIRE(out.str().find("done") != std::string::npos);
+    REQUIRE(out.str() ==
+            "task_id=task-0123456789abcdef0123456789abcdef sequence=1 "
+            "event=TaskStarted status=Created\n"
+            "task_id=task-0123456789abcdef0123456789abcdef sequence=2 "
+            "event=TaskCompleted status=Completed\n"
+            "done\n");
+    REQUIRE(err.str().empty());
+}
+
+TEST_CASE(cli_maps_every_progress_enum_to_a_fixed_name) {
+    struct ProgressCase {
+        agent::EventKind event_kind;
+        agent::TaskStatus status;
+    };
+    const std::vector<ProgressCase> cases = {
+        {agent::EventKind::TaskStarted, agent::TaskStatus::Created},
+        {agent::EventKind::ContextPreparationStarted,
+         agent::TaskStatus::PreparingContext},
+        {agent::EventKind::ContextPrepared, agent::TaskStatus::AwaitingModel},
+        {agent::EventKind::ContextPreparationFailed,
+         agent::TaskStatus::Failed},
+        {agent::EventKind::ModelCallStarted, agent::TaskStatus::AwaitingModel},
+        {agent::EventKind::ModelCallSucceeded,
+         agent::TaskStatus::AwaitingTool},
+        {agent::EventKind::ModelCallFailed, agent::TaskStatus::Failed},
+        {agent::EventKind::ToolCallStarted, agent::TaskStatus::AwaitingTool},
+        {agent::EventKind::ToolCallSucceeded,
+         agent::TaskStatus::AwaitingTool},
+        {agent::EventKind::ToolCallFailed, agent::TaskStatus::Failed},
+        {agent::EventKind::TaskCompleted, agent::TaskStatus::Completed},
+        {agent::EventKind::TaskFailed, agent::TaskStatus::Failed},
+        {agent::EventKind::TaskBudgetExceeded,
+         agent::TaskStatus::BudgetExceeded},
+        {agent::EventKind::TaskCancelled, agent::TaskStatus::Cancelled},
+        {static_cast<agent::EventKind>(999),
+         static_cast<agent::TaskStatus>(999)},
+    };
+    std::ostringstream out;
+    std::ostringstream err;
+    agent::CliApp app(
+        [cases](const agent::RunRequest&,
+                const agent::RuntimeProgressObserver& observer) {
+            for (std::size_t index = 0; index < cases.size(); ++index) {
+                observer({test::kTaskId, index + 1, cases[index].event_kind,
+                          cases[index].status});
+            }
+            return test::terminal_result(agent::TaskStatus::Completed);
+        },
+        [](const std::filesystem::path&) {
+            return test::verified_state(agent::TaskStatus::Completed);
+        },
+        out, err);
+
+    REQUIRE(app.execute(
+                {"agent", "run", "--workspace", ".", "--issue", "test"}) ==
+            agent::ExitCode::Success);
+    REQUIRE(out.str() ==
+            "task_id=task-0123456789abcdef0123456789abcdef sequence=1 "
+            "event=TaskStarted status=Created\n"
+            "task_id=task-0123456789abcdef0123456789abcdef sequence=2 "
+            "event=ContextPreparationStarted status=PreparingContext\n"
+            "task_id=task-0123456789abcdef0123456789abcdef sequence=3 "
+            "event=ContextPrepared status=AwaitingModel\n"
+            "task_id=task-0123456789abcdef0123456789abcdef sequence=4 "
+            "event=ContextPreparationFailed status=Failed\n"
+            "task_id=task-0123456789abcdef0123456789abcdef sequence=5 "
+            "event=ModelCallStarted status=AwaitingModel\n"
+            "task_id=task-0123456789abcdef0123456789abcdef sequence=6 "
+            "event=ModelCallSucceeded status=AwaitingTool\n"
+            "task_id=task-0123456789abcdef0123456789abcdef sequence=7 "
+            "event=ModelCallFailed status=Failed\n"
+            "task_id=task-0123456789abcdef0123456789abcdef sequence=8 "
+            "event=ToolCallStarted status=AwaitingTool\n"
+            "task_id=task-0123456789abcdef0123456789abcdef sequence=9 "
+            "event=ToolCallSucceeded status=AwaitingTool\n"
+            "task_id=task-0123456789abcdef0123456789abcdef sequence=10 "
+            "event=ToolCallFailed status=Failed\n"
+            "task_id=task-0123456789abcdef0123456789abcdef sequence=11 "
+            "event=TaskCompleted status=Completed\n"
+            "task_id=task-0123456789abcdef0123456789abcdef sequence=12 "
+            "event=TaskFailed status=Failed\n"
+            "task_id=task-0123456789abcdef0123456789abcdef sequence=13 "
+            "event=TaskBudgetExceeded status=BudgetExceeded\n"
+            "task_id=task-0123456789abcdef0123456789abcdef sequence=14 "
+            "event=TaskCancelled status=Cancelled\n"
+            "task_id=task-0123456789abcdef0123456789abcdef sequence=15 "
+            "event=Unknown status=Unknown\n"
+            "done\n");
     REQUIRE(err.str().empty());
 }
 
@@ -178,7 +274,10 @@ TEST_CASE(cli_sanitizes_controls_invalid_utf8_and_embedded_nul) {
     std::ostringstream out;
     std::ostringstream err;
     agent::CliApp app(
-        [completed](const agent::RunRequest&) { return completed; },
+        [completed](const agent::RunRequest&,
+                    const agent::RuntimeProgressObserver&) {
+            return completed;
+        },
         [](const std::filesystem::path&) {
             return test::verified_state(agent::TaskStatus::Completed);
         },
@@ -199,7 +298,10 @@ TEST_CASE(cli_preserves_printable_unicode_newline_and_tab) {
     std::ostringstream out;
     std::ostringstream err;
     agent::CliApp app(
-        [completed](const agent::RunRequest&) { return completed; },
+        [completed](const agent::RunRequest&,
+                    const agent::RuntimeProgressObserver&) {
+            return completed;
+        },
         [](const std::filesystem::path&) {
             return test::verified_state(agent::TaskStatus::Completed);
         },
@@ -221,7 +323,10 @@ TEST_CASE(cli_truncates_at_a_utf8_boundary_after_at_most_8192_rendered_bytes) {
     std::ostringstream out;
     std::ostringstream err;
     agent::CliApp app(
-        [completed](const agent::RunRequest&) { return completed; },
+        [completed](const agent::RunRequest&,
+                    const agent::RuntimeProgressObserver&) {
+            return completed;
+        },
         [](const std::filesystem::path&) {
             return test::verified_state(agent::TaskStatus::Completed);
         },
@@ -249,7 +354,9 @@ TEST_CASE(cli_maps_terminal_statuses_without_printing_terminal_details) {
         std::ostringstream out;
         std::ostringstream err;
         agent::CliApp app(
-            [status = item.first](const agent::RunRequest&) {
+            [status = item.first](
+                const agent::RunRequest&,
+                const agent::RuntimeProgressObserver&) {
                 return test::terminal_result(status);
             },
             [](const std::filesystem::path&) {
@@ -259,29 +366,60 @@ TEST_CASE(cli_maps_terminal_statuses_without_printing_terminal_details) {
 
         REQUIRE(app.execute({"agent", "run", "--workspace", ".", "--issue",
                              "test"}) == item.second);
-        REQUIRE(out.str().find("SENTINEL_PRIVATE_FAILURE_DETAIL") ==
-                std::string::npos);
-        REQUIRE(err.str().find("SENTINEL_PRIVATE_FAILURE_DETAIL") ==
-                std::string::npos);
+        REQUIRE(out.str().empty());
+        const std::string expected =
+            std::string{"task_id="} + test::kTaskId + " status=" +
+            (item.first == agent::TaskStatus::Failed
+                 ? "Failed error_code=ProtocolFailure "
+                   "summary=task failed; inspect the local event log\n"
+                 : item.first == agent::TaskStatus::BudgetExceeded
+                       ? "BudgetExceeded error_code=BudgetExceeded "
+                         "summary=task budget exceeded; adjust limits before "
+                         "retrying\n"
+                       : "Cancelled error_code=Cancelled "
+                         "summary=task cancelled; rerun when ready\n");
+        REQUIRE(err.str() == expected);
     }
 }
 
 TEST_CASE(cli_maps_fatal_errors_to_stable_exit_codes) {
-    const std::vector<std::pair<agent::ErrorCode, int>> cases = {
-        {agent::ErrorCode::InvalidInput, agent::ExitCode::InvalidInputOrConfig},
+    struct Case {
+        agent::ErrorCode code;
+        int exit_code;
+        const char* name;
+    };
+    const std::vector<Case> cases = {
+        {agent::ErrorCode::InvalidInput, agent::ExitCode::InvalidInputOrConfig,
+         "InvalidInput"},
         {agent::ErrorCode::InvalidConfiguration,
-         agent::ExitCode::InvalidInputOrConfig},
+         agent::ExitCode::InvalidInputOrConfig, "InvalidConfiguration"},
         {agent::ErrorCode::PersistenceFailure,
-         agent::ExitCode::PersistenceFailure},
-        {agent::ErrorCode::BudgetExceeded, agent::ExitCode::BudgetExceeded},
-        {agent::ErrorCode::Cancelled, agent::ExitCode::Cancelled},
-        {agent::ErrorCode::TransportFailure, agent::ExitCode::TaskFailed},
+         agent::ExitCode::PersistenceFailure, "PersistenceFailure"},
+        {agent::ErrorCode::TransportFailure, agent::ExitCode::TaskFailed,
+         "TransportFailure"},
+        {agent::ErrorCode::RequestTimeout, agent::ExitCode::TaskFailed,
+         "RequestTimeout"},
+        {agent::ErrorCode::HttpFailure, agent::ExitCode::TaskFailed,
+         "HttpFailure"},
+        {agent::ErrorCode::ProtocolFailure, agent::ExitCode::TaskFailed,
+         "ProtocolFailure"},
+        {agent::ErrorCode::DependencyUnavailable, agent::ExitCode::TaskFailed,
+         "DependencyUnavailable"},
+        {agent::ErrorCode::InvalidTransition, agent::ExitCode::TaskFailed,
+         "InvalidTransition"},
+        {agent::ErrorCode::BudgetExceeded, agent::ExitCode::BudgetExceeded,
+         "BudgetExceeded"},
+        {agent::ErrorCode::Cancelled, agent::ExitCode::Cancelled, "Cancelled"},
+        {static_cast<agent::ErrorCode>(999), agent::ExitCode::TaskFailed,
+         "Unknown"},
     };
     for (const auto& item : cases) {
         std::ostringstream out;
         std::ostringstream err;
         agent::CliApp app(
-            [code = item.first](const agent::RunRequest&) {
+            [code = item.code](
+                const agent::RunRequest&,
+                const agent::RuntimeProgressObserver&) {
                 return agent::RuntimeResult{
                     std::nullopt,
                     agent::RuntimeError{code, "SENTINEL_FATAL_DETAIL", false}};
@@ -291,9 +429,150 @@ TEST_CASE(cli_maps_fatal_errors_to_stable_exit_codes) {
             },
             out, err);
         REQUIRE(app.execute({"agent", "run", "--workspace", ".", "--issue",
-                             "test"}) == item.second);
-        REQUIRE(out.str().find("SENTINEL_FATAL_DETAIL") == std::string::npos);
-        REQUIRE(err.str().find("SENTINEL_FATAL_DETAIL") == std::string::npos);
+                             "test"}) == item.exit_code);
+        REQUIRE(out.str().empty());
+        REQUIRE(err.str() ==
+                std::string{"error_code="} + item.name +
+                    " summary=runtime failed before a durable task state was "
+                    "available\n");
+    }
+}
+
+TEST_CASE(cli_reports_a_durable_fatal_failure_with_only_fixed_fields) {
+    std::ostringstream out;
+    std::ostringstream err;
+    agent::CliApp app(
+        [](const agent::RunRequest&,
+           const agent::RuntimeProgressObserver& observer) {
+            observer({test::kTaskId, 3, agent::EventKind::ContextPrepared,
+                      agent::TaskStatus::AwaitingModel});
+            agent::TaskState state;
+            state.task_id = test::kTaskId;
+            state.status = agent::TaskStatus::AwaitingModel;
+            state.last_sequence = 3;
+            return agent::RuntimeResult{
+                state,
+                agent::RuntimeError{agent::ErrorCode::PersistenceFailure,
+                                    "SENTINEL_FATAL_STORAGE_BODY", true}};
+        },
+        [](const std::filesystem::path&) {
+            return test::verified_state(agent::TaskStatus::Completed);
+        },
+        out, err);
+
+    REQUIRE(app.execute(
+                {"agent", "run", "--workspace", ".", "--issue", "test"}) ==
+            agent::ExitCode::PersistenceFailure);
+    REQUIRE(out.str() ==
+            "task_id=task-0123456789abcdef0123456789abcdef sequence=3 "
+            "event=ContextPrepared status=AwaitingModel\n");
+    REQUIRE(err.str() ==
+            "task_id=task-0123456789abcdef0123456789abcdef "
+            "status=AwaitingModel error_code=PersistenceFailure "
+            "summary=runtime persistence failed; inspect local storage before "
+            "retrying\n");
+}
+
+TEST_CASE(cli_rejects_invalid_runtime_progress_task_id_without_reflection) {
+    const std::string unsafe_task_id =
+        "task-0123456789abcdef\r\nINJECTED_PROGRESS=" +
+        std::string(4096, 'x');
+    std::ostringstream out;
+    std::ostringstream err;
+    agent::CliApp app(
+        [&](const agent::RunRequest&,
+            const agent::RuntimeProgressObserver& observer) {
+            observer({unsafe_task_id, 1, agent::EventKind::TaskStarted,
+                      agent::TaskStatus::Created});
+            return test::terminal_result(agent::TaskStatus::Completed);
+        },
+        [](const std::filesystem::path&) {
+            return test::verified_state(agent::TaskStatus::Completed);
+        },
+        out, err);
+
+    REQUIRE(app.execute(
+                {"agent", "run", "--workspace", ".", "--issue", "test"}) ==
+            agent::ExitCode::TaskFailed);
+    REQUIRE(out.str().empty());
+    REQUIRE(err.str() == "runtime progress contained an invalid task ID\n");
+}
+
+TEST_CASE(cli_rejects_invalid_final_task_id_without_reflection) {
+    const std::string unsafe_task_id =
+        "task-0123456789abcdef\r\nINJECTED_FINAL=" + std::string(4096, 'x');
+    std::ostringstream out;
+    std::ostringstream err;
+    agent::CliApp app(
+        [&](const agent::RunRequest&,
+            const agent::RuntimeProgressObserver&) {
+            auto result = test::terminal_result(agent::TaskStatus::Completed);
+            result.state->task_id = unsafe_task_id;
+            result.state->final_text = "SENTINEL_UNSAFE_FINAL_TEXT";
+            return result;
+        },
+        [](const std::filesystem::path&) {
+            return test::verified_state(agent::TaskStatus::Completed);
+        },
+        out, err);
+
+    REQUIRE(app.execute(
+                {"agent", "run", "--workspace", ".", "--issue", "test"}) ==
+            agent::ExitCode::TaskFailed);
+    REQUIRE(out.str().empty());
+    REQUIRE(err.str() == "runtime returned an invalid task ID\n");
+}
+
+TEST_CASE(cli_progress_and_error_summaries_never_project_runtime_payloads) {
+    const std::vector<std::string> sentinels{
+        "SENTINEL_ISSUE",       "SENTINEL_WORKSPACE",
+        "SENTINEL_EVIDENCE",    "SENTINEL_MODEL_TEXT",
+        "SENTINEL_TOOL_VALUE",  "SENTINEL_CORRELATION",
+        "SENTINEL_TIMESTAMP",   "SENTINEL_PROVIDER_BODY",
+        "SENTINEL_CREDENTIAL"};
+    std::ostringstream out;
+    std::ostringstream err;
+    agent::CliApp app(
+        [&](const agent::RunRequest& request,
+            const agent::RuntimeProgressObserver& observer) {
+            REQUIRE(request.issue == sentinels[0]);
+            REQUIRE(request.workspace_utf8 == sentinels[1]);
+            observer({test::kTaskId, 9, agent::EventKind::ModelCallFailed,
+                      agent::TaskStatus::Failed});
+            auto result = test::terminal_result(agent::TaskStatus::Failed);
+            result.state->issue = sentinels[0];
+            result.state->workspace_utf8 = sentinels[1];
+            result.state->evidence = {{{sentinels[2], sentinels[2],
+                                       agent::Value::object({})}}};
+            result.state->messages = {
+                {agent::Role::Assistant,
+                 {agent::TextBlock{sentinels[3]}}}};
+            result.state->pending_tool_results = {
+                {"call-1", sentinels[4], true}};
+            result.state->terminal_error = agent::RuntimeError{
+                agent::ErrorCode::ProtocolFailure,
+                sentinels[5] + sentinels[6] + sentinels[7] + sentinels[8],
+                false};
+            return result;
+        },
+        [](const std::filesystem::path&) {
+            return test::verified_state(agent::TaskStatus::Completed);
+        },
+        out, err);
+
+    REQUIRE(app.execute({"agent", "run", "--workspace", sentinels[1],
+                         "--issue", sentinels[0]}) ==
+            agent::ExitCode::TaskFailed);
+    REQUIRE(out.str() ==
+            "task_id=task-0123456789abcdef0123456789abcdef sequence=9 "
+            "event=ModelCallFailed status=Failed\n");
+    REQUIRE(err.str() ==
+            "task_id=task-0123456789abcdef0123456789abcdef status=Failed "
+            "error_code=ProtocolFailure "
+            "summary=task failed; inspect the local event log\n");
+    for (const auto& sentinel : sentinels) {
+        REQUIRE(out.str().find(sentinel) == std::string::npos);
+        REQUIRE(err.str().find(sentinel) == std::string::npos);
     }
 }
 
@@ -315,7 +594,8 @@ TEST_CASE(cli_rejects_missing_duplicate_empty_and_unknown_run_arguments) {
         std::ostringstream out;
         std::ostringstream err;
         agent::CliApp app(
-            [&](const agent::RunRequest&) {
+            [&](const agent::RunRequest&,
+                const agent::RuntimeProgressObserver&) {
                 ++run_calls;
                 return test::terminal_result(agent::TaskStatus::Completed);
             },
@@ -334,7 +614,8 @@ TEST_CASE(cli_dispatches_verify_log_and_prints_only_summary_fields) {
     std::ostringstream out;
     std::ostringstream err;
     agent::CliApp app(
-        [](const agent::RunRequest&) {
+        [](const agent::RunRequest&,
+           const agent::RuntimeProgressObserver&) {
             return test::terminal_result(agent::TaskStatus::Completed);
         },
         [&](const std::filesystem::path& path) {
@@ -362,7 +643,8 @@ TEST_CASE(cli_maps_verify_failure_to_invalid_event_log_without_leaking_details) 
     std::ostringstream out;
     std::ostringstream err;
     agent::CliApp app(
-        [](const agent::RunRequest&) {
+        [](const agent::RunRequest&,
+           const agent::RuntimeProgressObserver&) {
             return test::terminal_result(agent::TaskStatus::Completed);
         },
         [](const std::filesystem::path&) {
@@ -384,7 +666,8 @@ TEST_CASE(cli_rejects_verify_log_without_the_events_binding) {
     std::ostringstream out;
     std::ostringstream err;
     agent::CliApp app(
-        [](const agent::RunRequest&) {
+        [](const agent::RunRequest&,
+           const agent::RuntimeProgressObserver&) {
             return test::terminal_result(agent::TaskStatus::Completed);
         },
         [&](const std::filesystem::path&) {
@@ -404,7 +687,8 @@ TEST_CASE(cli_rejects_an_unsafe_replayed_task_id_without_printing_it) {
     std::ostringstream out;
     std::ostringstream err;
     agent::CliApp app(
-        [](const agent::RunRequest&) {
+        [](const agent::RunRequest&,
+           const agent::RuntimeProgressObserver&) {
             return test::terminal_result(agent::TaskStatus::Completed);
         },
         [&](const std::filesystem::path&) {

@@ -216,16 +216,19 @@ Domain 保存不依赖基础设施的核心类型：
 状态变化必须遵守：
 
 ```text
-验证事件合法
+在状态副本上 preview reduce 并验证事件合法
 → 序列化事件
 → 追加完整一行并 flush
 → 写入成功
-→ StateReducer 应用事件
+→ 提交 preview 得到的 TaskState
+→ 通知本次 run 的 RuntimeProgress observer
 ```
 
 若 append 或 flush 失败，该事件不得应用到内存状态。因为 EventStore 本身不可用，Runtime 只能向 CLI 返回 `PersistenceFailure`；不能假装已经持久化一个 `TaskFailed` 事件。
 
 “验证事件合法”由对当前状态副本的非变异 preview reduce 完成；只有 preview 成功才允许 append，append 成功后直接提交已验证的下一状态。这样既不持久化非法事件，也不在持久化成功前改变 live `TaskState`。
+
+进度通知是 Application 层每次 `RuntimeEngine::run` 单独注入的回调。它按类型只接收 `RuntimeProgress{task_id, sequence, EventKind, TaskStatus}`，不接收 `RuntimeEvent`、payload、错误消息、模型/工具内容、证据、时间戳、correlation ID 或 Provider 数据。只有 preview reduce、append/flush 和状态提交全部成功后才通知；被拒绝或持久化失败的事件没有进度通知。
 
 第一阶段对缺行、重复 sequence、未知 schema、非法 JSON 或非法状态转移只报告验证失败，不自动修复或截断日志。
 
@@ -296,7 +299,7 @@ Adapter 在边界捕获库异常并映射为上述内部错误。RuntimeEngine �
 
 KnowledgeProvider 基础设施错误只记录 `ContextPreparationFailed`。模型非 2xx、超时、无法解析响应或缺少必需字段只记录 `ModelCallFailed`。ToolGateway 基础设施错误只记录 `ToolCallFailed`。这三个专用事件均保存原始 `RuntimeError` 到 `terminal_error` 并直接进入 `Failed`；`TaskFailed` 仅表示没有专用失败事件的通用 Runtime 故障。EventStore 失败是特殊情况：由于无法可靠写入终态事件，Engine 立即停止并通过 CLI 非零退出码报告。
 
-CLI 输出错误码、task_id 和可操作摘要，不输出密钥、完整认证头或不受控的大型响应正文。
+CLI 输出固定错误码名称、经过格式验证的 task_id、固定状态名称和固定可操作摘要，不输出 `RuntimeError.message`、密钥、完整认证头或不受控的大型响应正文。未知枚举值统一输出固定 `Unknown`，不回显整数或外部文本。
 
 成功模型文本通过 UTF-8 感知的终端 renderer 输出：保留可打印 Unicode、换行与制表符，转义 C0、DEL、ESC、NUL、C1 与非法 UTF-8 字节，并在不拆分 UTF-8 的前提下将 truncation marker 前的渲染内容限制为最多 8192 字节。
 
@@ -310,6 +313,14 @@ agent verify-log --events <events.jsonl>
 ```
 
 `run` 执行一个前台任务并实时显示脱敏状态事件。`verify-log` 读取事件、验证 sequence 和状态转移，并输出重放后的终态。
+
+每个已经持久化并提交的事件使用以下稳定进度行；四个值以外的事件数据不会进入 observer 或该输出路径：
+
+```text
+task_id=<validated> sequence=<n> event=<fixed-name> status=<fixed-name>
+```
+
+失败、预算结束、取消和已有 durable state 的 fatal 返回使用由 CLI 固定的摘要行，包含验证后的 task ID、固定 status、固定 `error_code` 名称和固定 `summary`。无 durable state 的 fatal 返回只输出固定 error code 与固定摘要。成功任务在进度行之后仍由既有 UTF-8 renderer 输出最终模型文本。
 
 精确的 `verify-log --events <path>` 在命令分派后只组合本地读取/重放路径，不加载 env file、Provider 配置、HTTP transport 或 model client；`verify-log` 与 `--env-file` 的组合是非法输入。
 
@@ -340,6 +351,8 @@ agent verify-log --events <events.jsonl>
 - 最大模型轮次、工具次数和时间预算；
 - 用户取消；
 - EventStore append 失败时状态不先行改变；
+- 进度只在 append/flush 和状态提交后按 durable sequence 通知，失败 append 不通知；
+- `RuntimeProgress` 按类型只有 task ID、sequence、EventKind 和 TaskStatus；
 - 终态后没有额外外部调用。
 
 ### 13.3 JSONL Adapter 测试
@@ -367,9 +380,12 @@ agent verify-log --events <events.jsonl>
 
 - 参数解析和稳定退出码；
 - Fake Model 下从 Issue 到 Completed 的完整运行；
+- 真实 `RuntimeEngine`、`CliApp` 和 `JsonlEventStore` 的离线组合中，进度与回读事件顺序、task ID 和终态完全一致；
 - 产生事件文件并通过 `verify-log` 重放；
 - MSVC/C++17 构建和 CTest；
 - 真实控制台中的 UTF-8 输入输出。
+
+离线 Fake/组件测试验证 UTF-8 renderer 和 Unicode 数据流，但不等价于真实 Windows 控制台成功进程测试；该进程级 Minor 证据缺口仍保留。真实 Provider smoke 仅在显式启用并获得凭据与网络调用授权时运行；本里程碑没有运行它，默认离线 CTest 成功不能代替该证据。
 
 ## 14. 初步文件职责
 

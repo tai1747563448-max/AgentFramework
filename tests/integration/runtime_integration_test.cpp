@@ -117,8 +117,10 @@ struct RealRuntimeFixture {
     RealRuntimeFixture(RealRuntimeFixture&&) = delete;
     RealRuntimeFixture& operator=(RealRuntimeFixture&&) = delete;
 
-    agent::RuntimeResult run(const agent::RunRequest& request) {
-        return engine.run(request);
+    agent::RuntimeResult run(
+        const agent::RunRequest& request,
+        const agent::RuntimeProgressObserver& observer = {}) {
+        return engine.run(request, observer);
     }
 };
 
@@ -177,6 +179,90 @@ TEST_CASE(fake_end_to_end_writes_and_replays_unicode_task) {
     REQUIRE(replayed.value() == *result.state);
 }
 
+TEST_CASE(cli_progress_exactly_matches_real_runtime_jsonl_durable_order) {
+    constexpr const char* kTaskId =
+        "task-00000000000000000000000000000009";
+    const std::string issue_sentinel = "SENTINEL_PRIVATE_ISSUE";
+    const std::string workspace_sentinel = "SENTINEL_PRIVATE_WORKSPACE";
+    const std::string metadata_sentinel = "SENTINEL_PROVIDER_METADATA";
+    test::ScopedTempDir temp(std::filesystem::u8path(u8"运行时-CLI-进度"));
+    agent::JsonlEventStore store(temp.path());
+    auto response = fixtures::text_response(u8"已完成🙂");
+    response.provider_request_id = metadata_sentinel;
+    test::FakeModel model({std::move(response)});
+    auto runtime = fixtures::real_runtime_with(model, store);
+    std::optional<agent::RuntimeResult> captured_result;
+    std::ostringstream output;
+    std::ostringstream error;
+    agent::CliApp cli(
+        [&](const agent::RunRequest& request,
+            const agent::RuntimeProgressObserver& observer) {
+            captured_result = runtime.run(
+                {request.issue, request.workspace_utf8, u8"你是编码代理。",
+                 fixtures::budgets()},
+                observer);
+            return *captured_result;
+        },
+        [&](const std::filesystem::path& path) {
+            const auto loaded = store.read_file(path);
+            if (!loaded.has_value()) {
+                return agent::Result<agent::TaskState>::failure(loaded.error());
+            }
+            return agent::replay_events(loaded.value());
+        },
+        output, error);
+
+    const auto code = cli.execute(
+        {"agent", "run", "--workspace", workspace_sentinel,
+         "--issue", issue_sentinel});
+
+    REQUIRE(code == agent::ExitCode::Success);
+    REQUIRE(captured_result.has_value());
+    REQUIRE(captured_result->state.has_value());
+    REQUIRE(!captured_result->fatal_error.has_value());
+    REQUIRE(captured_result->state->task_id == kTaskId);
+    REQUIRE(captured_result->state->status == agent::TaskStatus::Completed);
+    const auto event_path = store.event_path(kTaskId);
+    REQUIRE(event_path.has_value());
+    const auto loaded = store.read_file(event_path.value());
+    REQUIRE(loaded.has_value());
+    const std::vector<agent::EventKind> expected_kinds{
+        agent::EventKind::TaskStarted,
+        agent::EventKind::ContextPreparationStarted,
+        agent::EventKind::ContextPrepared,
+        agent::EventKind::ModelCallStarted,
+        agent::EventKind::ModelCallSucceeded,
+        agent::EventKind::TaskCompleted};
+    REQUIRE(loaded.value().size() == expected_kinds.size());
+    for (std::size_t index = 0; index < loaded.value().size(); ++index) {
+        REQUIRE(loaded.value()[index].task_id == kTaskId);
+        REQUIRE(loaded.value()[index].sequence == index + 1);
+        REQUIRE(agent::event_kind(loaded.value()[index].payload) ==
+                expected_kinds[index]);
+    }
+    const auto replayed = agent::replay_events(loaded.value());
+    REQUIRE(replayed.has_value());
+    REQUIRE(replayed.value() == *captured_result->state);
+    REQUIRE(output.str() ==
+            "task_id=task-00000000000000000000000000000009 sequence=1 "
+            "event=TaskStarted status=Created\n"
+            "task_id=task-00000000000000000000000000000009 sequence=2 "
+            "event=ContextPreparationStarted status=PreparingContext\n"
+            "task_id=task-00000000000000000000000000000009 sequence=3 "
+            "event=ContextPrepared status=AwaitingModel\n"
+            "task_id=task-00000000000000000000000000000009 sequence=4 "
+            "event=ModelCallStarted status=AwaitingModel\n"
+            "task_id=task-00000000000000000000000000000009 sequence=5 "
+            "event=ModelCallSucceeded status=AwaitingModel\n"
+            "task_id=task-00000000000000000000000000000009 sequence=6 "
+            "event=TaskCompleted status=Completed\n"
+            "已完成🙂\n");
+    REQUIRE(error.str().empty());
+    REQUIRE(output.str().find(issue_sentinel) == std::string::npos);
+    REQUIRE(output.str().find(workspace_sentinel) == std::string::npos);
+    REQUIRE(output.str().find(metadata_sentinel) == std::string::npos);
+}
+
 TEST_CASE(provider_secret_never_reaches_cli_events_or_errors) {
     const std::string sentinel = "TASK9_SECRET_SENTINEL_DO_NOT_PRINT";
     test::ScopedTempDir temp(std::filesystem::u8path(u8"运行时-秘密边界"));
@@ -191,10 +277,12 @@ TEST_CASE(provider_secret_never_reaches_cli_events_or_errors) {
     std::ostringstream output;
     std::ostringstream error;
     agent::CliApp cli(
-        [&](const agent::RunRequest& request) {
-            captured_result = runtime.run({request.issue, request.workspace_utf8,
-                                           u8"你是编码代理。",
-                                           fixtures::budgets()});
+        [&](const agent::RunRequest& request,
+            const agent::RuntimeProgressObserver& observer) {
+            captured_result = runtime.run(
+                {request.issue, request.workspace_utf8, u8"你是编码代理。",
+                 fixtures::budgets()},
+                observer);
             return *captured_result;
         },
         [&](const std::filesystem::path& path) {

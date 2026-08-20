@@ -44,6 +44,88 @@ const char* status_name(TaskStatus status) {
     return "Unknown";
 }
 
+const char* event_kind_name(EventKind event_kind) {
+    switch (event_kind) {
+        case EventKind::TaskStarted:
+            return "TaskStarted";
+        case EventKind::ContextPreparationStarted:
+            return "ContextPreparationStarted";
+        case EventKind::ContextPrepared:
+            return "ContextPrepared";
+        case EventKind::ContextPreparationFailed:
+            return "ContextPreparationFailed";
+        case EventKind::ModelCallStarted:
+            return "ModelCallStarted";
+        case EventKind::ModelCallSucceeded:
+            return "ModelCallSucceeded";
+        case EventKind::ModelCallFailed:
+            return "ModelCallFailed";
+        case EventKind::ToolCallStarted:
+            return "ToolCallStarted";
+        case EventKind::ToolCallSucceeded:
+            return "ToolCallSucceeded";
+        case EventKind::ToolCallFailed:
+            return "ToolCallFailed";
+        case EventKind::TaskCompleted:
+            return "TaskCompleted";
+        case EventKind::TaskFailed:
+            return "TaskFailed";
+        case EventKind::TaskBudgetExceeded:
+            return "TaskBudgetExceeded";
+        case EventKind::TaskCancelled:
+            return "TaskCancelled";
+    }
+    return "Unknown";
+}
+
+const char* error_code_name(ErrorCode code) {
+    switch (code) {
+        case ErrorCode::InvalidInput:
+            return "InvalidInput";
+        case ErrorCode::InvalidConfiguration:
+            return "InvalidConfiguration";
+        case ErrorCode::PersistenceFailure:
+            return "PersistenceFailure";
+        case ErrorCode::TransportFailure:
+            return "TransportFailure";
+        case ErrorCode::RequestTimeout:
+            return "RequestTimeout";
+        case ErrorCode::HttpFailure:
+            return "HttpFailure";
+        case ErrorCode::ProtocolFailure:
+            return "ProtocolFailure";
+        case ErrorCode::DependencyUnavailable:
+            return "DependencyUnavailable";
+        case ErrorCode::InvalidTransition:
+            return "InvalidTransition";
+        case ErrorCode::BudgetExceeded:
+            return "BudgetExceeded";
+        case ErrorCode::Cancelled:
+            return "Cancelled";
+    }
+    return "Unknown";
+}
+
+const char* terminal_summary(TaskStatus status) {
+    switch (status) {
+        case TaskStatus::Failed:
+            return "task failed; inspect the local event log";
+        case TaskStatus::BudgetExceeded:
+            return "task budget exceeded; adjust limits before retrying";
+        case TaskStatus::Cancelled:
+            return "task cancelled; rerun when ready";
+        default:
+            return "runtime returned an unexpected terminal state";
+    }
+}
+
+const char* fatal_summary(ErrorCode code) {
+    if (code == ErrorCode::PersistenceFailure) {
+        return "runtime persistence failed; inspect local storage before retrying";
+    }
+    return "runtime failed; inspect the local event log";
+}
+
 int exit_for_error(ErrorCode code) {
     switch (code) {
         case ErrorCode::InvalidInput:
@@ -327,13 +409,52 @@ int CliApp::execute(const std::vector<std::string>& args) {
         return ExitCode::InvalidInputOrConfig;
     }
 
-    const auto result = run_({*issue, *workspace, std::string{}, {}});
+    bool progress_valid = true;
+    const RuntimeProgressObserver observer =
+        [&](const RuntimeProgress& progress) {
+            if (!progress_valid) {
+                return;
+            }
+            if (!valid_generated_task_id(progress.task_id)) {
+                progress_valid = false;
+                return;
+            }
+            output_ << "task_id=" << progress.task_id
+                    << " sequence=" << progress.sequence
+                    << " event=" << event_kind_name(progress.event_kind)
+                    << " status=" << status_name(progress.status) << '\n';
+        };
+    const auto result =
+        run_({*issue, *workspace, std::string{}, {}}, observer);
+    if (!progress_valid) {
+        error_ << "runtime progress contained an invalid task ID\n";
+        return ExitCode::TaskFailed;
+    }
     if (result.fatal_error.has_value()) {
-        error_ << "runtime failed before reaching a terminal task state\n";
+        if (result.state.has_value()) {
+            if (!valid_generated_task_id(result.state->task_id)) {
+                error_ << "runtime returned an invalid task ID\n";
+                return ExitCode::TaskFailed;
+            }
+            error_ << "task_id=" << result.state->task_id
+                   << " status=" << status_name(result.state->status)
+                   << " error_code="
+                   << error_code_name(result.fatal_error->code)
+                   << " summary=" << fatal_summary(result.fatal_error->code)
+                   << '\n';
+        } else {
+            error_ << "error_code=" << error_code_name(result.fatal_error->code)
+                   << " summary=runtime failed before a durable task state was "
+                      "available\n";
+        }
         return exit_for_error(result.fatal_error->code);
     }
     if (!result.state.has_value()) {
         error_ << "runtime returned no task state\n";
+        return ExitCode::TaskFailed;
+    }
+    if (!valid_generated_task_id(result.state->task_id)) {
+        error_ << "runtime returned an invalid task ID\n";
         return ExitCode::TaskFailed;
     }
 
@@ -346,13 +467,34 @@ int CliApp::execute(const std::vector<std::string>& args) {
             output_ << render_terminal_text(*result.state->final_text) << '\n';
             return ExitCode::Success;
         case TaskStatus::BudgetExceeded:
-            error_ << "task budget exceeded\n";
+            error_ << "task_id=" << result.state->task_id
+                   << " status=" << status_name(result.state->status)
+                   << " error_code="
+                   << (result.state->terminal_error.has_value()
+                           ? error_code_name(result.state->terminal_error->code)
+                           : "Unknown")
+                   << " summary=" << terminal_summary(result.state->status)
+                   << '\n';
             return ExitCode::BudgetExceeded;
         case TaskStatus::Cancelled:
-            error_ << "task cancelled\n";
+            error_ << "task_id=" << result.state->task_id
+                   << " status=" << status_name(result.state->status)
+                   << " error_code="
+                   << (result.state->terminal_error.has_value()
+                           ? error_code_name(result.state->terminal_error->code)
+                           : "Unknown")
+                   << " summary=" << terminal_summary(result.state->status)
+                   << '\n';
             return ExitCode::Cancelled;
         case TaskStatus::Failed:
-            error_ << "task failed\n";
+            error_ << "task_id=" << result.state->task_id
+                   << " status=" << status_name(result.state->status)
+                   << " error_code="
+                   << (result.state->terminal_error.has_value()
+                           ? error_code_name(result.state->terminal_error->code)
+                           : "Unknown")
+                   << " summary=" << terminal_summary(result.state->status)
+                   << '\n';
             return ExitCode::TaskFailed;
         default:
             error_ << "runtime returned a non-terminal task state\n";
