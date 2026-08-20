@@ -750,6 +750,38 @@ TEST_CASE(generic_budget_terminals_accept_reconstructibly_legal_traces) {
             std::optional<agent::RuntimeError>{tool_error});
 }
 
+TEST_CASE(time_budget_terminal_rejects_awaiting_tool_after_all_work_is_processed) {
+    const std::string task = "post-tool-time-budget";
+    std::vector<agent::RuntimeEvent> events = {
+        fixtures::task_started(task, 1, "issue"),
+        fixtures::context_started(task, 2),
+        fixtures::context_prepared(task, 3, "source"),
+        fixtures::model_started(task, 4),
+        fixtures::model_succeeded(
+            task, 5, {agent::ToolUseBlock{fixtures::first_call()}},
+            agent::StopReason::ToolUse),
+        fixtures::tool_started(task, 6, fixtures::first_call()),
+        fixtures::tool_succeeded(task, 7, fixtures::first_result()),
+    };
+    const auto prefix = agent::replay_events(events);
+    REQUIRE(prefix.has_value());
+    REQUIRE(prefix.value().status == agent::TaskStatus::AwaitingTool);
+    REQUIRE(!prefix.value().active_tool_call_id.has_value());
+    REQUIRE(prefix.value().next_tool_index ==
+            prefix.value().pending_tool_calls.size());
+    events.push_back(fixtures::event(
+        task, 8,
+        agent::TaskBudgetExceededPayload{
+            "max_task_time_ms",
+            {agent::ErrorCode::BudgetExceeded,
+             "max_task_time_ms budget exceeded", false}}));
+
+    const auto result = agent::replay_events(events);
+
+    REQUIRE(!result.has_value());
+    REQUIRE(result.error().code == agent::ErrorCode::InvalidTransition);
+}
+
 TEST_CASE(generic_budget_terminal_rejects_unknown_or_empty_names) {
     for (const auto& name : {std::string{}, std::string{"unknown_budget"}}) {
         const std::string task = name.empty() ? "empty-budget" : "unknown-budget";

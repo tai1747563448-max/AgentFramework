@@ -273,7 +273,7 @@ runtime_data/tasks/<task_id>/events.jsonl
 
 `max_tokens` 的 `TaskBudgetExceeded` 仅可紧接在已接受的 `MaxTokens ModelCallSucceeded` 之后回放，且必须携带精确、固定的 `max_tokens` payload。`EndTurn` 和 `StopSequence` 只接受 `TaskCompleted`，不接受预算终态。
 
-通用预算回放只接受 `max_task_time_ms`、`max_model_rounds`、`max_tool_calls`，错误必须精确为 `{BudgetExceeded, "<budget_name> budget exceeded", false}`，并且没有进行中的模型调用或工具调用。时间预算只可从 `PreparingContext`、空闲 `AwaitingModel` 或空闲 `AwaitingTool` 接受；V1 事件不包含可重建的单调时钟经过时间，因此回放不声称重新验证 elapsed。模型轮次预算只可从没有已接受终止 stop 的空闲 `AwaitingModel` 接受，并要求 `usage.model_rounds >= budgets.max_model_rounds`。工具调用预算只可从已接受 `ToolUse`、仍有未处理 pending call 的空闲 `AwaitingTool` 接受，并要求 `usage.tool_calls >= budgets.max_tool_calls`。未知名称、篡改错误、错误状态、未耗尽计数，以及已接受 `MaxTokens`、`EndTurn` 或 `StopSequence` 后的其他预算终态均拒绝回放。
+通用预算回放只接受 `max_task_time_ms`、`max_model_rounds`、`max_tool_calls`，错误必须精确为 `{BudgetExceeded, "<budget_name> budget exceeded", false}`，并且没有进行中的模型调用或工具调用。时间预算只可从 `PreparingContext`、空闲 `AwaitingModel` 或仍有未处理 pending call 的空闲 `AwaitingTool` 接受；V1 事件不包含可重建的单调时钟经过时间，因此回放不声称重新验证 elapsed。模型轮次预算只可从没有已接受终止 stop 的空闲 `AwaitingModel` 接受，并要求 `usage.model_rounds >= budgets.max_model_rounds`。工具调用预算只可从已接受 `ToolUse`、仍有未处理 pending call 的空闲 `AwaitingTool` 接受，并要求 `usage.tool_calls >= budgets.max_tool_calls`。未知名称、篡改错误、错误状态、未耗尽计数，以及已接受 `MaxTokens`、`EndTurn` 或 `StopSequence` 后的其他预算终态均拒绝回放。
 
 第一阶段不做自动重试。请求开始但结果未知的情况保留在事件日志中，由后续 Recovery 子项目定义处理策略。
 

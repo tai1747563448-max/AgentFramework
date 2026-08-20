@@ -275,7 +275,9 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                         const bool legal_status =
                             state.status == TaskStatus::PreparingContext ||
                             state.status == TaskStatus::AwaitingModel ||
-                            state.status == TaskStatus::AwaitingTool;
+                            (state.status == TaskStatus::AwaitingTool &&
+                             state.next_tool_index <
+                                 state.pending_tool_calls.size());
                         if (!legal_status) {
                             return invalid_transition(
                                 "time budget requires an idle external-call guard");
