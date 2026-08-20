@@ -252,9 +252,52 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                         return invalid_transition(
                             "task budget terminal does not match accepted response");
                     }
-                } else if (follows_max_tokens || follows_text_completion) {
-                    return invalid_transition(
-                        "task budget terminal does not match accepted response");
+                } else {
+                    const bool is_time_budget =
+                        typed_payload.budget_name == "max_task_time_ms";
+                    const bool is_model_budget =
+                        typed_payload.budget_name == "max_model_rounds";
+                    const bool is_tool_budget =
+                        typed_payload.budget_name == "max_tool_calls";
+                    const RuntimeError expected_error{
+                        ErrorCode::BudgetExceeded,
+                        typed_payload.budget_name + " budget exceeded", false};
+                    if ((!is_time_budget && !is_model_budget && !is_tool_budget) ||
+                        !(typed_payload.error == expected_error) ||
+                        state.model_call_in_flight ||
+                        state.active_tool_call_id.has_value() ||
+                        follows_max_tokens || follows_text_completion) {
+                        return invalid_transition(
+                            "task budget terminal is not a legal generic guard");
+                    }
+
+                    if (is_time_budget) {
+                        const bool legal_status =
+                            state.status == TaskStatus::PreparingContext ||
+                            state.status == TaskStatus::AwaitingModel ||
+                            state.status == TaskStatus::AwaitingTool;
+                        if (!legal_status) {
+                            return invalid_transition(
+                                "time budget requires an idle external-call guard");
+                        }
+                    } else if (is_model_budget) {
+                        if (state.status != TaskStatus::AwaitingModel ||
+                            state.accepted_model_stop_reason.has_value() ||
+                            state.usage.model_rounds <
+                                state.budgets.max_model_rounds) {
+                            return invalid_transition(
+                                "model-round budget requires an exhausted idle guard");
+                        }
+                    } else if (state.status != TaskStatus::AwaitingTool ||
+                               state.accepted_model_stop_reason !=
+                                   StopReason::ToolUse ||
+                               state.next_tool_index >=
+                                   state.pending_tool_calls.size() ||
+                               state.usage.tool_calls <
+                                   state.budgets.max_tool_calls) {
+                        return invalid_transition(
+                            "tool-call budget requires exhausted pending work");
+                    }
                 }
                 state.terminal_error = typed_payload.error;
                 state.status = TaskStatus::BudgetExceeded;
