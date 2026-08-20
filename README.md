@@ -14,7 +14,10 @@ The dependency direction points inward:
 - `src/application` owns the reducer and `RuntimeEngine`. Every candidate event
   is preview-reduced without mutating live state, appended and flushed, and
   only then committed to memory. A per-run observer is notified after that
-  durable commit with only task ID, sequence, event kind, and task status.
+  durable commit with only task ID, sequence, event kind, and task status. If
+  observation throws, the Runtime disables its local callback copy and
+  continues the same task; reporting cannot create an event, fatal result, or
+  exit-code change.
 - `src/ports` defines model, tool, knowledge, event-store, clock, ID, and
   cancellation interfaces.
 - `src/adapters` supplies Anthropic Messages HTTP, JSONL persistence, empty

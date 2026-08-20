@@ -68,7 +68,7 @@ RuntimeEngine::RuntimeEngine(ModelClient& model,
 RuntimeResult RuntimeEngine::append_event(std::optional<TaskState>& state,
                                           const std::string& task_id,
                                           EventPayload payload,
-                                          const RuntimeProgressObserver& observer) {
+                                          RuntimeProgressObserver& observer) {
     const std::uint64_t sequence =
         state.has_value() ? state->last_sequence + 1 : 1;
     RuntimeEvent event{1, sequence, task_id, clock_.now_utc(),
@@ -86,8 +86,12 @@ RuntimeResult RuntimeEngine::append_event(std::optional<TaskState>& state,
 
     state = std::move(reduced.value());
     if (observer) {
-        observer({state->task_id, state->last_sequence,
-                  event_kind(event.payload), state->status});
+        try {
+            observer({state->task_id, state->last_sequence,
+                      event_kind(event.payload), state->status});
+        } catch (...) {
+            observer = nullptr;
+        }
     }
     return {state, std::nullopt};
 }
@@ -96,7 +100,7 @@ RuntimeResult RuntimeEngine::guard_external_call(
     std::optional<TaskState>& state,
     const std::string& task_id,
     std::int64_t started_at_ms,
-    const RuntimeProgressObserver& observer,
+    RuntimeProgressObserver& observer,
     const char* count_budget_name,
     std::size_t count,
     std::size_t limit) {
@@ -135,7 +139,7 @@ RuntimeResult RuntimeEngine::guard_external_call(
 
 RuntimeResult RuntimeEngine::run(
     const RunRequest& request,
-    const RuntimeProgressObserver& observer) {
+    RuntimeProgressObserver observer) {
     std::optional<TaskState> state;
     const std::int64_t started_at_ms = clock_.monotonic_ms();
     const std::string task_id = ids_.next_task_id();

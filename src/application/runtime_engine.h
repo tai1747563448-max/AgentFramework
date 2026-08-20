@@ -53,17 +53,17 @@ public:
                   Cancellation& cancellation);
 
     RuntimeResult run(const RunRequest& request,
-                      const RuntimeProgressObserver& observer);
+                      RuntimeProgressObserver observer);
 
 private:
     RuntimeResult append_event(std::optional<TaskState>& state,
                                const std::string& task_id,
                                EventPayload payload,
-                               const RuntimeProgressObserver& observer);
+                               RuntimeProgressObserver& observer);
     RuntimeResult guard_external_call(std::optional<TaskState>& state,
                                       const std::string& task_id,
                                       std::int64_t started_at_ms,
-                                      const RuntimeProgressObserver& observer,
+                                      RuntimeProgressObserver& observer,
                                       const char* count_budget_name = nullptr,
                                       std::size_t count = 0,
                                       std::size_t limit = 0);

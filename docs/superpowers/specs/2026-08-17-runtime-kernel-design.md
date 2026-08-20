@@ -230,6 +230,8 @@ Domain 保存不依赖基础设施的核心类型：
 
 进度通知是 Application 层每次 `RuntimeEngine::run` 单独注入的回调。它按类型只接收 `RuntimeProgress{task_id, sequence, EventKind, TaskStatus}`，不接收 `RuntimeEvent`、payload、错误消息、模型/工具内容、证据、时间戳、correlation ID 或 Provider 数据。只有 preview reduce、append/flush 和状态提交全部成功后才通知；被拒绝或持久化失败的事件没有进度通知。
 
+进度观察是 best-effort 的非控制路径。`RuntimeEngine::run` 按值持有本次调用的可变 callback 副本；若一次通知抛出任何异常，Engine 只在该通知边界捕获异常并清空这份副本，后续不再通知，但继续同一个任务的模型/工具控制流和正常 `RuntimeResult`。观察失败不产生任务事件、`fatal_error` 或退出码变化，也不修改调用方持有的 callback。
+
 第一阶段对缺行、重复 sequence、未知 schema、非法 JSON 或非法状态转移只报告验证失败，不自动修复或截断日志。
 
 事件 envelope 与所有 schema-owned 嵌套记录都执行精确 key 集校验，包括 payload、错误、预算、消息/内容块、模型请求/响应、工具与证据记录；工具 schema/arguments 与 evidence metadata 中的 provider-neutral `Value` object 仍允许任意用户键，工具结果字符串内容也不被解释为 schema record。

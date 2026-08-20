@@ -17,6 +17,7 @@
 - All ordinary tests remain offline. `AGENT_ENABLE_LIVE_TESTS` stays OFF unless credentials are explicitly available; no live provider request is authorized by this plan.
 - Preserve write-ahead ordering: preview reduce, append/flush, commit state, then notify progress. A preview or append failure must not notify an event that is not durable.
 - Progress output is a fixed safe projection only: valid task ID, sequence, fixed `EventKind`, fixed `TaskStatus`. Never expose `RuntimeEvent::payload`, `RuntimeError::message`, issue, workspace, evidence, model text, tool arguments/results, provider body, credential, timestamp, or correlation ID.
+- Progress observation is best effort and must never control the durable task: `run` owns a mutable per-run callback copy, catches any callback exception at the reporting seam, disables that callback after its first failure, and continues normal Runtime control flow and `RuntimeResult` production.
 - Final CLI summaries may include the validated task ID, fixed status, and fixed `ErrorCode` name. They must not print raw terminal or fatal error messages.
 - Existing exact MaxTokens causal/payload binding and legal `max_task_time_ms`, `max_model_rounds`, and `max_tool_calls` replay must remain unchanged.
 - Tracked scope is limited to files named in each task. Generated build directories, SDD ledgers, reports, and review packages remain ignored.
@@ -122,6 +123,7 @@ Push to `backup/feat/runtime-kernel`; verify local SHA, tracking ref, and `E:\Gi
 - Modify: `tests/integration/runtime_integration_test.cpp`
 - Modify: `docs/superpowers/specs/2026-08-17-runtime-kernel-design.md`
 - Modify: `README.md`
+- Modify in fix round: `docs/superpowers/plans/2026-08-20-runtime-kernel-merge-review-fixes.md`
 
 **Step 1: Write RuntimeEngine progress-order tests**
 
@@ -129,6 +131,7 @@ Introduce tests for the new per-run observer contract before implementation:
 
 - a normal completed run reports one `RuntimeProgress` after each successfully appended event, with contiguous sequence, the stable task ID, fixed `EventKind`, and the post-reduce `TaskStatus` in durable order;
 - an EventStore append failure reports no progress for the rejected append and never reports a state transition that is absent from the store;
+- a throwing observer is called once, then disabled; the task still executes to its intended terminal state, returns its normal structured result, and persists the same complete event sequence as an empty observer;
 - observer data has no payload/error/message/text/evidence/tool/provider fields by type, not merely by a redaction assertion.
 
 **Step 2: Write CLI safe-output tests**
@@ -163,6 +166,7 @@ The expected RED is a missing observer/progress API or failing safe-report behav
 - Add `RuntimeProgress { task_id, sequence, EventKind, TaskStatus }` and `RuntimeProgressObserver` to the Application API.
 - `RuntimeEngine::run` accepts the observer per call and threads it into event append operations.
 - After preview reduce succeeds, EventStore append succeeds, and state is committed, invoke the observer with the safe projection. Never invoke it before durability or with a rejected event.
+- `RuntimeEngine::run` owns its callback copy. If notification throws, catch at this narrow observational boundary, clear the callback so it is not retried, and continue; do not turn reporting failure into `fatal_error`, a task event, an exit-code change, or an interrupted model/tool loop.
 - Change `RunCommand` so `CliApp` supplies the observer. The observer renders only validated/fixed progress fields; it never receives `RuntimeEvent::payload`.
 - Expose fixed mappings for all current `EventKind`, `TaskStatus`, and relevant `ErrorCode` values inside the CLI module; unknown enum values render a fixed `Unknown`, not integers or untrusted text.
 - On terminal/fatal return, print a fixed summary that includes a validated durable task ID when state exists, fixed status, and fixed error code. Preserve the final-text renderer for successful model output; never print raw error messages.
@@ -181,7 +185,7 @@ Do not claim the successful Unicode path is a real-console process test; that re
 
 **Step 7: Self-review, commit, backup**
 
-Confirm only the ten named tracked paths changed, progress is post-durable and payload-free by type, `verify-log` composition is unchanged, no raw error is printed, all task IDs are validated, no `pending_failure` appears in production code, and `git diff --check` passes.
+Confirm only the eleven named tracked paths changed across Task 2 and its reviewed fix round, progress is post-durable and payload-free by type, throwing observation cannot interrupt the task, `verify-log` composition is unchanged, no raw error is printed, all task IDs are validated, no `pending_failure` appears in production code, and `git diff --check` passes.
 
 Commit:
 

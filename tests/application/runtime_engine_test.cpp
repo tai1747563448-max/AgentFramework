@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -465,6 +466,55 @@ TEST_CASE(engine_never_reports_a_rejected_event_store_append) {
     REQUIRE(observed.back().sequence == result.state->last_sequence);
     REQUIRE(observed.back().status == result.state->status);
     REQUIRE(observed.back().event_kind == agent::EventKind::ContextPrepared);
+}
+
+TEST_CASE(throwing_progress_observer_is_disabled_without_interrupting_task) {
+    test::EngineFixture throwing_fixture(
+        test::FakeModel({
+            fixtures::tool_response({fixtures::call("call-1", "read"),
+                                     fixtures::call("call-2", "search")}),
+            fixtures::text_response("done")}),
+        test::FakeTools({agent::ToolResult{"call-1", "contents", false},
+                         agent::ToolResult{"call-2", "matches", false}}),
+        test::FakeKnowledge(fixtures::evidence()));
+    test::EngineFixture empty_observer_fixture(
+        test::FakeModel({
+            fixtures::tool_response({fixtures::call("call-1", "read"),
+                                     fixtures::call("call-2", "search")}),
+            fixtures::text_response("done")}),
+        test::FakeTools({agent::ToolResult{"call-1", "contents", false},
+                         agent::ToolResult{"call-2", "matches", false}}),
+        test::FakeKnowledge(fixtures::evidence()));
+    std::size_t observer_calls = 0;
+    agent::RuntimeProgressObserver throwing_observer =
+        [&](const agent::RuntimeProgress&) {
+            ++observer_calls;
+            throw std::runtime_error("SENTINEL_REPORTING_FAILURE");
+        };
+
+    const auto result = throwing_fixture.run(
+        fixtures::run_request("inspect code"), throwing_observer);
+    const auto empty_observer_result =
+        empty_observer_fixture.run(fixtures::run_request("inspect code"));
+
+    REQUIRE(observer_calls == 1);
+    REQUIRE(static_cast<bool>(throwing_observer));
+    REQUIRE(result.state.has_value());
+    REQUIRE(!result.fatal_error.has_value());
+    REQUIRE(result.state->status == agent::TaskStatus::Completed);
+    REQUIRE(result.state->final_text == std::optional<std::string>{"done"});
+    REQUIRE(!result.state->terminal_error.has_value());
+    REQUIRE(empty_observer_result.state.has_value());
+    REQUIRE(!empty_observer_result.fatal_error.has_value());
+    REQUIRE(*result.state == *empty_observer_result.state);
+    REQUIRE(throwing_fixture.events.events ==
+            empty_observer_fixture.events.events);
+    REQUIRE(throwing_fixture.events.events.size() == 14);
+    REQUIRE(throwing_fixture.model.requests.size() == 2);
+    REQUIRE(throwing_fixture.knowledge.retrieved_states.size() == 2);
+    REQUIRE(throwing_fixture.tools.definitions_calls == 2);
+    REQUIRE((throwing_fixture.tools.executed_ids() ==
+             std::vector<std::string>{"call-1", "call-2"}));
 }
 
 TEST_CASE(engine_builds_model_request_from_durable_inputs_in_order) {
