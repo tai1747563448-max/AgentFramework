@@ -300,6 +300,28 @@ TEST_CASE(context_failure_is_terminal_and_rejects_continuation) {
     REQUIRE(continuation.error().code == agent::ErrorCode::InvalidTransition);
 }
 
+TEST_CASE(reducer_rejects_invalid_context_evidence_before_state_mutation) {
+    auto events = fixtures::completed_text_trace(
+        "invalid-evidence", "fix warning", "done");
+    events.resize(2);
+    auto state = agent::replay_events(events);
+    REQUIRE(state.has_value());
+    auto invalid = fixtures::evidence("duplicate-source");
+    invalid.items.push_back(invalid.items.front());
+
+    const auto reduced = agent::reduce_event(
+        state.value(),
+        fixtures::event(
+            "invalid-evidence", 3,
+            agent::ContextPreparedPayload{std::move(invalid)}));
+
+    REQUIRE(!reduced.has_value());
+    REQUIRE(reduced.error().code == agent::ErrorCode::InvalidTransition);
+    REQUIRE(state.value().status == agent::TaskStatus::PreparingContext);
+    REQUIRE(state.value().evidence.items.empty());
+    REQUIRE(state.value().last_sequence == 2);
+}
+
 TEST_CASE(model_failure_is_terminal_and_rejects_continuation) {
     const auto trace = fixtures::completed_text_trace(
         "task-model-failure", "fix warning", "done");

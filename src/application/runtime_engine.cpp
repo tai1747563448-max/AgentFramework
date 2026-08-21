@@ -1,6 +1,7 @@
 #include "application/runtime_engine.h"
 
 #include "application/state_reducer.h"
+#include "domain/evidence_validation.h"
 #include "ports/cancellation.h"
 #include "ports/clock.h"
 #include "ports/event_store.h"
@@ -171,6 +172,14 @@ RuntimeResult RuntimeEngine::run(
             return append_event(
                 state, task_id,
                 ContextPreparationFailedPayload{evidence.error()}, observer);
+        }
+        if (!evidence_pack_is_valid(evidence.value())) {
+            return append_event(
+                state, task_id,
+                ContextPreparationFailedPayload{
+                    {ErrorCode::ProtocolFailure,
+                     "knowledge provider returned invalid evidence", false}},
+                observer);
         }
 
         transition = append_event(

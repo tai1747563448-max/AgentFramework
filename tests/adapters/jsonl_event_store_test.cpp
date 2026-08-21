@@ -458,6 +458,27 @@ TEST_CASE(jsonl_rejects_invalid_or_duplicate_response_tool_calls) {
     }
 }
 
+TEST_CASE(jsonl_rejects_forged_invalid_context_evidence) {
+    test::ScopedTempDir temp("jsonl-invalid-evidence");
+    const auto task = fixtures::valid_task_id("invalid-evidence");
+    auto invalid = fixtures::evidence();
+    invalid.items.push_back(invalid.items.front());
+    const std::vector<agent::RuntimeEvent> forged{
+        fixtures::task_started(task, 1, "issue"),
+        fixtures::event(task, 2,
+                        agent::ContextPreparationStartedPayload{}),
+        fixtures::event(task, 3,
+                        agent::ContextPreparedPayload{std::move(invalid)})};
+    const auto file =
+        temp.write_text("events.jsonl", fixtures::as_jsonl(forged));
+    agent::JsonlEventStore store(temp.path());
+
+    const auto loaded = store.read_file(file);
+
+    REQUIRE(!loaded.has_value());
+    REQUIRE(loaded.error().code == agent::ErrorCode::PersistenceFailure);
+}
+
 TEST_CASE(jsonl_append_reports_unwritable_runtime_root) {
     test::ScopedTempDir temp("jsonl-unwritable-root");
     const auto root_file = temp.write_text("not-a-directory", "occupied");

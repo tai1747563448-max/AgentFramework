@@ -37,6 +37,7 @@ target_include_directories(dotenv_header_only INTERFACE
 
 add_library(agent_kernel STATIC
     src/domain/value.cpp
+    src/domain/evidence_validation.cpp
     src/domain/runtime_event.cpp
     src/application/state_reducer.cpp
     src/application/runtime_engine.cpp
@@ -98,6 +99,7 @@ function(add_agent_test target source)
     add_test(NAME ${target} COMMAND ${target})
 endfunction()
 add_agent_test(domain_primitives_tests tests/domain/value_result_test.cpp)
+add_agent_test(evidence_validation_tests tests/domain/evidence_validation_test.cpp)
 add_agent_test(runtime_event_tests tests/domain/runtime_event_test.cpp)
 add_agent_test(state_reducer_tests tests/application/state_reducer_test.cpp)
 add_agent_test(runtime_engine_tests tests/application/runtime_engine_test.cpp)
