@@ -24,9 +24,10 @@ The dependency direction points inward:
   workspace file tools, opt-in structured CMake/CTest tools, an empty
   knowledge adapter, an opt-in Python RAG adapter, and system
   clock/ID/cancellation implementations.
-- `src/main.cpp` is the composition root; `src/cli` parses `run` and
-  `verify-log`, uses fixed failure messages, and bounds the fields printed by
-  progress and log verification. A successful `run` renders final text as
+- `src/main.cpp` is the composition root; `src/cli` parses `run`, `resume`,
+  `verify-log`, and `evaluate-log`, uses fixed failure messages, and bounds the
+  fields printed by progress, verification, and evaluation. A successful
+  `run` or `resume` renders final text as
   UTF-8, visibly
   escapes terminal controls and invalid bytes, and truncates only at code-point
   boundaries after at most 8192 rendered bytes.
@@ -47,9 +48,8 @@ direct `ModelCallFailed` protocol failures.
 This milestone provides versioned text-file inspection/editing, an opt-in
 structured build/test loop, and an opt-in deterministic local knowledge
 sidecar. It does not provide a model-selectable shell, Git mutation, embeddings,
-a vector database, crash resumption, automatic retry policy, parallel
-execution, multiple agents, a second provider, an HTTP service, a TUI, MCP, or
-plugins.
+a vector database, an automatic retry policy, parallel execution, multiple
+agents, a second provider, an HTTP service, a TUI, MCP, or plugins.
 
 ## Workspace file tools
 
@@ -194,8 +194,15 @@ ctest --test-dir build/vs2022 -C Debug --output-on-failure
 CMake configuration may obtain pinned third-party dependencies through
 `FetchContent` when they are not already cached. If Python 3.10+ is found,
 CTest also registers the Python unit suite and the real local C++/Python RAG
-integration. The default CTest suite uses only deterministic fakes, local
-processes, and local files; it does not send network requests.
+integration. It also runs a real, Unicode-path coding workflow against a tiny
+CMake project: the initial CTest fails, the Runtime edits source, persistence is
+failed after the filesystem effect, a fresh Runtime resumes the durable task,
+reconciles the repeated edit through its SHA conflict, rebuilds, passes the
+exact CTest, replays the final log, and evaluates it. The model is scripted and
+offline; the production Runtime, JSONL store, workspace/build tools, process
+runner, and Python RAG adapter are used. The default CTest suite uses only
+deterministic fakes, local processes, and local files; it does not send network
+requests.
 
 ## Configuration and `.env`
 
@@ -227,6 +234,31 @@ error-code names, and a fixed actionable summary; raw runtime error messages
 are not printed. Unknown enum values render as `Unknown`. Successful tasks then
 print final model text through the existing bounded UTF-8 renderer.
 
+## Resume a durable task
+
+`resume` loads exactly
+`<AGENT_RUNTIME_ROOT>/tasks/<task-id>/events.jsonl`, validates that every event
+belongs to the requested ID, replays it, and continues from the durable phase:
+
+```powershell
+& .\build\vs2022\Debug\agent.exe --env-file .env resume `
+  --task-id task-0123456789abcdef0123456789abcdef
+```
+
+A terminal task is idempotent: it returns the durable final result without an
+external call or another event. An in-flight model call is reissued from the
+exact durable `ModelRequest`; an active tool call is reexecuted from the exact
+durable `ToolCall`. This is at-least-once recovery. The file tools' expected
+SHA-256 and exact match count make an already-applied edit return a model-visible
+conflict, after which the model can reread and reconcile. The Runtime never
+claims exactly-once external effects.
+
+Durable cumulative model/tool counts continue across attempts. The wall-clock
+limit is monotonic only within one process attempt and restarts for an explicit
+resume; this is a documented V1 limitation, not a durable elapsed-time budget.
+Nonterminal resume needs the same local Provider/tool/RAG configuration as a
+fresh run. A terminal resume makes no Provider request.
+
 ## Verify an event log
 
 Each task is stored under
@@ -243,6 +275,24 @@ Verification prints only the validated task ID, current replayed status, and
 last sequence. It rejects malformed JSON, unknown schema, noncontiguous or mixed
 task sequences, invalid transitions, and unsafe task IDs without modifying the
 file. Combining `verify-log` with `--env-file` is invalid input.
+
+## Evaluate an event log
+
+Evaluation is also credential-independent and offline:
+
+```powershell
+& .\build\vs2022\Debug\agent.exe evaluate-log `
+  --events .\runtime_data\tasks\<task-id>\events.jsonl
+```
+
+It first performs the same strict replay, then prints only fixed fields: the
+verdict, terminal status, model/tool counts, evidence rounds/items, model
+requests carrying evidence, tool-error results, and last sequence. `pass`
+means the durable state is `Completed`, has nonempty final text, and has no
+pending model/tool/error state. A valid log that does not meet that contract
+returns the task-failed exit code; a malformed or invalid log returns the
+invalid-event-log exit code. `evaluate-log` never loads an env file, creates a
+Provider client, or starts RAG. Combining it with `--env-file` is invalid input.
 
 Event files are local audit records, not public logs. They can contain the
 issue, workspace path, prompts, evidence, tool inputs/results, model text, and

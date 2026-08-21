@@ -162,6 +162,12 @@ if(Python3_Interpreter_FOUND)
     target_compile_definitions(rag_integration_tests PRIVATE
         AGENT_RAG_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
         AGENT_RAG_SCRIPT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/rag/agent_rag_cli.py")
+    add_agent_test(autonomous_issue_workflow_tests
+        tests/integration/autonomous_issue_workflow_test.cpp)
+    target_link_libraries(autonomous_issue_workflow_tests PRIVATE agent_runtime)
+    target_compile_definitions(autonomous_issue_workflow_tests PRIVATE
+        AGENT_RAG_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
+        AGENT_RAG_SCRIPT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/rag/agent_rag_cli.py")
     add_test(
         NAME python_rag_tests
         COMMAND "${Python3_EXECUTABLE}" -E -s -X utf8 -m unittest
