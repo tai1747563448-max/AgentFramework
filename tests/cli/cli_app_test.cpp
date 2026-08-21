@@ -3,6 +3,7 @@
 #include "adapters/system/random_id_generator.h"
 #include "adapters/system/signal_cancellation.h"
 #include "adapters/system/system_clock.h"
+#include "application/task_evaluator.h"
 #include "cli/cli_app.h"
 #include "config/runtime_config.h"
 #include "test_support.h"
@@ -121,6 +122,23 @@ agent::RuntimeResult terminal_result(agent::TaskStatus status) {
 
 agent::Result<agent::TaskState> verified_state(agent::TaskStatus status) {
     return agent::Result<agent::TaskState>::success(terminal_state(status));
+}
+
+agent::Result<agent::TaskEvaluation> evaluated_task(bool passed) {
+    agent::TaskEvaluation evaluation;
+    evaluation.task_id = kTaskId;
+    evaluation.passed = passed;
+    evaluation.status = passed ? agent::TaskStatus::Completed
+                               : agent::TaskStatus::Failed;
+    evaluation.model_rounds = 2;
+    evaluation.tool_calls = 3;
+    evaluation.evidence_rounds = 2;
+    evaluation.evidence_items = 4;
+    evaluation.model_requests_with_evidence = 2;
+    evaluation.tool_error_results = 1;
+    evaluation.last_sequence = 9;
+    return agent::Result<agent::TaskEvaluation>::success(
+        std::move(evaluation));
 }
 
 }  // namespace test
@@ -1101,12 +1119,123 @@ TEST_CASE(startup_parser_extracts_one_explicit_env_file_before_command_dispatch)
                                       test::kTaskId}));
 }
 
+TEST_CASE(cli_evaluates_a_log_with_fixed_metrics_and_verdict_exit) {
+    for (const bool passed : {true, false}) {
+        std::vector<std::filesystem::path> paths;
+        std::ostringstream out;
+        std::ostringstream err;
+        agent::CliApp app(
+            [](const agent::RunRequest&,
+               const agent::RuntimeProgressObserver&) {
+                return test::terminal_result(agent::TaskStatus::Completed);
+            },
+            [](const std::string&,
+               const agent::RuntimeProgressObserver&) {
+                return test::terminal_result(agent::TaskStatus::Completed);
+            },
+            [](const std::filesystem::path&) {
+                return test::verified_state(agent::TaskStatus::Completed);
+            },
+            [&](const std::filesystem::path& path) {
+                paths.push_back(path);
+                return test::evaluated_task(passed);
+            },
+            out, err);
+
+        const auto code = app.execute(
+            {"agent", "evaluate-log", "--events", u8"E:/运行/事件.jsonl"});
+
+        REQUIRE(code == (passed ? agent::ExitCode::Success
+                                : agent::ExitCode::TaskFailed));
+        REQUIRE(paths == std::vector<std::filesystem::path>{
+                             std::filesystem::u8path(u8"E:/运行/事件.jsonl")});
+        REQUIRE(out.str() ==
+                std::string("task_id=") + test::kTaskId +
+                    " verdict=" + (passed ? "pass" : "fail") +
+                    " status=" + (passed ? "Completed" : "Failed") +
+                    " model_rounds=2 tool_calls=3 evidence_rounds=2 "
+                    "evidence_items=4 model_requests_with_evidence=2 "
+                    "tool_error_results=1 last_sequence=9\n");
+        REQUIRE(err.str().empty());
+    }
+}
+
+TEST_CASE(cli_rejects_invalid_evaluation_input_without_detail_leaks) {
+    const std::vector<std::vector<std::string>> bad_shapes{
+        {"agent", "evaluate-log"},
+        {"agent", "evaluate-log", "events.jsonl"},
+        {"agent", "evaluate-log", "--events", ""},
+        {"agent", "evaluate-log", "--events", "events.jsonl", "extra"},
+    };
+    for (const auto& args : bad_shapes) {
+        std::size_t evaluation_calls = 0;
+        std::ostringstream out;
+        std::ostringstream err;
+        agent::CliApp app(
+            [](const agent::RunRequest&,
+               const agent::RuntimeProgressObserver&) {
+                return test::terminal_result(agent::TaskStatus::Completed);
+            },
+            [](const std::string&,
+               const agent::RuntimeProgressObserver&) {
+                return test::terminal_result(agent::TaskStatus::Completed);
+            },
+            [](const std::filesystem::path&) {
+                return test::verified_state(agent::TaskStatus::Completed);
+            },
+            [&](const std::filesystem::path&) {
+                ++evaluation_calls;
+                return test::evaluated_task(true);
+            },
+            out, err);
+        REQUIRE(app.execute(args) ==
+                agent::ExitCode::InvalidInputOrConfig);
+        REQUIRE(evaluation_calls == 0);
+        REQUIRE(out.str().empty());
+        REQUIRE(!err.str().empty());
+    }
+
+    std::ostringstream out;
+    std::ostringstream err;
+    agent::CliApp app(
+        [](const agent::RunRequest&,
+           const agent::RuntimeProgressObserver&) {
+            return test::terminal_result(agent::TaskStatus::Completed);
+        },
+        [](const std::string&,
+           const agent::RuntimeProgressObserver&) {
+            return test::terminal_result(agent::TaskStatus::Completed);
+        },
+        [](const std::filesystem::path&) {
+            return test::verified_state(agent::TaskStatus::Completed);
+        },
+        [](const std::filesystem::path&) {
+            return agent::Result<agent::TaskEvaluation>::failure(
+                {agent::ErrorCode::InvalidTransition,
+                 "SENTINEL_PRIVATE_EVALUATION_DETAIL", false});
+        },
+        out, err);
+    REQUIRE(app.execute({"agent", "evaluate-log", "--events",
+                         "events.jsonl"}) ==
+            agent::ExitCode::InvalidEventLog);
+    REQUIRE(out.str().empty());
+    REQUIRE(err.str().find("SENTINEL_PRIVATE_EVALUATION_DETAIL") ==
+            std::string::npos);
+}
+
 TEST_CASE(startup_parser_rejects_env_file_with_verify_log_and_bad_forms) {
     const auto verify_with_env = agent::parse_startup_arguments(
         {"agent", "verify-log", "--events", "events.jsonl", "--env-file",
          "agent.env"});
     REQUIRE(!verify_with_env.has_value());
     REQUIRE(verify_with_env.error().code == agent::ErrorCode::InvalidInput);
+
+    const auto evaluate_with_env = agent::parse_startup_arguments(
+        {"agent", "evaluate-log", "--events", "events.jsonl", "--env-file",
+         "agent.env"});
+    REQUIRE(!evaluate_with_env.has_value());
+    REQUIRE(evaluate_with_env.error().code ==
+            agent::ErrorCode::InvalidInput);
 
     const std::vector<std::vector<std::string>> rejected = {
         {"agent", "--env-file"},

@@ -33,6 +33,24 @@ if(NOT verify_error STREQUAL "")
 endif()
 
 execute_process(
+    COMMAND "${AGENT_EXE}" evaluate-log --events "${EVENT_LOG}"
+    WORKING_DIRECTORY "${TEST_ROOT}"
+    RESULT_VARIABLE evaluate_result
+    OUTPUT_VARIABLE evaluate_output
+    ERROR_VARIABLE evaluate_error)
+if(NOT evaluate_result EQUAL 0)
+    message(FATAL_ERROR
+        "credential-free evaluate-log returned ${evaluate_result}: ${evaluate_error}")
+endif()
+if(NOT evaluate_output MATCHES
+       "^task_id=task-0000000000000000000000000000000b verdict=pass status=Completed model_rounds=1 tool_calls=0 evidence_rounds=1 evidence_items=0 model_requests_with_evidence=0 tool_error_results=0 last_sequence=6")
+    message(FATAL_ERROR "credential-free evaluate-log summary was unexpected")
+endif()
+if(NOT evaluate_error STREQUAL "")
+    message(FATAL_ERROR "credential-free evaluate-log wrote unexpected stderr")
+endif()
+
+execute_process(
     COMMAND "${AGENT_EXE}" verify-log --events "${EVENT_LOG}"
             --env-file "${poison_env}"
     WORKING_DIRECTORY "${TEST_ROOT}"
@@ -45,4 +63,19 @@ if(NOT combined_result EQUAL 2)
 endif()
 if(NOT combined_output STREQUAL "")
     message(FATAL_ERROR "invalid combined command wrote unexpected stdout")
+endif()
+
+execute_process(
+    COMMAND "${AGENT_EXE}" evaluate-log --events "${EVENT_LOG}"
+            --env-file "${poison_env}"
+    WORKING_DIRECTORY "${TEST_ROOT}"
+    RESULT_VARIABLE evaluate_combined_result
+    OUTPUT_VARIABLE evaluate_combined_output
+    ERROR_VARIABLE evaluate_combined_error)
+if(NOT evaluate_combined_result EQUAL 2)
+    message(FATAL_ERROR
+        "evaluate-log plus --env-file returned ${evaluate_combined_result}, expected 2")
+endif()
+if(NOT evaluate_combined_output STREQUAL "")
+    message(FATAL_ERROR "invalid evaluate command wrote unexpected stdout")
 endif()

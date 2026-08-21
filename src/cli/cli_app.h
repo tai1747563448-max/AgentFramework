@@ -1,6 +1,7 @@
 #pragma once
 
 #include "application/runtime_engine.h"
+#include "application/task_evaluator.h"
 #include "domain/result.h"
 #include "domain/task_state.h"
 
@@ -19,6 +20,8 @@ using ResumeCommand = std::function<RuntimeResult(
     const std::string&, const RuntimeProgressObserver&)>;
 using VerifyCommand =
     std::function<Result<TaskState>(const std::filesystem::path&)>;
+using EvaluateCommand =
+    std::function<Result<TaskEvaluation>(const std::filesystem::path&)>;
 
 enum ExitCode : int {
     Success = 0,
@@ -55,6 +58,12 @@ public:
            VerifyCommand verify,
            std::ostream& output,
            std::ostream& error);
+    CliApp(RunCommand run,
+           ResumeCommand resume,
+           VerifyCommand verify,
+           EvaluateCommand evaluate,
+           std::ostream& output,
+           std::ostream& error);
 
     int execute(const std::vector<std::string>& args);
 
@@ -62,6 +71,7 @@ private:
     RunCommand run_;
     ResumeCommand resume_;
     VerifyCommand verify_;
+    EvaluateCommand evaluate_;
     std::ostream& output_;
     std::ostream& error_;
 };

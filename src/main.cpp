@@ -35,7 +35,8 @@ int run_agent(std::vector<std::string> args) {
             return agent::ExitCode::InvalidInputOrConfig;
         }
         if (startup.value().command_args.size() > 1 &&
-            startup.value().command_args[1] == "verify-log") {
+            (startup.value().command_args[1] == "verify-log" ||
+             startup.value().command_args[1] == "evaluate-log")) {
             agent::JsonlEventStore local_events(std::filesystem::path{});
             agent::RunCommand unavailable_run = [](
                 const agent::RunRequest&,
@@ -55,8 +56,28 @@ int run_agent(std::vector<std::string> args) {
                     }
                     return agent::replay_events(loaded.value());
                 };
-            agent::CliApp app(std::move(unavailable_run), std::move(verify),
-                              std::cout, std::cerr);
+            agent::ResumeCommand unavailable_resume = [](
+                const std::string&,
+                const agent::RuntimeProgressObserver&) {
+                return agent::RuntimeResult{
+                    std::nullopt,
+                    agent::RuntimeError{agent::ErrorCode::InvalidInput,
+                                        "resume command is unavailable",
+                                        false}};
+            };
+            agent::EvaluateCommand evaluate =
+                [&](const std::filesystem::path& path) {
+                    auto loaded = local_events.read_file(path);
+                    if (!loaded.has_value()) {
+                        return agent::Result<agent::TaskEvaluation>::failure(
+                            {agent::ErrorCode::PersistenceFailure,
+                             "event log evaluation failed", false});
+                    }
+                    return agent::evaluate_task_events(loaded.value());
+                };
+            agent::CliApp app(
+                std::move(unavailable_run), std::move(unavailable_resume),
+                std::move(verify), std::move(evaluate), std::cout, std::cerr);
             return app.execute(startup.value().command_args);
         }
         if (startup.value().env_file.has_value()) {

@@ -367,9 +367,10 @@ Result<StartupArguments> parse_startup_arguments(
         parsed.env_file = path.lexically_normal();
     }
     if (parsed.env_file.has_value() && parsed.command_args.size() > 1 &&
-        parsed.command_args[1] == "verify-log") {
+        (parsed.command_args[1] == "verify-log" ||
+         parsed.command_args[1] == "evaluate-log")) {
         return invalid_startup_arguments(
-            "--env-file cannot be combined with verify-log");
+            "--env-file cannot be combined with credential-free commands");
     }
     return Result<StartupArguments>::success(std::move(parsed));
 }
@@ -445,9 +446,25 @@ CliApp::CliApp(RunCommand run,
                VerifyCommand verify,
                std::ostream& output,
                std::ostream& error)
+    : CliApp(
+          std::move(run), std::move(resume), std::move(verify),
+          [](const std::filesystem::path&) {
+              return Result<TaskEvaluation>::failure(
+                  {ErrorCode::InvalidInput,
+                   "evaluate command is unavailable", false});
+          },
+          output, error) {}
+
+CliApp::CliApp(RunCommand run,
+               ResumeCommand resume,
+               VerifyCommand verify,
+               EvaluateCommand evaluate,
+               std::ostream& output,
+               std::ostream& error)
     : run_(std::move(run)),
       resume_(std::move(resume)),
       verify_(std::move(verify)),
+      evaluate_(std::move(evaluate)),
       output_(output),
       error_(error) {}
 
@@ -455,7 +472,8 @@ int CliApp::execute(const std::vector<std::string>& args) {
     if (args.size() < 2) {
         error_ << "usage: agent run --workspace <path> --issue <text> | "
                   "agent resume --task-id <task-id> | "
-                  "agent verify-log --events <path>\n";
+                  "agent verify-log --events <path> | "
+                  "agent evaluate-log --events <path>\n";
         return ExitCode::InvalidInputOrConfig;
     }
 
@@ -478,6 +496,36 @@ int CliApp::execute(const std::vector<std::string>& args) {
                 << status_name(state.status)
                 << " last_sequence=" << state.last_sequence << '\n';
         return ExitCode::Success;
+    }
+
+    if (args[1] == "evaluate-log") {
+        if (args.size() != 4 || args[2] != "--events" || args[3].empty()) {
+            error_ << "evaluate-log requires --events <event-log path>\n";
+            return ExitCode::InvalidInputOrConfig;
+        }
+        const auto evaluated =
+            evaluate_(std::filesystem::u8path(args[3]));
+        if (!evaluated.has_value()) {
+            error_ << "event log evaluation failed\n";
+            return ExitCode::InvalidEventLog;
+        }
+        const auto& result = evaluated.value();
+        if (!valid_generated_task_id(result.task_id)) {
+            error_ << "event log contains an invalid task ID\n";
+            return ExitCode::InvalidEventLog;
+        }
+        output_ << "task_id=" << result.task_id
+                << " verdict=" << (result.passed ? "pass" : "fail")
+                << " status=" << status_name(result.status)
+                << " model_rounds=" << result.model_rounds
+                << " tool_calls=" << result.tool_calls
+                << " evidence_rounds=" << result.evidence_rounds
+                << " evidence_items=" << result.evidence_items
+                << " model_requests_with_evidence="
+                << result.model_requests_with_evidence
+                << " tool_error_results=" << result.tool_error_results
+                << " last_sequence=" << result.last_sequence << '\n';
+        return result.passed ? ExitCode::Success : ExitCode::TaskFailed;
     }
 
     bool progress_valid = true;
