@@ -9,6 +9,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace agent {
 
@@ -25,6 +26,11 @@ struct RunRequest {
     std::string workspace_utf8;
     std::string system_prompt;
     RuntimeBudgets budgets;
+};
+
+struct ResumeRequest {
+    std::vector<RuntimeEvent> durable_events;
+    std::string fallback_system_prompt;
 };
 
 struct RuntimeResult {
@@ -54,6 +60,8 @@ public:
 
     RuntimeResult run(const RunRequest& request,
                       RuntimeProgressObserver observer);
+    RuntimeResult resume(const ResumeRequest& request,
+                         RuntimeProgressObserver observer);
 
 private:
     RuntimeResult append_event(std::optional<TaskState>& state,
@@ -67,6 +75,10 @@ private:
                                       const char* count_budget_name = nullptr,
                                       std::size_t count = 0,
                                       std::size_t limit = 0);
+    RuntimeResult continue_task(std::optional<TaskState>& state,
+                                const std::string& system_prompt,
+                                std::int64_t started_at_ms,
+                                RuntimeProgressObserver& observer);
 
     ModelClient& model_;
     ToolGateway& tools_;

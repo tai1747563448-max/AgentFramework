@@ -39,14 +39,19 @@ bool contains_tool_result(const ModelResponse& response) {
     return false;
 }
 
-std::string concatenate_text(const ModelResponse& response) {
+std::string concatenate_text_blocks(
+    const std::vector<ContentBlock>& content) {
     std::string final_text;
-    for (const auto& block : response.content) {
+    for (const auto& block : content) {
         if (const auto* text = std::get_if<TextBlock>(&block)) {
             final_text += text->text;
         }
     }
     return final_text;
+}
+
+std::string concatenate_text(const ModelResponse& response) {
+    return concatenate_text_blocks(response.content);
 }
 
 }  // namespace
@@ -153,178 +158,319 @@ RuntimeResult RuntimeEngine::run(
         return transition;
     }
 
-    while (!is_terminal(state->status)) {
-        transition =
-            append_event(state, task_id, ContextPreparationStartedPayload{},
+    return continue_task(state, request.system_prompt, started_at_ms,
                          observer);
-        if (transition.fatal_error.has_value()) {
-            return transition;
+}
+
+RuntimeResult RuntimeEngine::resume(
+    const ResumeRequest& request,
+    RuntimeProgressObserver observer) {
+    auto replayed = replay_events(request.durable_events);
+    if (!replayed.has_value()) {
+        return {std::nullopt, replayed.error()};
+    }
+
+    std::optional<TaskState> state{std::move(replayed.value())};
+    if (is_terminal(state->status)) {
+        return {std::move(state), std::nullopt};
+    }
+
+    const std::string system_prompt =
+        state->last_model_request.has_value()
+            ? state->last_model_request->system_prompt
+            : request.fallback_system_prompt;
+    const std::int64_t started_at_ms = clock_.monotonic_ms();
+    return continue_task(state, system_prompt, started_at_ms, observer);
+}
+
+RuntimeResult RuntimeEngine::continue_task(
+    std::optional<TaskState>& state,
+    const std::string& system_prompt,
+    std::int64_t started_at_ms,
+    RuntimeProgressObserver& observer) {
+    const auto invariant_failure = [&](const char* message) {
+        return RuntimeResult{
+            state,
+            RuntimeError{ErrorCode::InvalidTransition, message, false}};
+    };
+
+    while (!is_terminal(state->status)) {
+        const std::string task_id = state->task_id;
+
+        if (state->status == TaskStatus::Created) {
+            auto transition = append_event(
+                state, task_id, ContextPreparationStartedPayload{}, observer);
+            if (transition.fatal_error.has_value()) {
+                return transition;
+            }
+            continue;
         }
 
-        transition =
-            guard_external_call(state, task_id, started_at_ms, observer);
-        if (transition.fatal_error.has_value() || is_terminal(state->status)) {
-            return transition;
-        }
+        if (state->status == TaskStatus::PreparingContext) {
+            auto transition =
+                guard_external_call(state, task_id, started_at_ms, observer);
+            if (transition.fatal_error.has_value() ||
+                is_terminal(state->status)) {
+                return transition;
+            }
 
-        auto evidence = knowledge_.retrieve(*state);
-        if (!evidence.has_value()) {
-            return append_event(
+            auto evidence = knowledge_.retrieve(*state);
+            if (!evidence.has_value()) {
+                return append_event(
+                    state, task_id,
+                    ContextPreparationFailedPayload{evidence.error()},
+                    observer);
+            }
+            if (!evidence_pack_is_valid(evidence.value())) {
+                return append_event(
+                    state, task_id,
+                    ContextPreparationFailedPayload{
+                        {ErrorCode::ProtocolFailure,
+                         "knowledge provider returned invalid evidence",
+                         false}},
+                    observer);
+            }
+
+            transition = append_event(
                 state, task_id,
-                ContextPreparationFailedPayload{evidence.error()}, observer);
-        }
-        if (!evidence_pack_is_valid(evidence.value())) {
-            return append_event(
-                state, task_id,
-                ContextPreparationFailedPayload{
-                    {ErrorCode::ProtocolFailure,
-                     "knowledge provider returned invalid evidence", false}},
-                observer);
+                ContextPreparedPayload{std::move(evidence.value())}, observer);
+            if (transition.fatal_error.has_value()) {
+                return transition;
+            }
+            continue;
         }
 
-        transition = append_event(
-            state, task_id, ContextPreparedPayload{std::move(evidence.value())},
-            observer);
-        if (transition.fatal_error.has_value()) {
-            return transition;
-        }
+        if (state->status == TaskStatus::AwaitingModel) {
+            if (!state->model_call_in_flight &&
+                state->accepted_model_stop_reason.has_value()) {
+                switch (*state->accepted_model_stop_reason) {
+                case StopReason::EndTurn:
+                case StopReason::StopSequence:
+                    if (state->messages.empty() ||
+                        state->messages.back().role != Role::Assistant) {
+                        return invariant_failure(
+                            "accepted terminal response is unavailable");
+                    }
+                    return append_event(
+                        state, task_id,
+                        TaskCompletedPayload{concatenate_text_blocks(
+                            state->messages.back().content)},
+                        observer);
+                case StopReason::MaxTokens:
+                    return append_event(
+                        state, task_id,
+                        TaskBudgetExceededPayload{
+                            "max_tokens",
+                            {ErrorCode::BudgetExceeded,
+                             "model output token budget exceeded", false}},
+                        observer);
+                case StopReason::ToolUse:
+                case StopReason::Unknown:
+                    return invariant_failure(
+                        "accepted model response cannot be continued");
+                }
+            }
 
-        transition = guard_external_call(
-            state, task_id, started_at_ms, observer, "max_model_rounds",
-            state->usage.model_rounds, state->budgets.max_model_rounds);
-        if (transition.fatal_error.has_value() || is_terminal(state->status)) {
-            return transition;
-        }
+            ModelRequest model_request;
+            if (state->model_call_in_flight) {
+                if (!state->last_model_request.has_value()) {
+                    return invariant_failure(
+                        "in-flight model request is unavailable");
+                }
+                auto transition = guard_external_call(
+                    state, task_id, started_at_ms, observer);
+                if (transition.fatal_error.has_value() ||
+                    is_terminal(state->status)) {
+                    return transition;
+                }
+                model_request = *state->last_model_request;
+            } else {
+                auto transition = guard_external_call(
+                    state, task_id, started_at_ms, observer,
+                    "max_model_rounds", state->usage.model_rounds,
+                    state->budgets.max_model_rounds);
+                if (transition.fatal_error.has_value() ||
+                    is_terminal(state->status)) {
+                    return transition;
+                }
 
-        transition =
-            guard_external_call(state, task_id, started_at_ms, observer);
-        if (transition.fatal_error.has_value() || is_terminal(state->status)) {
-            return transition;
-        }
-        auto definitions = tools_.definitions();
+                transition = guard_external_call(
+                    state, task_id, started_at_ms, observer);
+                if (transition.fatal_error.has_value() ||
+                    is_terminal(state->status)) {
+                    return transition;
+                }
+                auto definitions = tools_.definitions();
 
-        ModelRequest model_request{request.system_prompt,
-                                   state->messages,
-                                   std::move(definitions),
-                                   state->budgets.model_timeout_ms};
-        model_request.evidence = state->evidence;
+                model_request = ModelRequest{
+                    system_prompt, state->messages, std::move(definitions),
+                    state->budgets.model_timeout_ms};
+                model_request.evidence = state->evidence;
 
-        transition = guard_external_call(
-            state, task_id, started_at_ms, observer, "max_model_rounds",
-            state->usage.model_rounds, state->budgets.max_model_rounds);
-        if (transition.fatal_error.has_value() || is_terminal(state->status)) {
-            return transition;
-        }
-        transition = append_event(
-            state, task_id, ModelCallStartedPayload{model_request}, observer);
-        if (transition.fatal_error.has_value()) {
-            return transition;
-        }
+                transition = guard_external_call(
+                    state, task_id, started_at_ms, observer,
+                    "max_model_rounds", state->usage.model_rounds,
+                    state->budgets.max_model_rounds);
+                if (transition.fatal_error.has_value() ||
+                    is_terminal(state->status)) {
+                    return transition;
+                }
+                transition = append_event(
+                    state, task_id,
+                    ModelCallStartedPayload{model_request}, observer);
+                if (transition.fatal_error.has_value()) {
+                    return transition;
+                }
+            }
 
-        auto response = model_.complete(model_request);
-        if (!response.has_value()) {
-            return append_event(state, task_id,
-                                ModelCallFailedPayload{response.error()},
-                                observer);
-        }
+            auto response = model_.complete(model_request);
+            if (!response.has_value()) {
+                return append_event(
+                    state, task_id,
+                    ModelCallFailedPayload{response.error()}, observer);
+            }
 
-        const auto protocol_failure = [&](const char* message) {
-            return append_event(
-                state, task_id,
-                ModelCallFailedPayload{
-                    {ErrorCode::ProtocolFailure, message, false}},
-                observer);
-        };
-        if (!is_known_stop_reason_pair(response.value().stop_reason,
-                                       response.value().raw_stop_reason)) {
-            return protocol_failure(
-                "model stop reason fields do not match");
-        }
-        if (!response_tool_uses_are_valid(response.value())) {
-            return protocol_failure(
-                "model response contains an invalid tool-use block");
-        }
-        if (contains_tool_result(response.value())) {
-            return protocol_failure(
-                "model response contains an invalid tool-result block");
-        }
+            const auto protocol_failure = [&](const char* message) {
+                return append_event(
+                    state, task_id,
+                    ModelCallFailedPayload{
+                        {ErrorCode::ProtocolFailure, message, false}},
+                    observer);
+            };
+            if (!is_known_stop_reason_pair(
+                    response.value().stop_reason,
+                    response.value().raw_stop_reason)) {
+                return protocol_failure(
+                    "model stop reason fields do not match");
+            }
+            if (!response_tool_uses_are_valid(response.value())) {
+                return protocol_failure(
+                    "model response contains an invalid tool-use block");
+            }
+            if (contains_tool_result(response.value())) {
+                return protocol_failure(
+                    "model response contains an invalid tool-result block");
+            }
 
-        const bool has_tool_call = contains_tool_call(response.value());
-        const auto final_text = concatenate_text(response.value());
+            const bool has_tool_call = contains_tool_call(response.value());
+            const auto final_text = concatenate_text(response.value());
 
-        switch (response.value().stop_reason) {
-        case StopReason::Unknown:
-            return protocol_failure("model returned an unknown stop reason");
-        case StopReason::ToolUse:
+            switch (response.value().stop_reason) {
+            case StopReason::Unknown:
+                return protocol_failure(
+                    "model returned an unknown stop reason");
+            case StopReason::ToolUse:
+                if (!has_tool_call) {
+                    return protocol_failure(
+                        "tool-use stop did not contain a tool-use block");
+                }
+                break;
+            case StopReason::EndTurn:
+            case StopReason::StopSequence:
+                if (has_tool_call || final_text.empty()) {
+                    return protocol_failure(
+                        "terminal text stop requires nonempty text and no tools");
+                }
+
+                {
+                    auto transition = append_event(
+                        state, task_id,
+                        ModelCallSucceededPayload{
+                            std::move(response.value())},
+                        observer);
+                    if (transition.fatal_error.has_value()) {
+                        return transition;
+                    }
+                }
+                return append_event(
+                    state, task_id, TaskCompletedPayload{final_text},
+                    observer);
+            case StopReason::MaxTokens:
+                if (has_tool_call) {
+                    return protocol_failure(
+                        "max-tokens stop cannot contain tool-use blocks");
+                }
+
+                {
+                    auto transition = append_event(
+                        state, task_id,
+                        ModelCallSucceededPayload{
+                            std::move(response.value())},
+                        observer);
+                    if (transition.fatal_error.has_value()) {
+                        return transition;
+                    }
+                }
+                return append_event(
+                    state, task_id,
+                    TaskBudgetExceededPayload{
+                        "max_tokens",
+                        {ErrorCode::BudgetExceeded,
+                         "model output token budget exceeded", false}},
+                    observer);
+            }
+
             if (!has_tool_call) {
                 return protocol_failure(
-                    "tool-use stop did not contain a tool-use block");
-            }
-            break;
-        case StopReason::EndTurn:
-        case StopReason::StopSequence:
-            if (has_tool_call || final_text.empty()) {
-                return protocol_failure(
-                    "terminal text stop requires nonempty text and no tools");
+                    "model returned no tool calls for a tool-use stop");
             }
 
-            transition = append_event(
+            auto transition = append_event(
                 state, task_id,
                 ModelCallSucceededPayload{std::move(response.value())},
                 observer);
             if (transition.fatal_error.has_value()) {
                 return transition;
             }
-            return append_event(
-                state, task_id, TaskCompletedPayload{final_text}, observer);
-        case StopReason::MaxTokens:
-            if (has_tool_call) {
-                return protocol_failure(
-                    "max-tokens stop cannot contain tool-use blocks");
-            }
-
-            transition = append_event(
-                state, task_id,
-                ModelCallSucceededPayload{std::move(response.value())},
-                observer);
-            if (transition.fatal_error.has_value()) {
-                return transition;
-            }
-            return append_event(
-                state, task_id,
-                TaskBudgetExceededPayload{
-                    "max_tokens",
-                    {ErrorCode::BudgetExceeded,
-                     "model output token budget exceeded", false}},
-                observer);
+            continue;
         }
 
-        if (!has_tool_call) {
-            return protocol_failure(
-                "model returned no tool calls for a tool-use stop");
-        }
-
-        transition = append_event(
-            state, task_id,
-            ModelCallSucceededPayload{std::move(response.value())}, observer);
-        if (transition.fatal_error.has_value()) {
-            return transition;
-        }
-
-        while (state->next_tool_index < state->pending_tool_calls.size()) {
-            transition = guard_external_call(
-                state, task_id, started_at_ms, observer, "max_tool_calls",
-                state->usage.tool_calls, state->budgets.max_tool_calls);
-            if (transition.fatal_error.has_value() || is_terminal(state->status)) {
-                return transition;
+        if (state->status == TaskStatus::AwaitingTool) {
+            if (!state->active_tool_call_id.has_value() &&
+                state->next_tool_index == state->pending_tool_calls.size()) {
+                auto transition = append_event(
+                    state, task_id, ContextPreparationStartedPayload{},
+                    observer);
+                if (transition.fatal_error.has_value()) {
+                    return transition;
+                }
+                continue;
             }
 
+            if (state->next_tool_index >=
+                state->pending_tool_calls.size()) {
+                return invariant_failure(
+                    "awaiting tool state has no pending call");
+            }
             const ToolCall call =
                 state->pending_tool_calls.at(state->next_tool_index);
-            transition = append_event(
-                state, task_id, ToolCallStartedPayload{call}, observer);
-            if (transition.fatal_error.has_value()) {
-                return transition;
+
+            if (state->active_tool_call_id.has_value()) {
+                if (*state->active_tool_call_id != call.id) {
+                    return invariant_failure(
+                        "active tool identity does not match pending call");
+                }
+                auto transition = guard_external_call(
+                    state, task_id, started_at_ms, observer);
+                if (transition.fatal_error.has_value() ||
+                    is_terminal(state->status)) {
+                    return transition;
+                }
+            } else {
+                auto transition = guard_external_call(
+                    state, task_id, started_at_ms, observer,
+                    "max_tool_calls", state->usage.tool_calls,
+                    state->budgets.max_tool_calls);
+                if (transition.fatal_error.has_value() ||
+                    is_terminal(state->status)) {
+                    return transition;
+                }
+
+                transition = append_event(
+                    state, task_id, ToolCallStartedPayload{call}, observer);
+                if (transition.fatal_error.has_value()) {
+                    return transition;
+                }
             }
 
             auto tool_result = tools_.execute(
@@ -346,14 +492,17 @@ RuntimeResult RuntimeEngine::run(
                     observer);
             }
 
-            transition = append_event(
+            auto transition = append_event(
                 state, task_id,
                 ToolCallSucceededPayload{std::move(tool_result.value())},
                 observer);
             if (transition.fatal_error.has_value()) {
                 return transition;
             }
+            continue;
         }
+
+        return invariant_failure("runtime reached an unknown task state");
     }
 
     return {state, std::nullopt};
