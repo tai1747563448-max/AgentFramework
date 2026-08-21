@@ -217,9 +217,6 @@ bool prepare_build_directory(const std::string& workspace_utf8,
     }
     std::error_code error;
     const auto supplied = std::filesystem::u8path(workspace_utf8);
-    if (!supplied.is_absolute()) {
-        return false;
-    }
     const auto absolute =
         std::filesystem::absolute(supplied, error).lexically_normal();
     if (error || !existing_real_directory(absolute)) {

@@ -31,6 +31,25 @@ public:
     std::optional<agent::RuntimeError> failure;
 };
 
+class ScopedCurrentPath final {
+public:
+    explicit ScopedCurrentPath(const std::filesystem::path& path)
+        : previous_(std::filesystem::current_path()) {
+        std::filesystem::current_path(path);
+    }
+
+    ~ScopedCurrentPath() {
+        std::error_code ignored;
+        std::filesystem::current_path(previous_, ignored);
+    }
+
+    ScopedCurrentPath(const ScopedCurrentPath&) = delete;
+    ScopedCurrentPath& operator=(const ScopedCurrentPath&) = delete;
+
+private:
+    std::filesystem::path previous_;
+};
+
 agent::ToolCall call(std::string id,
                      std::string name,
                      agent::Value::Object arguments) {
@@ -222,19 +241,31 @@ TEST_CASE(cmake_gateway_rejects_open_ended_or_unsafe_inputs_before_process) {
     }
     REQUIRE(process.requests.empty());
 
-    const agent::ToolExecutionContext relative_context{"."};
-    REQUIRE(fixtures::error_code(gateway.execute(
-                fixtures::call("relative", "configure_project",
-                               {{"configuration", "Debug"}}),
-                relative_context)) == "access_denied");
-    REQUIRE(process.requests.empty());
-
     temp.write_text(".agent", "not a directory");
     REQUIRE(fixtures::error_code(gateway.execute(
                 fixtures::call("unsafe", "configure_project",
                                {{"configuration", "Debug"}}),
                 context)) == "access_denied");
     REQUIRE(process.requests.empty());
+}
+
+TEST_CASE(cmake_gateway_canonicalizes_a_relative_workspace_before_execution) {
+    test::ScopedTempDir temp(std::filesystem::u8path(u8"相对工作区-🙂"));
+    fixtures::ScopedCurrentPath current(temp.path().parent_path());
+    fixtures::FakeProcessRunner process;
+    agent::CMakeToolGateway gateway(process, 123'000);
+    const agent::ToolExecutionContext context{
+        temp.path().filename().generic_u8string()};
+
+    const auto result = gateway.execute(
+        fixtures::call("relative", "configure_project",
+                       {{"configuration", "Debug"}}),
+        context);
+
+    REQUIRE(result.has_value() && !result.value().is_error);
+    REQUIRE(process.requests.size() == 1);
+    REQUIRE(process.requests.front().working_directory ==
+            std::filesystem::weakly_canonical(temp.path()));
 }
 
 TEST_CASE(cmake_gateway_returns_bounded_process_failure_evidence) {
