@@ -23,6 +23,8 @@ Testing/
 *.dll
 *.lib
 *.pdb
+__pycache__/
+*.py[cod]
 
 # Editors and IDEs
 .idea/

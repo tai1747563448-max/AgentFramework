@@ -4,6 +4,7 @@
 #include "adapters/empty/empty_knowledge_provider.h"
 #include "adapters/persistence/jsonl_event_store.h"
 #include "adapters/process/direct_process_runner.h"
+#include "adapters/rag/python_rag_knowledge_provider.h"
 #include "adapters/system/random_id_generator.h"
 #include "adapters/system/signal_cancellation.h"
 #include "adapters/system/system_clock.h"
@@ -18,6 +19,7 @@
 #include <filesystem>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -85,13 +87,19 @@ int run_agent(std::vector<std::string> args) {
             gateways.push_back(std::ref(build_tools));
         }
         agent::CompositeToolGateway tools(std::move(gateways));
-        agent::EmptyKnowledgeProvider knowledge;
+        std::unique_ptr<agent::KnowledgeProvider> knowledge;
+        if (config.value().rag_enabled) {
+            knowledge = std::make_unique<agent::PythonRagKnowledgeProvider>(
+                process, config.value().rag);
+        } else {
+            knowledge = std::make_unique<agent::EmptyKnowledgeProvider>();
+        }
         agent::JsonlEventStore events(config.value().runtime_root);
         agent::SystemClock clock;
         agent::RandomIdGenerator ids;
         agent::SignalCancellation cancellation;
-        agent::RuntimeEngine engine(model, tools, knowledge, events, clock, ids,
-                                    cancellation);
+        agent::RuntimeEngine engine(model, tools, *knowledge, events, clock,
+                                    ids, cancellation);
 
         agent::RunCommand run = [&]
             (const agent::RunRequest& cli_request,

@@ -585,6 +585,31 @@ TEST_CASE(knowledge_failure_appends_only_specialized_terminal_event) {
     REQUIRE(fixture.model.requests.empty());
 }
 
+TEST_CASE(invalid_knowledge_evidence_becomes_a_direct_context_failure) {
+    auto invalid = fixtures::evidence();
+    invalid.items.push_back(invalid.items.front());
+    test::EngineFixture fixture(
+        test::FakeModel({fixtures::text_response("unused")}),
+        test::FakeTools{}, test::FakeKnowledge(std::move(invalid)));
+
+    const auto result = fixture.run(fixtures::run_request("fix warning"));
+
+    const agent::RuntimeError expected{
+        agent::ErrorCode::ProtocolFailure,
+        "knowledge provider returned invalid evidence", false};
+    REQUIRE(result.state.has_value());
+    REQUIRE(!result.fatal_error.has_value());
+    REQUIRE(result.state->status == agent::TaskStatus::Failed);
+    REQUIRE(result.state->terminal_error ==
+            std::optional<agent::RuntimeError>{expected});
+    const std::vector<agent::EventKind> expected_kinds{
+        agent::EventKind::TaskStarted,
+        agent::EventKind::ContextPreparationStarted,
+        agent::EventKind::ContextPreparationFailed};
+    REQUIRE(fixture.events.kinds() == expected_kinds);
+    REQUIRE(fixture.model.requests.empty());
+}
+
 TEST_CASE(model_failure_appends_only_specialized_terminal_event) {
     const agent::RuntimeError expected{
         agent::ErrorCode::RequestTimeout, "model request timed out", true};

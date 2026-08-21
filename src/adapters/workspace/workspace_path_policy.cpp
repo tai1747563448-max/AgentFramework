@@ -162,7 +162,7 @@ bool WorkspacePathPolicy::is_protected(
     for (const auto& raw_component : relative.components) {
         const auto component = ascii_lower(raw_component);
         if (component == ".git" || component == ".worktrees" ||
-            component == ".agent" ||
+            component == ".agent" || component == ".rag" ||
             component == "runtime_data") {
             return true;
         }

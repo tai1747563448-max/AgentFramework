@@ -1,5 +1,7 @@
 #include "application/state_reducer.h"
 
+#include "domain/evidence_validation.h"
+
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -119,6 +121,10 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                     return invalid_transition(
                         "context prepared requires preparing context state");
                 }
+                if (!evidence_pack_is_valid(typed_payload.evidence)) {
+                    return invalid_transition(
+                        "context prepared evidence is invalid");
+                }
                 state.evidence = typed_payload.evidence;
                 state.status = TaskStatus::AwaitingModel;
                 return Result<void>::success();
@@ -137,6 +143,11 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                     state.accepted_model_stop_reason.has_value()) {
                     return invalid_transition(
                         "model call start requires idle awaiting model state");
+                }
+                if (!evidence_pack_is_valid(typed_payload.request.evidence) ||
+                    !(typed_payload.request.evidence == state.evidence)) {
+                    return invalid_transition(
+                        "model request evidence does not match prepared context");
                 }
                 state.model_call_in_flight = true;
                 ++state.usage.model_rounds;

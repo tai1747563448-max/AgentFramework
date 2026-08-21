@@ -22,7 +22,8 @@ The dependency direction points inward:
   cancellation interfaces.
 - `src/adapters` supplies Anthropic Messages HTTP, JSONL persistence, bounded
   workspace file tools, opt-in structured CMake/CTest tools, an empty
-  knowledge adapter, and system clock/ID/cancellation implementations.
+  knowledge adapter, an opt-in Python RAG adapter, and system
+  clock/ID/cancellation implementations.
 - `src/main.cpp` is the composition root; `src/cli` parses `run` and
   `verify-log`, uses fixed failure messages, and bounds the fields printed by
   progress and log verification. A successful `run` renders final text as
@@ -43,12 +44,12 @@ tool block; `end_turn` and `stop_sequence` require nonempty tool-free text;
 `max_tokens` terminates as `BudgetExceeded`; unknown or inconsistent stops are
 direct `ModelCallFailed` protocol failures.
 
-This milestone provides versioned text-file inspection/editing and an opt-in,
-structured build/test loop. It does not provide a model-selectable shell, Git
-mutation, real RAG, crash recovery, automatic retry policy, parallel
+This milestone provides versioned text-file inspection/editing, an opt-in
+structured build/test loop, and an opt-in deterministic local knowledge
+sidecar. It does not provide a model-selectable shell, Git mutation, embeddings,
+a vector database, crash resumption, automatic retry policy, parallel
 execution, multiple agents, a second provider, an HTTP service, a TUI, MCP, or
-plugins. The Python RAG sidecar is the next independent milestone; it is not
-implied by build-tool or offline-test success.
+plugins.
 
 ## Workspace file tools
 
@@ -68,11 +69,11 @@ explicit build-tool opt-in adds the three tools documented below:
 Tool paths are relative to the `--workspace` supplied for that durable task.
 Absolute paths, `..`, links/reparse points, multiply linked files, `.git`,
 `.worktrees`, secret-bearing `.env*` files (except `.env.example`), common
-credential files, runtime data, `.agent`, and reserved `.agent-tmp-*` names are
-refused or omitted. Writes use an exclusively created same-directory temporary
-file, flush it, atomically install it, and verify the installed bytes. A stale
-hash or match count is a retryable tool conflict and leaves the target
-unchanged.
+credential files, runtime data, `.agent`, `.rag`, and reserved `.agent-tmp-*`
+names are refused or omitted. Writes use an exclusively created same-directory
+temporary file, flush it, atomically install it, and verify the installed
+bytes. A stale hash or match count is a retryable tool conflict and leaves the
+target unchanged.
 
 Text files are strict UTF-8 without NUL and at most 1 MiB. A tool result is at
 most 64 KiB; listings and searches return at most 200 results. Recursive
@@ -106,6 +107,80 @@ user's filesystem permissions. The child environment is reduced and provider
 credentials are excluded, yet enabling these tools still authorizes trusted
 workspace code execution. Keep them disabled for unknown repositories.
 
+## Local Python RAG sidecar (opt-in)
+
+RAG is disabled by default. In V1 it is a standard-library-only Python 3.10+
+SQLite index with deterministic BM25 ranking. The tokenizer handles ASCII
+identifiers, camelCase, snake_case, and Chinese characters/bigrams. It does not
+download a model, call a network service, install a package, generate an
+embedding, or expose a long-running HTTP daemon.
+
+Build or replace an index manually from a trusted source tree. For example,
+from the repository root in PowerShell:
+
+```powershell
+$python = (Get-Command python).Source
+$script = (Resolve-Path .\rag\agent_rag_cli.py).Path
+& $python -E -s -X utf8 $script build `
+  --source .\docs `
+  --index .\.rag\knowledge.sqlite3
+$index = (Resolve-Path .\.rag\knowledge.sqlite3).Path
+```
+
+The builder accepts a bounded set of text/code extensions, skips protected
+directories and conservatively named secret files, rejects links and multiply
+linked files, chunks in stable path/line order, and atomically replaces the
+SQLite file. The filename filter rejects stem tokens `secret`, `secrets`,
+`credential`, `credentials`, `password`, `passwords`, `passwd`, `token`, and
+`tokens`, separated by `.`, `-`, or `_`. This is not a content secret scanner:
+use a trusted, curated source tree (the example uses `docs`) and review it
+before building. Rebuilding removes stale chunks. Its result and failures
+contain only bounded summaries; source text and local absolute paths are not
+printed as diagnostics.
+
+Enable retrieval only after the index exists. `AGENT_RAG_SCRIPT` and
+`AGENT_RAG_INDEX` must name absolute canonical ordinary files without link
+components; `AGENT_RAG_PYTHON` may be an absolute interpreter path or a trusted
+program name on `PATH`:
+
+```powershell
+$env:AGENT_ENABLE_RAG = "1"
+$env:AGENT_RAG_PYTHON = $python
+$env:AGENT_RAG_SCRIPT = $script
+$env:AGENT_RAG_INDEX = $index
+$env:AGENT_RAG_TOP_K = "5"
+$env:AGENT_RAG_TIMEOUT_SECONDS = "10"
+```
+
+For each Runtime context round, C++ sends only the durable Issue through stdin
+to one fixed command:
+
+```text
+<python> -E -s -X utf8 <script> query --index <index>
+```
+
+The response is parsed as an exact versioned JSON object and converted to a
+structured `EvidencePack`. At most 20 items and 32 KiB of source content may
+become durable. The Python adapter requires each source ID to match its
+canonical relative `path#Lx-Ly[-Pn]` citation, requires an exact path/line/hash/
+score metadata schema, and recomputes the content SHA-256. Runtime, Reducer,
+and JSONL replay enforce the provider-neutral EvidencePack bounds. Reducer also
+requires each durable `ModelCallStarted.request.evidence` to exactly equal the
+immediately prepared context, so replay cannot substitute what the model saw.
+
+Evidence is labeled as untrusted reference data in the Provider request. It is
+not a system instruction and RAG is not a model-callable tool: enabling it does
+not change the five file tools or optional eight file/build tools. A timeout,
+broken index, invalid JSON, or invalid evidence becomes the existing direct
+`ContextPreparationFailed -> Failed` path with a fixed explanation; raw Python
+stderr is never persisted or sent to the model.
+
+When `AGENT_ENABLE_RAG=0`, all other `AGENT_RAG_*` values are ignored, no RAG
+path is inspected, and no Python process is started. `AGENT_RAG_TOP_K` must be
+1 through 20 and `AGENT_RAG_TIMEOUT_SECONDS` must be 1 through 60 when enabled.
+Keeping an index inside workspace `.rag` is supported operationally, but the
+agent's workspace tools cannot list, read, edit, or replace that directory.
+
 ## Build and offline tests on Visual Studio 2022
 
 From a Visual Studio-capable PowerShell in the repository root:
@@ -117,8 +192,10 @@ ctest --test-dir build/vs2022 -C Debug --output-on-failure
 ```
 
 CMake configuration may obtain pinned third-party dependencies through
-`FetchContent` when they are not already cached. The default CTest suite uses
-only deterministic fakes or local files and does not send network requests.
+`FetchContent` when they are not already cached. If Python 3.10+ is found,
+CTest also registers the Python unit suite and the real local C++/Python RAG
+integration. The default CTest suite uses only deterministic fakes, local
+processes, and local files; it does not send network requests.
 
 ## Configuration and `.env`
 

@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.21)
 project(AgentFramework VERSION 0.1.0 LANGUAGES CXX)
 
 find_package(Threads REQUIRED)
+find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -36,6 +37,7 @@ target_include_directories(dotenv_header_only INTERFACE
 
 add_library(agent_kernel STATIC
     src/domain/value.cpp
+    src/domain/evidence_validation.cpp
     src/domain/runtime_event.cpp
     src/application/state_reducer.cpp
     src/application/runtime_engine.cpp
@@ -58,6 +60,7 @@ add_library(agent_runtime STATIC
     src/adapters/workspace/workspace_file_ops.cpp
     src/adapters/workspace/workspace_tool_gateway.cpp
     src/adapters/process/direct_process_runner.cpp
+    src/adapters/rag/python_rag_knowledge_provider.cpp
     src/adapters/build/cmake_tool_gateway.cpp
     src/adapters/tools/composite_tool_gateway.cpp
     src/adapters/system/system_clock.cpp
@@ -97,6 +100,7 @@ function(add_agent_test target source)
     add_test(NAME ${target} COMMAND ${target})
 endfunction()
 add_agent_test(domain_primitives_tests tests/domain/value_result_test.cpp)
+add_agent_test(evidence_validation_tests tests/domain/evidence_validation_test.cpp)
 add_agent_test(runtime_event_tests tests/domain/runtime_event_test.cpp)
 add_agent_test(state_reducer_tests tests/application/state_reducer_test.cpp)
 add_agent_test(runtime_engine_tests tests/application/runtime_engine_test.cpp)
@@ -106,6 +110,9 @@ target_link_libraries(anthropic_adapter_tests PRIVATE Threads::Threads)
 if(WIN32)
     target_link_libraries(anthropic_adapter_tests PRIVATE ws2_32)
 endif()
+add_agent_test(python_rag_adapter_tests
+    tests/adapters/python_rag_knowledge_provider_test.cpp)
+target_link_libraries(python_rag_adapter_tests PRIVATE agent_runtime)
 add_agent_test(cli_tests tests/cli/cli_app_test.cpp)
 target_link_libraries(cli_tests PRIVATE agent_runtime)
 add_agent_test(runtime_integration_tests tests/integration/runtime_integration_test.cpp)
@@ -139,6 +146,20 @@ add_test(
         "-DEVENT_LOG=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/valid-completed-events.jsonl"
         "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/verify-log-process"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/verify_log_process_test.cmake")
+if(Python3_Interpreter_FOUND)
+    add_agent_test(rag_integration_tests
+        tests/integration/rag_integration_test.cpp)
+    target_link_libraries(rag_integration_tests PRIVATE agent_runtime)
+    target_compile_definitions(rag_integration_tests PRIVATE
+        AGENT_RAG_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
+        AGENT_RAG_SCRIPT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/rag/agent_rag_cli.py")
+    add_test(
+        NAME python_rag_tests
+        COMMAND "${Python3_EXECUTABLE}" -E -s -X utf8 -m unittest
+            discover -s "${CMAKE_CURRENT_SOURCE_DIR}/rag/tests" -v)
+    set_tests_properties(python_rag_tests PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
 
 if(AGENT_ENABLE_LIVE_TESTS)
     add_executable(anthropic_live_smoke tests/live/anthropic_live_smoke.cpp)
