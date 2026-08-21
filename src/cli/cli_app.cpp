@@ -256,6 +256,86 @@ std::string render_terminal_text(std::string_view text) {
     return rendered;
 }
 
+int render_runtime_result(const RuntimeResult& result,
+                          bool progress_valid,
+                          std::ostream& output,
+                          std::ostream& error) {
+    if (!progress_valid) {
+        error << "runtime progress contained an invalid task ID\n";
+        return ExitCode::TaskFailed;
+    }
+    if (result.fatal_error.has_value()) {
+        if (result.state.has_value()) {
+            if (!valid_generated_task_id(result.state->task_id)) {
+                error << "runtime returned an invalid task ID\n";
+                return ExitCode::TaskFailed;
+            }
+            error << "task_id=" << result.state->task_id
+                  << " status=" << status_name(result.state->status)
+                  << " error_code="
+                  << error_code_name(result.fatal_error->code)
+                  << " summary=" << fatal_summary(result.fatal_error->code)
+                  << '\n';
+        } else {
+            error << "error_code=" << error_code_name(result.fatal_error->code)
+                  << " summary=runtime failed before a durable task state was "
+                     "available\n";
+        }
+        return exit_for_error(result.fatal_error->code);
+    }
+    if (!result.state.has_value()) {
+        error << "runtime returned no task state\n";
+        return ExitCode::TaskFailed;
+    }
+    if (!valid_generated_task_id(result.state->task_id)) {
+        error << "runtime returned an invalid task ID\n";
+        return ExitCode::TaskFailed;
+    }
+
+    switch (result.state->status) {
+        case TaskStatus::Completed:
+            if (!result.state->final_text.has_value()) {
+                error << "completed task has no final output\n";
+                return ExitCode::TaskFailed;
+            }
+            output << render_terminal_text(*result.state->final_text) << '\n';
+            return ExitCode::Success;
+        case TaskStatus::BudgetExceeded:
+            error << "task_id=" << result.state->task_id
+                  << " status=" << status_name(result.state->status)
+                  << " error_code="
+                  << (result.state->terminal_error.has_value()
+                          ? error_code_name(result.state->terminal_error->code)
+                          : "Unknown")
+                  << " summary=" << terminal_summary(result.state->status)
+                  << '\n';
+            return ExitCode::BudgetExceeded;
+        case TaskStatus::Cancelled:
+            error << "task_id=" << result.state->task_id
+                  << " status=" << status_name(result.state->status)
+                  << " error_code="
+                  << (result.state->terminal_error.has_value()
+                          ? error_code_name(result.state->terminal_error->code)
+                          : "Unknown")
+                  << " summary=" << terminal_summary(result.state->status)
+                  << '\n';
+            return ExitCode::Cancelled;
+        case TaskStatus::Failed:
+            error << "task_id=" << result.state->task_id
+                  << " status=" << status_name(result.state->status)
+                  << " error_code="
+                  << (result.state->terminal_error.has_value()
+                          ? error_code_name(result.state->terminal_error->code)
+                          : "Unknown")
+                  << " summary=" << terminal_summary(result.state->status)
+                  << '\n';
+            return ExitCode::TaskFailed;
+        default:
+            error << "runtime returned a non-terminal task state\n";
+            return ExitCode::TaskFailed;
+    }
+}
+
 }  // namespace
 
 Result<StartupArguments> parse_startup_arguments(
@@ -287,9 +367,10 @@ Result<StartupArguments> parse_startup_arguments(
         parsed.env_file = path.lexically_normal();
     }
     if (parsed.env_file.has_value() && parsed.command_args.size() > 1 &&
-        parsed.command_args[1] == "verify-log") {
+        (parsed.command_args[1] == "verify-log" ||
+         parsed.command_args[1] == "evaluate-log")) {
         return invalid_startup_arguments(
-            "--env-file cannot be combined with verify-log");
+            "--env-file cannot be combined with credential-free commands");
     }
     return Result<StartupArguments>::success(std::move(parsed));
 }
@@ -349,15 +430,50 @@ CliApp::CliApp(RunCommand run,
                VerifyCommand verify,
                std::ostream& output,
                std::ostream& error)
+    : CliApp(
+          std::move(run),
+          [](const std::string&,
+             const RuntimeProgressObserver&) {
+              return RuntimeResult{
+                  std::nullopt,
+                  RuntimeError{ErrorCode::InvalidInput,
+                               "resume command is unavailable", false}};
+          },
+          std::move(verify), output, error) {}
+
+CliApp::CliApp(RunCommand run,
+               ResumeCommand resume,
+               VerifyCommand verify,
+               std::ostream& output,
+               std::ostream& error)
+    : CliApp(
+          std::move(run), std::move(resume), std::move(verify),
+          [](const std::filesystem::path&) {
+              return Result<TaskEvaluation>::failure(
+                  {ErrorCode::InvalidInput,
+                   "evaluate command is unavailable", false});
+          },
+          output, error) {}
+
+CliApp::CliApp(RunCommand run,
+               ResumeCommand resume,
+               VerifyCommand verify,
+               EvaluateCommand evaluate,
+               std::ostream& output,
+               std::ostream& error)
     : run_(std::move(run)),
+      resume_(std::move(resume)),
       verify_(std::move(verify)),
+      evaluate_(std::move(evaluate)),
       output_(output),
       error_(error) {}
 
 int CliApp::execute(const std::vector<std::string>& args) {
     if (args.size() < 2) {
         error_ << "usage: agent run --workspace <path> --issue <text> | "
-                  "agent verify-log --events <path>\n";
+                  "agent resume --task-id <task-id> | "
+                  "agent verify-log --events <path> | "
+                  "agent evaluate-log --events <path>\n";
         return ExitCode::InvalidInputOrConfig;
     }
 
@@ -380,6 +496,62 @@ int CliApp::execute(const std::vector<std::string>& args) {
                 << status_name(state.status)
                 << " last_sequence=" << state.last_sequence << '\n';
         return ExitCode::Success;
+    }
+
+    if (args[1] == "evaluate-log") {
+        if (args.size() != 4 || args[2] != "--events" || args[3].empty()) {
+            error_ << "evaluate-log requires --events <event-log path>\n";
+            return ExitCode::InvalidInputOrConfig;
+        }
+        const auto evaluated =
+            evaluate_(std::filesystem::u8path(args[3]));
+        if (!evaluated.has_value()) {
+            error_ << "event log evaluation failed\n";
+            return ExitCode::InvalidEventLog;
+        }
+        const auto& result = evaluated.value();
+        if (!valid_generated_task_id(result.task_id)) {
+            error_ << "event log contains an invalid task ID\n";
+            return ExitCode::InvalidEventLog;
+        }
+        output_ << "task_id=" << result.task_id
+                << " verdict=" << (result.passed ? "pass" : "fail")
+                << " status=" << status_name(result.status)
+                << " model_rounds=" << result.model_rounds
+                << " tool_calls=" << result.tool_calls
+                << " evidence_rounds=" << result.evidence_rounds
+                << " evidence_items=" << result.evidence_items
+                << " model_requests_with_evidence="
+                << result.model_requests_with_evidence
+                << " tool_error_results=" << result.tool_error_results
+                << " last_sequence=" << result.last_sequence << '\n';
+        return result.passed ? ExitCode::Success : ExitCode::TaskFailed;
+    }
+
+    bool progress_valid = true;
+    const RuntimeProgressObserver observer =
+        [&](const RuntimeProgress& progress) {
+            if (!progress_valid) {
+                return;
+            }
+            if (!valid_generated_task_id(progress.task_id)) {
+                progress_valid = false;
+                return;
+            }
+            output_ << "task_id=" << progress.task_id
+                    << " sequence=" << progress.sequence
+                    << " event=" << event_kind_name(progress.event_kind)
+                    << " status=" << status_name(progress.status) << '\n';
+        };
+
+    if (args[1] == "resume") {
+        if (args.size() != 4 || args[2] != "--task-id" ||
+            !valid_generated_task_id(args[3])) {
+            error_ << "resume requires --task-id <valid task ID>\n";
+            return ExitCode::InvalidInputOrConfig;
+        }
+        const auto result = resume_(args[3], observer);
+        return render_runtime_result(result, progress_valid, output_, error_);
     }
 
     if (args[1] != "run") {
@@ -409,97 +581,9 @@ int CliApp::execute(const std::vector<std::string>& args) {
         return ExitCode::InvalidInputOrConfig;
     }
 
-    bool progress_valid = true;
-    const RuntimeProgressObserver observer =
-        [&](const RuntimeProgress& progress) {
-            if (!progress_valid) {
-                return;
-            }
-            if (!valid_generated_task_id(progress.task_id)) {
-                progress_valid = false;
-                return;
-            }
-            output_ << "task_id=" << progress.task_id
-                    << " sequence=" << progress.sequence
-                    << " event=" << event_kind_name(progress.event_kind)
-                    << " status=" << status_name(progress.status) << '\n';
-        };
     const auto result =
         run_({*issue, *workspace, std::string{}, {}}, observer);
-    if (!progress_valid) {
-        error_ << "runtime progress contained an invalid task ID\n";
-        return ExitCode::TaskFailed;
-    }
-    if (result.fatal_error.has_value()) {
-        if (result.state.has_value()) {
-            if (!valid_generated_task_id(result.state->task_id)) {
-                error_ << "runtime returned an invalid task ID\n";
-                return ExitCode::TaskFailed;
-            }
-            error_ << "task_id=" << result.state->task_id
-                   << " status=" << status_name(result.state->status)
-                   << " error_code="
-                   << error_code_name(result.fatal_error->code)
-                   << " summary=" << fatal_summary(result.fatal_error->code)
-                   << '\n';
-        } else {
-            error_ << "error_code=" << error_code_name(result.fatal_error->code)
-                   << " summary=runtime failed before a durable task state was "
-                      "available\n";
-        }
-        return exit_for_error(result.fatal_error->code);
-    }
-    if (!result.state.has_value()) {
-        error_ << "runtime returned no task state\n";
-        return ExitCode::TaskFailed;
-    }
-    if (!valid_generated_task_id(result.state->task_id)) {
-        error_ << "runtime returned an invalid task ID\n";
-        return ExitCode::TaskFailed;
-    }
-
-    switch (result.state->status) {
-        case TaskStatus::Completed:
-            if (!result.state->final_text.has_value()) {
-                error_ << "completed task has no final output\n";
-                return ExitCode::TaskFailed;
-            }
-            output_ << render_terminal_text(*result.state->final_text) << '\n';
-            return ExitCode::Success;
-        case TaskStatus::BudgetExceeded:
-            error_ << "task_id=" << result.state->task_id
-                   << " status=" << status_name(result.state->status)
-                   << " error_code="
-                   << (result.state->terminal_error.has_value()
-                           ? error_code_name(result.state->terminal_error->code)
-                           : "Unknown")
-                   << " summary=" << terminal_summary(result.state->status)
-                   << '\n';
-            return ExitCode::BudgetExceeded;
-        case TaskStatus::Cancelled:
-            error_ << "task_id=" << result.state->task_id
-                   << " status=" << status_name(result.state->status)
-                   << " error_code="
-                   << (result.state->terminal_error.has_value()
-                           ? error_code_name(result.state->terminal_error->code)
-                           : "Unknown")
-                   << " summary=" << terminal_summary(result.state->status)
-                   << '\n';
-            return ExitCode::Cancelled;
-        case TaskStatus::Failed:
-            error_ << "task_id=" << result.state->task_id
-                   << " status=" << status_name(result.state->status)
-                   << " error_code="
-                   << (result.state->terminal_error.has_value()
-                           ? error_code_name(result.state->terminal_error->code)
-                           : "Unknown")
-                   << " summary=" << terminal_summary(result.state->status)
-                   << '\n';
-            return ExitCode::TaskFailed;
-        default:
-            error_ << "runtime returned a non-terminal task state\n";
-            return ExitCode::TaskFailed;
-    }
+    return render_runtime_result(result, progress_valid, output_, error_);
 }
 
 }  // namespace agent

@@ -41,6 +41,7 @@ add_library(agent_kernel STATIC
     src/domain/runtime_event.cpp
     src/application/state_reducer.cpp
     src/application/runtime_engine.cpp
+    src/application/task_evaluator.cpp
     src/adapters/json/value_json.cpp
     src/adapters/anthropic/cpr_http_transport.cpp
     src/adapters/anthropic/anthropic_messages_client.cpp
@@ -104,6 +105,7 @@ add_agent_test(evidence_validation_tests tests/domain/evidence_validation_test.c
 add_agent_test(runtime_event_tests tests/domain/runtime_event_test.cpp)
 add_agent_test(state_reducer_tests tests/application/state_reducer_test.cpp)
 add_agent_test(runtime_engine_tests tests/application/runtime_engine_test.cpp)
+add_agent_test(task_evaluator_tests tests/application/task_evaluator_test.cpp)
 add_agent_test(jsonl_event_store_tests tests/adapters/jsonl_event_store_test.cpp)
 add_agent_test(anthropic_adapter_tests tests/adapters/anthropic_messages_client_test.cpp)
 target_link_libraries(anthropic_adapter_tests PRIVATE Threads::Threads)
@@ -146,11 +148,24 @@ add_test(
         "-DEVENT_LOG=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/valid-completed-events.jsonl"
         "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/verify-log-process"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/verify_log_process_test.cmake")
+add_test(
+    NAME resume_terminal_process_local
+    COMMAND ${CMAKE_COMMAND}
+        "-DAGENT_EXE=$<TARGET_FILE:agent>"
+        "-DEVENT_LOG=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/valid-completed-events.jsonl"
+        "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/resume-process"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/resume_process_test.cmake")
 if(Python3_Interpreter_FOUND)
     add_agent_test(rag_integration_tests
         tests/integration/rag_integration_test.cpp)
     target_link_libraries(rag_integration_tests PRIVATE agent_runtime)
     target_compile_definitions(rag_integration_tests PRIVATE
+        AGENT_RAG_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
+        AGENT_RAG_SCRIPT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/rag/agent_rag_cli.py")
+    add_agent_test(autonomous_issue_workflow_tests
+        tests/integration/autonomous_issue_workflow_test.cpp)
+    target_link_libraries(autonomous_issue_workflow_tests PRIVATE agent_runtime)
+    target_compile_definitions(autonomous_issue_workflow_tests PRIVATE
         AGENT_RAG_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
         AGENT_RAG_SCRIPT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/rag/agent_rag_cli.py")
     add_test(

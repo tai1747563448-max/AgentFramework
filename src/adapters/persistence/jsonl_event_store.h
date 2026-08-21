@@ -14,6 +14,8 @@ public:
     Result<void> append(const RuntimeEvent& event) override;
     Result<std::vector<RuntimeEvent>> read_file(
         const std::filesystem::path& path) const override;
+    Result<std::vector<RuntimeEvent>> read_task(
+        const std::string& task_id) const;
     Result<std::filesystem::path> event_path(
         const std::string& task_id) const;
 

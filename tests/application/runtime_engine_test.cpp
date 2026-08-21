@@ -285,6 +285,16 @@ struct EngineFixture {
         const agent::RuntimeProgressObserver& observer) {
         return engine.run(request, observer);
     }
+
+    agent::RuntimeResult resume(
+        std::vector<agent::RuntimeEvent> durable_events,
+        std::string fallback_system_prompt = "fallback prompt",
+        const agent::RuntimeProgressObserver& observer = {}) {
+        events.events = durable_events;
+        return engine.resume(
+            {std::move(durable_events), std::move(fallback_system_prompt)},
+            observer);
+    }
 };
 
 }  // namespace test
@@ -377,6 +387,323 @@ TEST_CASE(engine_completes_single_model_turn) {
         agent::EventKind::ModelCallSucceeded,
         agent::EventKind::TaskCompleted};
     REQUIRE(fixture.events.kinds() == expected_kinds);
+}
+
+TEST_CASE(resume_rejects_invalid_logs_before_any_external_call) {
+    test::EngineFixture fixture(
+        test::FakeModel({fixtures::text_response("unused")}),
+        test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
+
+    const auto empty = fixture.resume({});
+
+    REQUIRE(!empty.state.has_value());
+    REQUIRE(empty.fatal_error.has_value());
+    REQUIRE(empty.fatal_error->code == agent::ErrorCode::InvalidInput);
+    REQUIRE(fixture.events.events.empty());
+    REQUIRE(fixture.model.requests.empty());
+    REQUIRE(fixture.knowledge.retrieved_states.empty());
+    REQUIRE(fixture.tools.executed_calls.empty());
+}
+
+TEST_CASE(resume_returns_terminal_state_idempotently_without_external_calls) {
+    test::EngineFixture completed(
+        test::FakeModel({fixtures::text_response("done")}),
+        test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
+    const auto original = completed.run(fixtures::run_request("fix warning"));
+    REQUIRE(original.state.has_value());
+    const auto durable_events = completed.events.events;
+
+    test::EngineFixture resumed(
+        test::FakeModel(std::vector<agent::ModelResponse>{}), test::FakeTools{},
+                                test::FakeKnowledge(agent::EvidencePack{}));
+    const auto result = resumed.resume(durable_events);
+
+    REQUIRE(result.state.has_value());
+    REQUIRE(!result.fatal_error.has_value());
+    REQUIRE(*result.state == *original.state);
+    REQUIRE(resumed.events.events == durable_events);
+    REQUIRE(resumed.model.requests.empty());
+    REQUIRE(resumed.knowledge.retrieved_states.empty());
+    REQUIRE(resumed.tools.definitions_calls == 0);
+    REQUIRE(resumed.tools.executed_calls.empty());
+}
+
+TEST_CASE(resume_reissues_exact_in_flight_model_request_without_new_start) {
+    auto request = fixtures::run_request("recover model call");
+    request.budgets.max_model_rounds = 1;
+    test::EngineFixture<test::FailingEventStore> interrupted(
+        test::FakeModel({fixtures::text_response("lost response")}),
+        test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}),
+        test::FailingEventStore(5));
+    const auto interrupted_result = interrupted.run(request);
+    REQUIRE(interrupted_result.fatal_error.has_value());
+    REQUIRE(interrupted.events.events.size() == 4);
+    const auto durable_events = interrupted.events.events;
+    const auto durable_request = interrupted.model.requests.front();
+    std::vector<agent::RuntimeProgress> progress;
+
+    test::EngineFixture resumed(
+        test::FakeModel({fixtures::text_response("recovered")}),
+        test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
+    const auto result = resumed.resume(
+        durable_events, "different configured prompt",
+        [&](const agent::RuntimeProgress& item) { progress.push_back(item); });
+
+    REQUIRE(result.state.has_value());
+    REQUIRE(!result.fatal_error.has_value());
+    REQUIRE(result.state->status == agent::TaskStatus::Completed);
+    REQUIRE(result.state->usage.model_rounds == 1);
+    REQUIRE((resumed.model.requests ==
+             std::vector<agent::ModelRequest>{durable_request}));
+    REQUIRE(resumed.events.count(agent::EventKind::ModelCallStarted) == 1);
+    REQUIRE(resumed.events.count(agent::EventKind::ModelCallSucceeded) == 1);
+    REQUIRE(resumed.events.count(agent::EventKind::TaskCompleted) == 1);
+    REQUIRE(resumed.knowledge.retrieved_states.empty());
+    REQUIRE(resumed.tools.definitions_calls == 0);
+    REQUIRE(progress.size() == 2);
+    REQUIRE(progress.front().sequence == 5);
+    REQUIRE(progress.back().sequence == 6);
+}
+
+TEST_CASE(resume_reexecutes_exact_active_tool_call_and_reconciles_result) {
+    auto request = fixtures::run_request("recover file edit");
+    request.budgets.max_model_rounds = 2;
+    request.budgets.max_tool_calls = 1;
+    const auto call = fixtures::call("call-edit", "replace_text");
+    test::EngineFixture<test::FailingEventStore> interrupted(
+        test::FakeModel({fixtures::tool_response({call})}),
+        test::FakeTools(
+            {agent::ToolResult{"call-edit", "mutation succeeded", false}}),
+        test::FakeKnowledge(fixtures::evidence()),
+        test::FailingEventStore(7));
+    const auto interrupted_result = interrupted.run(request);
+    REQUIRE(interrupted_result.fatal_error.has_value());
+    REQUIRE(interrupted.events.events.size() == 6);
+    const auto durable_events = interrupted.events.events;
+
+    test::EngineFixture resumed(
+        test::FakeModel({fixtures::text_response("verified after recovery")}),
+        test::FakeTools({agent::ToolResult{
+            "call-edit", "expected hash no longer matches", true}}),
+        test::FakeKnowledge(fixtures::evidence()));
+    const auto result = resumed.resume(durable_events);
+
+    REQUIRE(result.state.has_value());
+    REQUIRE(!result.fatal_error.has_value());
+    REQUIRE(result.state->status == agent::TaskStatus::Completed);
+    REQUIRE(result.state->usage.tool_calls == 1);
+    REQUIRE((resumed.tools.executed_calls ==
+             std::vector<agent::ToolCall>{call}));
+    REQUIRE(resumed.events.count(agent::EventKind::ToolCallStarted) == 1);
+    REQUIRE(resumed.events.count(agent::EventKind::ToolCallSucceeded) == 1);
+    REQUIRE(resumed.model.requests.size() == 1);
+    const auto& result_message = resumed.model.requests.front().messages.back();
+    REQUIRE(result_message.role == agent::Role::User);
+    const auto* recovered_result = std::get_if<agent::ToolResultBlock>(
+        &result_message.content.front());
+    REQUIRE(recovered_result != nullptr);
+    REQUIRE(recovered_result->result.tool_call_id == "call-edit");
+    REQUIRE(recovered_result->result.is_error);
+}
+
+TEST_CASE(resume_finishes_an_accepted_terminal_response_without_model_call) {
+    test::EngineFixture<test::FailingEventStore> interrupted(
+        test::FakeModel({fixtures::text_response("durable final text")}),
+        test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}),
+        test::FailingEventStore(6));
+    const auto interrupted_result =
+        interrupted.run(fixtures::run_request("finish terminal append"));
+    REQUIRE(interrupted_result.fatal_error.has_value());
+    REQUIRE(interrupted.events.events.size() == 5);
+
+    test::EngineFixture resumed(
+        test::FakeModel(std::vector<agent::ModelResponse>{}), test::FakeTools{},
+                                test::FakeKnowledge(agent::EvidencePack{}));
+    const auto result = resumed.resume(interrupted.events.events);
+
+    REQUIRE(result.state.has_value());
+    REQUIRE(!result.fatal_error.has_value());
+    REQUIRE(result.state->status == agent::TaskStatus::Completed);
+    REQUIRE(result.state->final_text ==
+            std::optional<std::string>{"durable final text"});
+    REQUIRE(resumed.model.requests.empty());
+    REQUIRE(resumed.events.count(agent::EventKind::ModelCallStarted) == 1);
+    REQUIRE(resumed.events.count(agent::EventKind::ModelCallSucceeded) == 1);
+    REQUIRE(resumed.events.count(agent::EventKind::TaskCompleted) == 1);
+}
+
+TEST_CASE(resume_finishes_an_accepted_max_tokens_response_without_model_call) {
+    const auto partial = fixtures::stopped_response(
+        {agent::TextBlock{"partial"}}, agent::StopReason::MaxTokens,
+        "max_tokens");
+    test::EngineFixture<test::FailingEventStore> interrupted(
+        test::FakeModel({partial}), test::FakeTools{},
+        test::FakeKnowledge(agent::EvidencePack{}),
+        test::FailingEventStore(6));
+    const auto interrupted_result =
+        interrupted.run(fixtures::run_request("finish budget append"));
+    REQUIRE(interrupted_result.fatal_error.has_value());
+    REQUIRE(interrupted.events.events.size() == 5);
+
+    test::EngineFixture resumed(
+        test::FakeModel(std::vector<agent::ModelResponse>{}), test::FakeTools{},
+        test::FakeKnowledge(agent::EvidencePack{}));
+    const auto result = resumed.resume(interrupted.events.events);
+
+    REQUIRE(result.state.has_value());
+    REQUIRE(!result.fatal_error.has_value());
+    REQUIRE(result.state->status == agent::TaskStatus::BudgetExceeded);
+    REQUIRE(result.state->terminal_error.has_value());
+    REQUIRE(result.state->terminal_error->code ==
+            agent::ErrorCode::BudgetExceeded);
+    REQUIRE(resumed.model.requests.empty());
+    REQUIRE(resumed.events.count(agent::EventKind::ModelCallStarted) == 1);
+    REQUIRE(resumed.events.count(agent::EventKind::ModelCallSucceeded) == 1);
+    REQUIRE(resumed.events.count(agent::EventKind::TaskBudgetExceeded) == 1);
+}
+
+TEST_CASE(resume_continues_each_idle_nonterminal_phase) {
+    {
+        test::EngineFixture<test::FailingEventStore> interrupted(
+            test::FakeModel({fixtures::text_response("unused")}),
+            test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}),
+            test::FailingEventStore(2));
+        interrupted.run(fixtures::run_request("created prefix"));
+        test::EngineFixture resumed(
+            test::FakeModel({fixtures::text_response("created recovered")}),
+            test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
+        const auto result = resumed.resume(interrupted.events.events);
+        REQUIRE(result.state.has_value());
+        REQUIRE(result.state->status == agent::TaskStatus::Completed);
+        REQUIRE(resumed.knowledge.retrieved_states.size() == 1);
+        REQUIRE(resumed.model.requests.size() == 1);
+    }
+    {
+        test::EngineFixture<test::FailingEventStore> interrupted(
+            test::FakeModel({fixtures::text_response("unused")}),
+            test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}),
+            test::FailingEventStore(3));
+        interrupted.run(fixtures::run_request("preparing prefix"));
+        test::EngineFixture resumed(
+            test::FakeModel({fixtures::text_response("context recovered")}),
+            test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
+        const auto result = resumed.resume(interrupted.events.events);
+        REQUIRE(result.state.has_value());
+        REQUIRE(result.state->status == agent::TaskStatus::Completed);
+        REQUIRE(resumed.knowledge.retrieved_states.size() == 1);
+        REQUIRE(resumed.model.requests.size() == 1);
+    }
+    {
+        test::EngineFixture<test::FailingEventStore> interrupted(
+            test::FakeModel({fixtures::text_response("unused")}),
+            test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}),
+            test::FailingEventStore(4));
+        interrupted.run(fixtures::run_request("model idle prefix"));
+        test::EngineFixture resumed(
+            test::FakeModel({fixtures::text_response("model recovered")}),
+            test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
+        const auto result = resumed.resume(interrupted.events.events);
+        REQUIRE(result.state.has_value());
+        REQUIRE(result.state->status == agent::TaskStatus::Completed);
+        REQUIRE(resumed.knowledge.retrieved_states.empty());
+        REQUIRE(resumed.model.requests.size() == 1);
+    }
+    {
+        auto request = fixtures::run_request("completed tool prefix");
+        request.budgets.max_model_rounds = 2;
+        request.budgets.max_tool_calls = 1;
+        test::EngineFixture<test::FailingEventStore> interrupted(
+            test::FakeModel({fixtures::tool_response(
+                {fixtures::call("call-read", "read_file")})}),
+            test::FakeTools(
+                {agent::ToolResult{"call-read", "contents", false}}),
+            test::FakeKnowledge(agent::EvidencePack{}),
+            test::FailingEventStore(8));
+        interrupted.run(request);
+        REQUIRE(interrupted.events.events.size() == 7);
+        test::EngineFixture resumed(
+            test::FakeModel({fixtures::text_response("tools recovered")}),
+            test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
+        const auto result = resumed.resume(interrupted.events.events);
+        REQUIRE(result.state.has_value());
+        REQUIRE(result.state->status == agent::TaskStatus::Completed);
+        REQUIRE(resumed.tools.executed_calls.empty());
+        REQUIRE(resumed.knowledge.retrieved_states.size() == 1);
+        REQUIRE(resumed.model.requests.size() == 1);
+    }
+}
+
+TEST_CASE(resume_applies_cancellation_before_reissuing_in_flight_call) {
+    test::EngineFixture<test::FailingEventStore> interrupted(
+        test::FakeModel({fixtures::text_response("lost")}), test::FakeTools{},
+        test::FakeKnowledge(agent::EvidencePack{}),
+        test::FailingEventStore(5));
+    interrupted.run(fixtures::run_request("cancel recovery"));
+
+    test::EngineFixture resumed(
+        test::FakeModel({fixtures::text_response("must not run")}),
+        test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}),
+        test::MemoryEventStore{}, test::FakeClock{},
+        test::FakeCancellation(true));
+    const auto result = resumed.resume(interrupted.events.events);
+
+    REQUIRE(result.state.has_value());
+    REQUIRE(!result.fatal_error.has_value());
+    REQUIRE(result.state->status == agent::TaskStatus::Cancelled);
+    REQUIRE(resumed.model.requests.empty());
+    REQUIRE(resumed.events.count(agent::EventKind::TaskCancelled) == 1);
+}
+
+TEST_CASE(resume_applies_wall_budget_before_reissuing_each_in_flight_call) {
+    {
+        auto request = fixtures::run_request("time out recovered model");
+        request.budgets.max_task_time_ms = 50;
+        test::EngineFixture<test::FailingEventStore> interrupted(
+            test::FakeModel({fixtures::text_response("lost")}),
+            test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}),
+            test::FailingEventStore(5));
+        interrupted.run(request);
+        REQUIRE(interrupted.events.events.size() == 4);
+
+        test::EngineFixture resumed(
+            test::FakeModel({fixtures::text_response("must not run")}),
+            test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}),
+            test::MemoryEventStore{}, test::FakeClock({1'000, 1'050}));
+        const auto result = resumed.resume(interrupted.events.events);
+
+        REQUIRE(result.state.has_value());
+        REQUIRE(!result.fatal_error.has_value());
+        REQUIRE(result.state->status == agent::TaskStatus::BudgetExceeded);
+        REQUIRE(resumed.model.requests.empty());
+        REQUIRE(resumed.events.count(agent::EventKind::TaskBudgetExceeded) == 1);
+    }
+    {
+        auto request = fixtures::run_request("time out recovered tool");
+        request.budgets.max_task_time_ms = 50;
+        const auto call = fixtures::call("call-edit", "replace_text");
+        test::EngineFixture<test::FailingEventStore> interrupted(
+            test::FakeModel({fixtures::tool_response({call})}),
+            test::FakeTools(
+                {agent::ToolResult{"call-edit", "lost", false}}),
+            test::FakeKnowledge(agent::EvidencePack{}),
+            test::FailingEventStore(7));
+        interrupted.run(request);
+        REQUIRE(interrupted.events.events.size() == 6);
+
+        test::EngineFixture resumed(
+            test::FakeModel(std::vector<agent::ModelResponse>{}),
+            test::FakeTools(
+                {agent::ToolResult{"call-edit", "must not run", false}}),
+            test::FakeKnowledge(agent::EvidencePack{}),
+            test::MemoryEventStore{}, test::FakeClock({2'000, 2'050}));
+        const auto result = resumed.resume(interrupted.events.events);
+
+        REQUIRE(result.state.has_value());
+        REQUIRE(!result.fatal_error.has_value());
+        REQUIRE(result.state->status == agent::TaskStatus::BudgetExceeded);
+        REQUIRE(resumed.tools.executed_calls.empty());
+        REQUIRE(resumed.events.count(agent::EventKind::TaskBudgetExceeded) == 1);
+    }
 }
 
 TEST_CASE(runtime_progress_type_is_exactly_the_safe_four_field_projection) {

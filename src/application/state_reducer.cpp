@@ -144,12 +144,28 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                     return invalid_transition(
                         "model call start requires idle awaiting model state");
                 }
+                if (typed_payload.request.messages != state.messages) {
+                    return invalid_transition(
+                        "model request messages do not match durable state");
+                }
                 if (!evidence_pack_is_valid(typed_payload.request.evidence) ||
                     !(typed_payload.request.evidence == state.evidence)) {
                     return invalid_transition(
                         "model request evidence does not match prepared context");
                 }
+                if (typed_payload.request.timeout_ms !=
+                    state.budgets.model_timeout_ms) {
+                    return invalid_transition(
+                        "model request timeout does not match task budget");
+                }
+                if (state.last_model_request.has_value() &&
+                    typed_payload.request.system_prompt !=
+                        state.last_model_request->system_prompt) {
+                    return invalid_transition(
+                        "model request system prompt changed within the task");
+                }
                 state.model_call_in_flight = true;
+                state.last_model_request = typed_payload.request;
                 ++state.usage.model_rounds;
                 return Result<void>::success();
             } else if constexpr (std::is_same_v<Payload, ModelCallSucceededPayload>) {
@@ -283,8 +299,9 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                         typed_payload.budget_name + " budget exceeded", false};
                     if ((!is_time_budget && !is_model_budget && !is_tool_budget) ||
                         !(typed_payload.error == expected_error) ||
-                        state.model_call_in_flight ||
-                        state.active_tool_call_id.has_value() ||
+                        (!is_time_budget &&
+                         (state.model_call_in_flight ||
+                          state.active_tool_call_id.has_value())) ||
                         follows_max_tokens || follows_text_completion) {
                         return invalid_transition(
                             "task budget terminal is not a legal generic guard");

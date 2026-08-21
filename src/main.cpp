@@ -35,7 +35,8 @@ int run_agent(std::vector<std::string> args) {
             return agent::ExitCode::InvalidInputOrConfig;
         }
         if (startup.value().command_args.size() > 1 &&
-            startup.value().command_args[1] == "verify-log") {
+            (startup.value().command_args[1] == "verify-log" ||
+             startup.value().command_args[1] == "evaluate-log")) {
             agent::JsonlEventStore local_events(std::filesystem::path{});
             agent::RunCommand unavailable_run = [](
                 const agent::RunRequest&,
@@ -55,8 +56,28 @@ int run_agent(std::vector<std::string> args) {
                     }
                     return agent::replay_events(loaded.value());
                 };
-            agent::CliApp app(std::move(unavailable_run), std::move(verify),
-                              std::cout, std::cerr);
+            agent::ResumeCommand unavailable_resume = [](
+                const std::string&,
+                const agent::RuntimeProgressObserver&) {
+                return agent::RuntimeResult{
+                    std::nullopt,
+                    agent::RuntimeError{agent::ErrorCode::InvalidInput,
+                                        "resume command is unavailable",
+                                        false}};
+            };
+            agent::EvaluateCommand evaluate =
+                [&](const std::filesystem::path& path) {
+                    auto loaded = local_events.read_file(path);
+                    if (!loaded.has_value()) {
+                        return agent::Result<agent::TaskEvaluation>::failure(
+                            {agent::ErrorCode::PersistenceFailure,
+                             "event log evaluation failed", false});
+                    }
+                    return agent::evaluate_task_events(loaded.value());
+                };
+            agent::CliApp app(
+                std::move(unavailable_run), std::move(unavailable_resume),
+                std::move(verify), std::move(evaluate), std::cout, std::cerr);
             return app.execute(startup.value().command_args);
         }
         if (startup.value().env_file.has_value()) {
@@ -109,6 +130,22 @@ int run_agent(std::vector<std::string> args) {
             request.budgets = config.value().budgets;
             return engine.run(request, observer);
         };
+        agent::ResumeCommand resume = [&]
+            (const std::string& task_id,
+             const agent::RuntimeProgressObserver& observer) {
+            auto loaded = events.read_task(task_id);
+            if (!loaded.has_value() || loaded.value().empty() ||
+                loaded.value().front().task_id != task_id) {
+                return agent::RuntimeResult{
+                    std::nullopt,
+                    agent::RuntimeError{
+                        agent::ErrorCode::PersistenceFailure,
+                        "task event log could not be loaded", false}};
+            }
+            return engine.resume(
+                {std::move(loaded.value()), config.value().system_prompt},
+                observer);
+        };
         agent::VerifyCommand verify = [&](const std::filesystem::path& path) {
             auto loaded = events.read_file(path);
             if (!loaded.has_value()) {
@@ -119,8 +156,8 @@ int run_agent(std::vector<std::string> args) {
             return agent::replay_events(loaded.value());
         };
 
-        agent::CliApp app(std::move(run), std::move(verify), std::cout,
-                          std::cerr);
+        agent::CliApp app(std::move(run), std::move(resume),
+                          std::move(verify), std::cout, std::cerr);
         return app.execute(startup.value().command_args);
     } catch (const std::exception&) {
         std::cerr << "runtime initialization failed\n";

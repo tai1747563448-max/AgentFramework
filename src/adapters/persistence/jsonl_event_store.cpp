@@ -16,9 +16,11 @@
 #include <unistd.h>
 #endif
 
+#include <array>
 #include <cstdint>
 #include <fstream>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -42,6 +44,11 @@ Result<std::filesystem::path> persistence_path_failure(std::string message) {
         {ErrorCode::PersistenceFailure, std::move(message), false});
 }
 
+Result<std::string> persistence_text_read_failure(std::string message) {
+    return Result<std::string>::failure(
+        {ErrorCode::PersistenceFailure, std::move(message), false});
+}
+
 bool is_contained_path(const std::filesystem::path& base,
                        const std::filesystem::path& candidate) {
     const auto relative = candidate.lexically_relative(base);
@@ -50,6 +57,57 @@ bool is_contained_path(const std::filesystem::path& base,
     }
     const auto first = relative.begin();
     return first != relative.end() && *first != std::filesystem::path("..");
+}
+
+Result<std::vector<RuntimeEvent>> decode_event_stream(std::istream& input) {
+    std::vector<RuntimeEvent> events;
+    std::string line;
+    std::size_t line_number = 0;
+    try {
+        while (std::getline(input, line)) {
+            ++line_number;
+            if (line.empty()) {
+                continue;
+            }
+            const auto json = nlohmann::json::parse(line);
+            auto decoded = event_from_json(json);
+            if (!decoded.has_value()) {
+                return persistence_read_failure(
+                    "invalid event record at line " +
+                    std::to_string(line_number));
+            }
+            events.push_back(std::move(decoded.value()));
+        }
+    } catch (const nlohmann::json::exception&) {
+        return persistence_read_failure("invalid JSON event record at line " +
+                                        std::to_string(line_number));
+    } catch (const std::exception&) {
+        return persistence_read_failure("failed while reading event log");
+    }
+    if (input.bad()) {
+        return persistence_read_failure("failed while reading event log");
+    }
+
+    if (!events.empty()) {
+        const auto& task_id = events.front().task_id;
+        std::uint64_t expected_sequence = 1;
+        for (const auto& event : events) {
+            if (event.task_id != task_id) {
+                return persistence_read_failure(
+                    "event log contains more than one task ID");
+            }
+            if (event.sequence != expected_sequence) {
+                return persistence_read_failure(
+                    "event log sequence is not contiguous");
+            }
+            ++expected_sequence;
+        }
+    }
+    const auto replayed = replay_events(events);
+    if (!replayed.has_value()) {
+        return persistence_read_failure("event log cannot be replayed");
+    }
+    return Result<std::vector<RuntimeEvent>>::success(std::move(events));
 }
 
 #ifdef _WIN32
@@ -222,6 +280,71 @@ Result<void> secure_append_line(const std::filesystem::path& runtime_root,
     return Result<void>::success();
 }
 
+Result<std::string> secure_read_task_bytes(
+    const std::filesystem::path& runtime_root,
+    const std::filesystem::path& path,
+    const std::string& task_id) {
+    const auto root = open_directory_handle(runtime_root);
+    if (!root.valid() || !is_plain_directory(root.get())) {
+        return persistence_text_read_failure("event path escapes runtime root");
+    }
+    const auto tasks = open_directory_handle(runtime_root / "tasks");
+    if (!tasks.valid() || !is_plain_directory(tasks.get()) ||
+        !is_direct_handle_child(root.get(), tasks.get(), "tasks")) {
+        return persistence_text_read_failure("event path escapes runtime root");
+    }
+    const auto task = open_directory_handle(path.parent_path());
+    if (!task.valid() || !is_plain_directory(task.get()) ||
+        !is_direct_handle_child(tasks.get(), task.get(),
+                                std::filesystem::u8path(task_id))) {
+        return persistence_text_read_failure("event path escapes runtime root");
+    }
+
+    UniqueHandle leaf(CreateFileW(
+        path.c_str(), GENERIC_READ | FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT |
+            FILE_FLAG_SEQUENTIAL_SCAN,
+        nullptr));
+    if (!leaf.valid()) {
+        return persistence_text_read_failure("failed to open event log");
+    }
+    FILE_ATTRIBUTE_TAG_INFO attributes{};
+    BY_HANDLE_FILE_INFORMATION information{};
+    if (GetFileInformationByHandleEx(leaf.get(), FileAttributeTagInfo,
+                                     &attributes, sizeof(attributes)) == 0 ||
+        GetFileInformationByHandle(leaf.get(), &information) == 0 ||
+        GetFileType(leaf.get()) != FILE_TYPE_DISK ||
+        (attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
+        (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+        information.nNumberOfLinks != 1 ||
+        !is_direct_handle_child(task.get(), leaf.get(), "events.jsonl")) {
+        return persistence_text_read_failure(
+            "event log leaf is not a regular file");
+    }
+
+    std::string bytes;
+    std::array<char, 16 * 1024> buffer{};
+    for (;;) {
+        DWORD read = 0;
+        if (ReadFile(leaf.get(), buffer.data(),
+                     static_cast<DWORD>(buffer.size()), &read, nullptr) == 0) {
+            return persistence_text_read_failure(
+                "failed while reading event log");
+        }
+        if (read == 0) {
+            break;
+        }
+        try {
+            bytes.append(buffer.data(), static_cast<std::size_t>(read));
+        } catch (const std::exception&) {
+            return persistence_text_read_failure(
+                "failed while reading event log");
+        }
+    }
+    return Result<std::string>::success(std::move(bytes));
+}
+
 #else
 
 class UniqueFileDescriptor {
@@ -312,6 +435,65 @@ Result<void> secure_append_line(const std::filesystem::path& runtime_root,
     return Result<void>::success();
 }
 
+Result<std::string> secure_read_task_bytes(
+    const std::filesystem::path& runtime_root,
+    const std::filesystem::path&,
+    const std::string& task_id) {
+    const UniqueFileDescriptor root(open(runtime_root.c_str(),
+                                         O_RDONLY | O_DIRECTORY | O_CLOEXEC |
+                                             O_NOFOLLOW));
+    if (!root.valid() || !is_plain_directory(root.get())) {
+        return persistence_text_read_failure("event path escapes runtime root");
+    }
+    const UniqueFileDescriptor tasks(openat(
+        root.get(), "tasks",
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+    if (!tasks.valid() || !is_plain_directory(tasks.get())) {
+        return persistence_text_read_failure("event path escapes runtime root");
+    }
+    const UniqueFileDescriptor task(openat(
+        tasks.get(), task_id.c_str(),
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+    if (!task.valid() || !is_plain_directory(task.get())) {
+        return persistence_text_read_failure("event path escapes runtime root");
+    }
+    const UniqueFileDescriptor leaf(openat(
+        task.get(), "events.jsonl", O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+    if (!leaf.valid()) {
+        return persistence_text_read_failure("failed to open event log");
+    }
+    struct stat information {};
+    if (fstat(leaf.get(), &information) != 0 ||
+        !S_ISREG(information.st_mode) || information.st_nlink != 1) {
+        return persistence_text_read_failure(
+            "event log leaf is not a regular file");
+    }
+
+    std::string bytes;
+    std::array<char, 16 * 1024> buffer{};
+    for (;;) {
+        const auto read_count = read(leaf.get(), buffer.data(), buffer.size());
+        if (read_count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (read_count < 0) {
+            return persistence_text_read_failure(
+                "failed while reading event log");
+        }
+        if (read_count == 0) {
+            break;
+        }
+        try {
+            bytes.append(buffer.data(),
+                         static_cast<std::size_t>(read_count));
+        } catch (const std::exception&) {
+            return persistence_text_read_failure(
+                "failed while reading event log");
+        }
+    }
+    return Result<std::string>::success(std::move(bytes));
+}
+
 #endif
 
 }  // namespace
@@ -384,56 +566,40 @@ Result<std::vector<RuntimeEvent>> JsonlEventStore::read_file(
     if (!input) {
         return persistence_read_failure("failed to open event log");
     }
+    return decode_event_stream(input);
+}
 
-    std::vector<RuntimeEvent> events;
-    std::string line;
-    std::size_t line_number = 0;
+Result<std::vector<RuntimeEvent>> JsonlEventStore::read_task(
+    const std::string& task_id) const {
+    if (!is_valid_task_id(task_id)) {
+        return persistence_read_failure("invalid task ID for event storage");
+    }
     try {
-        while (std::getline(input, line)) {
-            ++line_number;
-            if (line.empty()) {
-                continue;
-            }
-            const auto json = nlohmann::json::parse(line);
-            auto decoded = event_from_json(json);
-            if (!decoded.has_value()) {
-                return persistence_read_failure(
-                    "invalid event record at line " +
-                    std::to_string(line_number));
-            }
-            events.push_back(std::move(decoded.value()));
+        const auto resolved = event_path(task_id);
+        if (!resolved.has_value()) {
+            return persistence_read_failure("failed to resolve event log");
         }
-    } catch (const nlohmann::json::exception&) {
-        return persistence_read_failure("invalid JSON event record at line " +
-                                        std::to_string(line_number));
+        std::error_code error;
+        const auto absolute_root =
+            std::filesystem::absolute(runtime_root_, error).lexically_normal();
+        if (error) {
+            return persistence_read_failure("failed to resolve runtime root");
+        }
+        auto bytes =
+            secure_read_task_bytes(absolute_root, resolved.value(), task_id);
+        if (!bytes.has_value()) {
+            return persistence_read_failure(bytes.error().message);
+        }
+        std::istringstream input(bytes.value());
+        auto events = decode_event_stream(input);
+        if (!events.has_value() || events.value().empty() ||
+            events.value().front().task_id != task_id) {
+            return persistence_read_failure("task event log does not match task ID");
+        }
+        return events;
     } catch (const std::exception&) {
         return persistence_read_failure("failed while reading event log");
     }
-    if (input.bad()) {
-        return persistence_read_failure("failed while reading event log");
-    }
-
-    if (!events.empty()) {
-        const auto& task_id = events.front().task_id;
-        std::uint64_t expected_sequence = 1;
-        for (const auto& event : events) {
-            if (event.task_id != task_id) {
-                return persistence_read_failure(
-                    "event log contains more than one task ID");
-            }
-            if (event.sequence != expected_sequence) {
-                return persistence_read_failure(
-                    "event log sequence is not contiguous");
-            }
-            ++expected_sequence;
-        }
-    }
-
-    const auto replayed = replay_events(events);
-    if (!replayed.has_value()) {
-        return persistence_read_failure("event log cannot be replayed");
-    }
-    return Result<std::vector<RuntimeEvent>>::success(std::move(events));
 }
 
 }  // namespace agent
