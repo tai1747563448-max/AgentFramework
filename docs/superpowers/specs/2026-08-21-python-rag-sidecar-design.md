@@ -117,7 +117,7 @@ package remains importable from the wrapper directory.
 ### 5.1 Build command
 
 ```text
-python -E -s rag/agent_rag_cli.py build \
+python -E -s -X utf8 rag/agent_rag_cli.py build \
   --source <trusted-document-root> \
   --index <knowledge.sqlite>
 ```
@@ -130,7 +130,7 @@ Stdout contains one bounded JSON summary; stderr contains only fixed errors.
 ### 5.2 Query command
 
 ```text
-python -E -s rag/agent_rag_cli.py query --index <knowledge.sqlite>
+python -E -s -X utf8 rag/agent_rag_cli.py query --index <knowledge.sqlite>
 ```
 
 The query command reads exactly one JSON object from stdin and writes exactly
@@ -147,11 +147,13 @@ The first indexer accepts strict UTF-8 regular files with these source forms:
 - Python: `.py`;
 - build description: `.cmake` and exact `CMakeLists.txt`.
 
-The traversal is lexically sorted and never follows a symlink/reparse point.
+The traversal is lexically sorted and never follows a symlink/reparse point or
+accepts a multiply linked regular file.
 It skips protected components, hidden runtime/index directories, common build
 directories, secret-bearing filenames, unsupported extensions, files larger
 than 1 MiB, invalid UTF-8, and NUL-containing files. It stops at fixed corpus
-budgets: 10,000 accepted files and 64 MiB accepted source bytes. Reaching a
+budgets: 50,000 inspected entries, 10,000 accepted files, and 64 MiB accepted
+source bytes. Reaching a
 budget is a build error, not silent partial success.
 
 Files are divided on line boundaries into chunks of at most 4,096 UTF-8 bytes,
@@ -162,6 +164,10 @@ a stable source ID:
 ```text
 relative/posix/path.md#L<start>-L<end>
 ```
+
+When one physical line must be split, its chunks append `-P<part>` (starting at
+1), for example `generated.txt#L7-L7-P2`; ordinary line-range IDs remain
+unchanged.
 
 The database stores the relative path, line interval, text, UTF-8 byte length,
 SHA-256 of the chunk, token count, and term frequencies. It never stores the
@@ -237,7 +243,7 @@ owns no process and starts one per `retrieve` call. It validates before launch:
 It launches only:
 
 ```text
-<python> -E -s <script> query --index <index>
+<python> -E -s -X utf8 <script> query --index <index>
 ```
 
 with the JSON request on stdin, script directory as cwd, 64 KiB stdout, 4 KiB

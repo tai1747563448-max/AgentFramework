@@ -169,7 +169,7 @@ feat: validate durable rag evidence
 
 Use a Fake ProcessRunner and real temporary script/index files. Test first:
 
-- exact program and `-E -s <script> query --index <index>` arguments;
+- exact program and `-E -s -X utf8 <script> query --index <index>` arguments;
 - script parent cwd, literal Issue only in stdin, top-k/schema/byte cap;
 - strict ordered conversion of all evidence fields and metadata;
 - runner failure, timeout, nonzero exit, stdout truncation, malformed JSON,

@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.21)
 project(AgentFramework VERSION 0.1.0 LANGUAGES CXX)
 
 find_package(Threads REQUIRED)
+find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -139,6 +140,14 @@ add_test(
         "-DEVENT_LOG=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/valid-completed-events.jsonl"
         "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/verify-log-process"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/verify_log_process_test.cmake")
+if(Python3_Interpreter_FOUND)
+    add_test(
+        NAME python_rag_tests
+        COMMAND "${Python3_EXECUTABLE}" -E -s -X utf8 -m unittest
+            discover -s "${CMAKE_CURRENT_SOURCE_DIR}/rag/tests" -v)
+    set_tests_properties(python_rag_tests PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
 
 if(AGENT_ENABLE_LIVE_TESTS)
     add_executable(anthropic_live_smoke tests/live/anthropic_live_smoke.cpp)
