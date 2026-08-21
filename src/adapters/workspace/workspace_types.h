@@ -76,4 +76,13 @@ struct SearchOutput {
     std::size_t omitted_entries{0};
 };
 
+struct WriteOutput {
+    std::string path;
+    bool created{false};
+    std::string old_sha256;
+    std::string new_sha256;
+    std::size_t replacements{0};
+    std::size_t bytes_written{0};
+};
+
 }  // namespace agent::workspace

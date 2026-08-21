@@ -242,6 +242,15 @@ nlohmann::json bounded_search_json(const std::string& path,
     return encoded;
 }
 
+nlohmann::json write_json(const workspace::WriteOutput& output) {
+    return {{"path", output.path},
+            {"created", output.created},
+            {"old_sha256", output.old_sha256},
+            {"new_sha256", output.new_sha256},
+            {"replacements", output.replacements},
+            {"bytes_written", output.bytes_written}};
+}
+
 }  // namespace
 
 WorkspaceToolGateway::WorkspaceToolGateway(std::filesystem::path runtime_root)
@@ -404,6 +413,93 @@ Result<ToolResult> WorkspaceToolGateway::execute(
                 bounded_search_json(
                     *path_text,
                     std::get<workspace::SearchOutput>(searched)));
+        }
+        if (call.name == "replace_text") {
+            if (!optional_exact_keys(
+                    args,
+                    {"path", "old_text", "new_text",
+                     "expected_occurrences", "expected_sha256"},
+                    {})) {
+                return Result<ToolResult>::success(fault_result(
+                    call.id,
+                    invalid_arguments("invalid replace_text arguments")));
+            }
+            const auto path_text = string_value(args, "path");
+            const auto old_text = string_value(args, "old_text");
+            const auto new_text = string_value(args, "new_text");
+            const auto occurrences = size_value(
+                args, "expected_occurrences", 1, 1000);
+            const auto expected_sha256 =
+                string_value(args, "expected_sha256");
+            if (!path_text.has_value() || !old_text.has_value() ||
+                !new_text.has_value() || !occurrences.has_value() ||
+                !expected_sha256.has_value()) {
+                return Result<ToolResult>::success(fault_result(
+                    call.id,
+                    invalid_arguments("invalid replace_text arguments")));
+            }
+            const auto parsed = policy_.parse(*path_text);
+            if (std::holds_alternative<workspace::Fault>(parsed)) {
+                return Result<ToolResult>::success(
+                    fault_result(call.id, std::get<workspace::Fault>(parsed)));
+            }
+            const auto replaced = files_.replace_text(
+                workspace, std::get<workspace::RelativePath>(parsed),
+                *old_text, *new_text, *occurrences, *expected_sha256);
+            if (std::holds_alternative<workspace::Fault>(replaced)) {
+                return Result<ToolResult>::success(fault_result(
+                    call.id, std::get<workspace::Fault>(replaced)));
+            }
+            return success_result(
+                call.id,
+                write_json(std::get<workspace::WriteOutput>(replaced)));
+        }
+        if (call.name == "write_file") {
+            if (!optional_exact_keys(
+                    args, {"path", "content", "mode"},
+                    {"expected_sha256"})) {
+                return Result<ToolResult>::success(fault_result(
+                    call.id,
+                    invalid_arguments("invalid write_file arguments")));
+            }
+            const auto path_text = string_value(args, "path");
+            const auto content = string_value(args, "content");
+            const auto mode = string_value(args, "mode");
+            std::optional<std::string> expected_sha256;
+            if (args.find("expected_sha256") != args.end()) {
+                expected_sha256 = string_value(args, "expected_sha256");
+                if (!expected_sha256.has_value()) {
+                    return Result<ToolResult>::success(fault_result(
+                        call.id,
+                        invalid_arguments("invalid write_file arguments")));
+                }
+            }
+            if (!path_text.has_value() || !content.has_value() ||
+                !mode.has_value() ||
+                (*mode != "create" && *mode != "overwrite")) {
+                return Result<ToolResult>::success(fault_result(
+                    call.id,
+                    invalid_arguments("invalid write_file arguments")));
+            }
+            const auto parsed = policy_.parse(*path_text);
+            if (std::holds_alternative<workspace::Fault>(parsed)) {
+                return Result<ToolResult>::success(
+                    fault_result(call.id, std::get<workspace::Fault>(parsed)));
+            }
+            const auto hash_view = expected_sha256.has_value()
+                                       ? std::optional<std::string_view>{
+                                             *expected_sha256}
+                                       : std::nullopt;
+            const auto written = files_.write_file(
+                workspace, std::get<workspace::RelativePath>(parsed),
+                *content, *mode == "create", hash_view);
+            if (std::holds_alternative<workspace::Fault>(written)) {
+                return Result<ToolResult>::success(fault_result(
+                    call.id, std::get<workspace::Fault>(written)));
+            }
+            return success_result(
+                call.id,
+                write_json(std::get<workspace::WriteOutput>(written)));
         }
         return Result<ToolResult>::success(fault_result(
             call.id, invalid_arguments("unknown workspace tool")));

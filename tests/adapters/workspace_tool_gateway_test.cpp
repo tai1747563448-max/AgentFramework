@@ -1,4 +1,5 @@
 #include "adapters/workspace/workspace_tool_gateway.h"
+#include "adapters/workspace/workspace_text.h"
 #include "ports/tool_gateway.h"
 #include "test_support.h"
 
@@ -7,6 +8,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <iterator>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -46,6 +49,42 @@ agent::ToolCall search_call(std::string id,
                 {"query", std::move(query)},
                 {"case_sensitive", case_sensitive},
                 {"max_results", max_results}})};
+}
+
+agent::ToolCall replace_call(std::string id,
+                             std::string path,
+                             std::string old_text,
+                             std::string new_text,
+                             std::int64_t occurrences,
+                             std::string hash) {
+    return {std::move(id), "replace_text",
+            agent::Value::object({
+                {"path", std::move(path)},
+                {"old_text", std::move(old_text)},
+                {"new_text", std::move(new_text)},
+                {"expected_occurrences", occurrences},
+                {"expected_sha256", std::move(hash)}})};
+}
+
+agent::ToolCall write_call(std::string id,
+                           std::string path,
+                           std::string content,
+                           std::string mode,
+                           std::optional<std::string> hash = std::nullopt) {
+    agent::Value::Object args{{"path", std::move(path)},
+                              {"content", std::move(content)},
+                              {"mode", std::move(mode)}};
+    if (hash.has_value()) {
+        args.emplace("expected_sha256", std::move(*hash));
+    }
+    return {std::move(id), "write_file",
+            agent::Value::object(std::move(args))};
+}
+
+std::string read_bytes(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(input),
+            std::istreambuf_iterator<char>()};
 }
 
 nlohmann::json content_json(const agent::Result<agent::ToolResult>& result) {
@@ -401,4 +440,209 @@ TEST_CASE(workspace_search_stops_before_the_serialized_result_limit) {
     REQUIRE(json.at("matches").size() < 200);
     REQUIRE(json.at("truncated") == true);
     REQUIRE(json.at("truncation_reason") == "output_bytes");
+}
+
+TEST_CASE(workspace_replace_is_versioned_non_overlapping_and_atomic) {
+    test::ScopedTempDir temp("workspace-replace");
+    const auto file = temp.write_text("a.cpp", "old old\n");
+    agent::WorkspaceToolGateway gateway(temp.path() / "runtime_data");
+    const agent::ToolExecutionContext context{temp.path().generic_u8string()};
+    const auto original_hash = agent::workspace::sha256_hex("old old\n");
+
+    const auto stale = gateway.execute(
+        fixtures::replace_call("call-stale", "a.cpp", "old", "new", 2,
+                               std::string(64, '0')),
+        context);
+    REQUIRE(fixtures::error_code(stale) == "conflict");
+    REQUIRE(fixtures::content_json(stale).at("error").at("retryable") == true);
+    REQUIRE(fixtures::read_bytes(file) == "old old\n");
+
+    const auto wrong_count = gateway.execute(
+        fixtures::replace_call("call-count", "a.cpp", "old", "new", 1,
+                               original_hash),
+        context);
+    REQUIRE(fixtures::error_code(wrong_count) == "conflict");
+    REQUIRE(fixtures::read_bytes(file) == "old old\n");
+
+    const auto replaced = gateway.execute(
+        fixtures::replace_call("call-replace", "a.cpp", "old", "new", 2,
+                               original_hash),
+        context);
+    REQUIRE(replaced.has_value() && !replaced.value().is_error);
+    const auto replaced_json = fixtures::content_json(replaced);
+    REQUIRE(fixtures::read_bytes(file) == "new new\n");
+    REQUIRE(replaced_json.at("path") == "a.cpp");
+    REQUIRE(replaced_json.at("created") == false);
+    REQUIRE(replaced_json.at("old_sha256") == original_hash);
+    REQUIRE(replaced_json.at("new_sha256") ==
+            agent::workspace::sha256_hex("new new\n"));
+    REQUIRE(replaced_json.at("replacements") == 2);
+    REQUIRE(replaced_json.at("bytes_written") == 8);
+
+    const auto overlap_file = temp.write_text("overlap.txt", "aaa");
+    const auto overlap = gateway.execute(
+        fixtures::replace_call("call-overlap", "overlap.txt", "aa", "X", 1,
+                               agent::workspace::sha256_hex("aaa")),
+        context);
+    REQUIRE(overlap.has_value() && !overlap.value().is_error);
+    REQUIRE(fixtures::read_bytes(overlap_file) == "Xa");
+
+    for (const auto& entry : std::filesystem::directory_iterator(temp.path())) {
+        REQUIRE(entry.path().filename().generic_u8string().find(
+                    ".agent-tmp-") == std::string::npos);
+    }
+}
+
+TEST_CASE(workspace_write_enforces_create_and_overwrite_preconditions) {
+    test::ScopedTempDir temp("workspace-write-modes");
+    std::filesystem::create_directory(temp.path() / "docs");
+    agent::WorkspaceToolGateway gateway(temp.path() / "runtime_data");
+    const agent::ToolExecutionContext context{temp.path().generic_u8string()};
+
+    const auto created = gateway.execute(
+        fixtures::write_call("call-create", "docs/note.txt", u8"你好\n",
+                             "create"),
+        context);
+    REQUIRE(created.has_value() && !created.value().is_error);
+    const auto created_json = fixtures::content_json(created);
+    REQUIRE(created_json.at("created") == true);
+    REQUIRE(created_json.at("new_sha256") ==
+            agent::workspace::sha256_hex(u8"你好\n"));
+    REQUIRE(fixtures::read_bytes(temp.path() / "docs/note.txt") == u8"你好\n");
+
+    const auto create_existing = gateway.execute(
+        fixtures::write_call("call-create-existing", "docs/note.txt", "lost",
+                             "create"),
+        context);
+    REQUIRE(fixtures::error_code(create_existing) == "conflict");
+    REQUIRE(fixtures::read_bytes(temp.path() / "docs/note.txt") == u8"你好\n");
+
+    const auto stale = gateway.execute(
+        fixtures::write_call("call-overwrite-stale", "docs/note.txt", "new\n",
+                             "overwrite", std::string(64, '0')),
+        context);
+    REQUIRE(fixtures::error_code(stale) == "conflict");
+    REQUIRE(fixtures::read_bytes(temp.path() / "docs/note.txt") == u8"你好\n");
+
+    const auto overwritten = gateway.execute(
+        fixtures::write_call(
+            "call-overwrite", "docs/note.txt", "new\n", "overwrite",
+            agent::workspace::sha256_hex(u8"你好\n")),
+        context);
+    REQUIRE(overwritten.has_value() && !overwritten.value().is_error);
+    const auto overwritten_json = fixtures::content_json(overwritten);
+    REQUIRE(overwritten_json.at("created") == false);
+    REQUIRE(overwritten_json.at("old_sha256") ==
+            agent::workspace::sha256_hex(u8"你好\n"));
+    REQUIRE(fixtures::read_bytes(temp.path() / "docs/note.txt") == "new\n");
+
+    const auto empty = gateway.execute(
+        fixtures::write_call("call-empty", "docs/empty.txt", "", "create"),
+        context);
+    REQUIRE(empty.has_value() && !empty.value().is_error);
+    REQUIRE(fixtures::read_bytes(temp.path() / "docs/empty.txt").empty());
+
+    REQUIRE(fixtures::error_code(gateway.execute(
+                fixtures::write_call("call-missing", "docs/missing.txt", "x",
+                                     "overwrite", std::string(64, '0')),
+                context)) == "not_found");
+    REQUIRE(fixtures::error_code(gateway.execute(
+                fixtures::write_call("call-parent", "missing/note.txt", "x",
+                                     "create"),
+                context)) == "not_found");
+    REQUIRE(fixtures::error_code(gateway.execute(
+                fixtures::write_call("call-create-hash", "docs/new.txt", "x",
+                                     "create", std::string(64, '0')),
+                context)) == "invalid_arguments");
+    REQUIRE(fixtures::error_code(gateway.execute(
+                fixtures::write_call("call-no-hash", "docs/note.txt", "x",
+                                     "overwrite"),
+                context)) == "invalid_arguments");
+}
+
+TEST_CASE(workspace_mutations_reject_invalid_protected_and_oversized_content) {
+    test::ScopedTempDir temp("workspace-write-invalid");
+    const auto file = temp.write_text("a.txt", "old\n");
+    temp.write_text(".env", "SECRET=sentinel\n");
+    agent::WorkspaceToolGateway gateway(temp.path() / "runtime_data");
+    const agent::ToolExecutionContext context{temp.path().generic_u8string()};
+    const auto hash = agent::workspace::sha256_hex("old\n");
+
+    REQUIRE(fixtures::error_code(gateway.execute(
+                fixtures::replace_call("call-empty-old", "a.txt", "", "new",
+                                       1, hash),
+                context)) == "invalid_arguments");
+    REQUIRE(fixtures::error_code(gateway.execute(
+                fixtures::replace_call("call-bad-hash", "a.txt", "old", "new",
+                                       1, "ABC"),
+                context)) == "invalid_arguments");
+    REQUIRE(fixtures::error_code(gateway.execute(
+                fixtures::replace_call(
+                    "call-nul", "a.txt", "old", std::string("x\0y", 3), 1,
+                    hash),
+                context)) == "invalid_arguments");
+    REQUIRE(fixtures::error_code(gateway.execute(
+                fixtures::replace_call("call-large", "a.txt", "old",
+                                       std::string(1024 * 1024 + 1, 'x'), 1,
+                                       hash),
+                context)) == "limit_exceeded");
+    REQUIRE(fixtures::read_bytes(file) == "old\n");
+
+    REQUIRE(fixtures::error_code(gateway.execute(
+                fixtures::write_call("call-protected", ".env", "changed",
+                                     "overwrite",
+                                     agent::workspace::sha256_hex(
+                                         "SECRET=sentinel\n")),
+                context)) == "access_denied");
+    REQUIRE(fixtures::error_code(gateway.execute(
+                fixtures::write_call("call-write-nul", "new.txt",
+                                     std::string("x\0y", 3), "create"),
+                context)) == "invalid_arguments");
+    REQUIRE(fixtures::error_code(gateway.execute(
+                fixtures::write_call("call-write-large", "new.txt",
+                                     std::string(1024 * 1024 + 1, 'x'),
+                                     "create"),
+                context)) == "limit_exceeded");
+    REQUIRE(fixtures::read_bytes(temp.path() / ".env") == "SECRET=sentinel\n");
+}
+
+TEST_CASE(workspace_mutations_do_not_follow_links_or_expose_temp_artifacts) {
+    test::ScopedTempDir temp("workspace-write-links");
+    test::ScopedTempDir outside("workspace-write-outside");
+    const auto sentinel = outside.write_text("sentinel.txt", "outside\n");
+    const auto hard_alias = temp.path() / "hard.txt";
+    std::error_code hard_error;
+    std::filesystem::create_hard_link(sentinel, hard_alias, hard_error);
+    REQUIRE(!hard_error);
+    temp.write_text(".agent-tmp-visible", "private\n");
+    agent::WorkspaceToolGateway gateway(temp.path() / "runtime_data");
+    const agent::ToolExecutionContext context{temp.path().generic_u8string()};
+
+    REQUIRE(fixtures::error_code(gateway.execute(
+                fixtures::write_call("call-hard", "hard.txt", "changed\n",
+                                     "overwrite",
+                                     agent::workspace::sha256_hex("outside\n")),
+                context)) == "access_denied");
+    REQUIRE(fixtures::read_bytes(sentinel) == "outside\n");
+
+    const auto listed = gateway.execute(
+        fixtures::list_call("call-list-temp", ".", false, 100), context);
+    REQUIRE(listed.has_value() && !listed.value().is_error);
+    REQUIRE(listed.value().content.find(".agent-tmp-visible") ==
+            std::string::npos);
+
+    const auto symlink = temp.path() / "link.txt";
+    std::error_code symlink_error;
+    std::filesystem::create_symlink(sentinel, symlink, symlink_error);
+    if (symlink_error) {
+        std::cout << "SKIP workspace mutation symlink guard: environment cannot "
+                     "create a file symlink\n";
+    } else {
+        REQUIRE(fixtures::error_code(gateway.execute(
+                    fixtures::write_call(
+                        "call-link", "link.txt", "changed\n", "overwrite",
+                        agent::workspace::sha256_hex("outside\n")),
+                    context)) == "access_denied");
+        REQUIRE(fixtures::read_bytes(sentinel) == "outside\n");
+    }
 }

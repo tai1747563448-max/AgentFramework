@@ -174,7 +174,8 @@ bool WorkspacePathPolicy::is_protected(
         const bool credential =
             leaf == ".git-credentials" || leaf == ".netrc" ||
             leaf == "_netrc" || leaf == ".npmrc" || leaf == ".pypirc";
-        if (env_file || credential) {
+        const bool temporary = leaf.rfind(".agent-tmp-", 0) == 0;
+        if (env_file || credential || temporary) {
             return true;
         }
     }

@@ -2,9 +2,23 @@
 
 #include "adapters/workspace/workspace_text.h"
 
+#if defined(_WIN32)
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <fstream>
 #include <iterator>
+#include <limits>
+#include <random>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -32,6 +46,20 @@ Fault file_limit_fault() {
 Fault text_fault() {
     return {FaultCode::UnsupportedFile,
             "file is not supported UTF-8 text", false};
+}
+
+Fault conflict_fault() {
+    return {FaultCode::Conflict,
+            "file content changed; read the file again", true};
+}
+
+Fault denied_fault() {
+    return {FaultCode::AccessDenied,
+            "workspace path is not permitted", false};
+}
+
+Fault not_found_fault() {
+    return {FaultCode::NotFound, "workspace path was not found", false};
 }
 
 bool is_fault(const Outcome<std::filesystem::path>& outcome) {
@@ -73,6 +101,259 @@ Outcome<std::string> load_text_file(const std::filesystem::path& file) {
         return text_fault();
     }
     return bytes;
+}
+
+bool valid_sha256(std::string_view hash) {
+    return hash.size() == 64 &&
+           std::all_of(hash.begin(), hash.end(), [](unsigned char value) {
+               return (value >= static_cast<unsigned char>('0') &&
+                       value <= static_cast<unsigned char>('9')) ||
+                      (value >= static_cast<unsigned char>('a') &&
+                       value <= static_cast<unsigned char>('f'));
+           });
+}
+
+std::string temp_leaf_name() {
+    static std::atomic<std::uint64_t> counter{0};
+    std::random_device random;
+    const auto stamp = std::chrono::high_resolution_clock::now()
+                           .time_since_epoch()
+                           .count();
+    return ".agent-tmp-" + std::to_string(stamp) + "-" +
+           std::to_string(counter.fetch_add(1, std::memory_order_relaxed)) +
+           "-" + std::to_string(random());
+}
+
+class TempPathGuard {
+public:
+    explicit TempPathGuard(std::filesystem::path path)
+        : path_(std::move(path)) {}
+
+    ~TempPathGuard() {
+        if (active_) {
+            std::error_code ignored;
+            std::filesystem::remove(path_, ignored);
+        }
+    }
+
+    void release() noexcept {
+        active_ = false;
+    }
+
+private:
+    std::filesystem::path path_;
+    bool active_{true};
+};
+
+Outcome<bool> write_exclusive(const std::filesystem::path& path,
+                              std::string_view content) {
+#if defined(_WIN32)
+    const HANDLE handle = CreateFileW(
+        path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        const auto error = GetLastError();
+        if (error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS) {
+            return conflict_fault();
+        }
+        return io_fault();
+    }
+    bool okay = true;
+    std::size_t written = 0;
+    while (written < content.size()) {
+        DWORD chunk_written = 0;
+        const auto remaining = content.size() - written;
+        const auto chunk = static_cast<DWORD>(
+            std::min<std::size_t>(remaining,
+                                  std::numeric_limits<DWORD>::max()));
+        if (!WriteFile(handle, content.data() + written, chunk,
+                       &chunk_written, nullptr) || chunk_written == 0) {
+            okay = false;
+            break;
+        }
+        written += chunk_written;
+    }
+    if (okay && !FlushFileBuffers(handle)) {
+        okay = false;
+    }
+    if (!CloseHandle(handle)) {
+        okay = false;
+    }
+    if (!okay) {
+        std::error_code ignored;
+        std::filesystem::remove(path, ignored);
+    }
+    return okay ? Outcome<bool>{true} : Outcome<bool>{io_fault()};
+#else
+    const int descriptor =
+        ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+    if (descriptor < 0) {
+        return errno == EEXIST ? Outcome<bool>{conflict_fault()}
+                              : Outcome<bool>{io_fault()};
+    }
+    bool okay = true;
+    std::size_t written = 0;
+    while (written < content.size()) {
+        const auto result =
+            ::write(descriptor, content.data() + written,
+                    content.size() - written);
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
+        if (result <= 0) {
+            okay = false;
+            break;
+        }
+        written += static_cast<std::size_t>(result);
+    }
+    if (okay && ::fsync(descriptor) != 0) {
+        okay = false;
+    }
+    if (::close(descriptor) != 0) {
+        okay = false;
+    }
+    if (!okay) {
+        std::error_code ignored;
+        std::filesystem::remove(path, ignored);
+    }
+    return okay ? Outcome<bool>{true} : Outcome<bool>{io_fault()};
+#endif
+}
+
+Outcome<bool> trustworthy_overwrite_target(
+    const std::filesystem::path& target,
+    std::string_view expected_sha256) {
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(target, error);
+    if (error) {
+        return io_fault();
+    }
+    if (!std::filesystem::exists(status)) {
+        return not_found_fault();
+    }
+    if (std::filesystem::is_symlink(status) ||
+        !std::filesystem::is_regular_file(status)) {
+        return denied_fault();
+    }
+#if defined(_WIN32)
+    const DWORD attributes = GetFileAttributesW(target.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        return io_fault();
+    }
+    if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        return denied_fault();
+    }
+#endif
+    const auto links = std::filesystem::hard_link_count(target, error);
+    if (error) {
+        return io_fault();
+    }
+    if (links != 1) {
+        return denied_fault();
+    }
+    const auto current = load_text_file(target);
+    if (std::holds_alternative<Fault>(current)) {
+        return std::get<Fault>(current);
+    }
+    if (sha256_hex(std::get<std::string>(current)) != expected_sha256) {
+        return conflict_fault();
+    }
+    return true;
+}
+
+Outcome<bool> install_file(const std::filesystem::path& target,
+                           std::string_view content,
+                           bool create,
+                           std::optional<std::string_view> expected_sha256) {
+    std::filesystem::path temporary;
+    Outcome<bool> created = conflict_fault();
+    for (std::size_t attempt = 0; attempt < 32; ++attempt) {
+        temporary = target.parent_path() /
+                    std::filesystem::u8path(temp_leaf_name());
+        created = write_exclusive(temporary, content);
+        if (std::holds_alternative<bool>(created)) {
+            break;
+        }
+        const auto& fault = std::get<Fault>(created);
+        if (fault.code != FaultCode::Conflict) {
+            return fault;
+        }
+    }
+    if (std::holds_alternative<Fault>(created)) {
+        return io_fault();
+    }
+    TempPathGuard cleanup(temporary);
+    const auto temporary_bytes = load_text_file(temporary);
+    if (std::holds_alternative<Fault>(temporary_bytes) ||
+        sha256_hex(std::get<std::string>(temporary_bytes)) !=
+            sha256_hex(content)) {
+        return io_fault();
+    }
+    if (!create) {
+        if (!expected_sha256.has_value()) {
+            return conflict_fault();
+        }
+        const auto trustworthy =
+            trustworthy_overwrite_target(target, *expected_sha256);
+        if (std::holds_alternative<Fault>(trustworthy)) {
+            return std::get<Fault>(trustworthy);
+        }
+#if !defined(_WIN32)
+        std::error_code error;
+        const auto permissions =
+            std::filesystem::status(target, error).permissions();
+        if (error) {
+            return io_fault();
+        }
+        std::filesystem::permissions(
+            temporary, permissions,
+            std::filesystem::perm_options::replace, error);
+        if (error) {
+            return io_fault();
+        }
+#endif
+    }
+
+#if defined(_WIN32)
+    DWORD flags = MOVEFILE_WRITE_THROUGH;
+    if (!create) {
+        flags |= MOVEFILE_REPLACE_EXISTING;
+    }
+    if (!MoveFileExW(temporary.c_str(), target.c_str(), flags)) {
+        const auto error = GetLastError();
+        if (create &&
+            (error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS)) {
+            return conflict_fault();
+        }
+        return io_fault();
+    }
+    cleanup.release();
+#else
+    if (create) {
+        if (::link(temporary.c_str(), target.c_str()) != 0) {
+            return errno == EEXIST ? Outcome<bool>{conflict_fault()}
+                                  : Outcome<bool>{io_fault()};
+        }
+        if (::unlink(temporary.c_str()) != 0) {
+            throw std::runtime_error("installed file state is not trustworthy");
+        }
+        cleanup.release();
+    } else {
+        std::error_code error;
+        std::filesystem::rename(temporary, target, error);
+        if (error) {
+            return io_fault();
+        }
+        cleanup.release();
+    }
+#endif
+
+    const auto installed = load_text_file(target);
+    if (std::holds_alternative<Fault>(installed) ||
+        sha256_hex(std::get<std::string>(installed)) != sha256_hex(content)) {
+        throw std::runtime_error("installed file state is not trustworthy");
+    }
+    return true;
 }
 
 std::size_t utf8_column(std::string_view line, std::size_t byte_offset) {
@@ -429,6 +710,139 @@ Outcome<SearchOutput> WorkspaceFileOps::search(
         }
     }
     return output;
+}
+
+Outcome<WriteOutput> WorkspaceFileOps::replace_text(
+    const std::filesystem::path& workspace,
+    const RelativePath& path,
+    std::string_view old_text,
+    std::string_view new_text,
+    std::size_t expected_occurrences,
+    std::string_view expected_sha256) const {
+    if (old_text.empty() || !is_strict_utf8_text(old_text) ||
+        !is_strict_utf8_text(new_text) || expected_occurrences == 0 ||
+        expected_occurrences > 1000 || !valid_sha256(expected_sha256)) {
+        return Fault{FaultCode::InvalidArguments,
+                     "invalid replace_text arguments", false};
+    }
+    if (new_text.size() > kMaxTextFileBytes) {
+        return file_limit_fault();
+    }
+    const auto resolved = policy_.resolve_existing(workspace, path, false);
+    if (std::holds_alternative<Fault>(resolved)) {
+        return std::get<Fault>(resolved);
+    }
+    const auto& target = std::get<std::filesystem::path>(resolved);
+    auto loaded = load_text_file(target);
+    if (std::holds_alternative<Fault>(loaded)) {
+        return std::get<Fault>(loaded);
+    }
+    const auto& current = std::get<std::string>(loaded);
+    const auto current_hash = sha256_hex(current);
+    if (current_hash != expected_sha256) {
+        return conflict_fault();
+    }
+    const auto positions = literal_matches(current, old_text, true);
+    if (positions.size() != expected_occurrences) {
+        return conflict_fault();
+    }
+
+    std::string replacement;
+    replacement.reserve(current.size());
+    std::size_t copied = 0;
+    for (const auto position : positions) {
+        replacement.append(current, copied, position - copied);
+        replacement.append(new_text);
+        if (replacement.size() > kMaxTextFileBytes) {
+            return file_limit_fault();
+        }
+        copied = position + old_text.size();
+    }
+    replacement.append(current, copied, std::string::npos);
+    if (replacement.size() > kMaxTextFileBytes) {
+        return file_limit_fault();
+    }
+    const auto installed = install_file(
+        target, replacement, false,
+        std::optional<std::string_view>{expected_sha256});
+    if (std::holds_alternative<Fault>(installed)) {
+        return std::get<Fault>(installed);
+    }
+    return WriteOutput{path.generic,
+                       false,
+                       current_hash,
+                       sha256_hex(replacement),
+                       positions.size(),
+                       replacement.size()};
+}
+
+Outcome<WriteOutput> WorkspaceFileOps::write_file(
+    const std::filesystem::path& workspace,
+    const RelativePath& path,
+    std::string_view content,
+    bool create,
+    std::optional<std::string_view> expected_sha256) const {
+    if (!is_strict_utf8_text(content) || path.components.empty() ||
+        (create && expected_sha256.has_value()) ||
+        (!create && (!expected_sha256.has_value() ||
+                     !valid_sha256(*expected_sha256)))) {
+        return Fault{FaultCode::InvalidArguments,
+                     "invalid write_file arguments", false};
+    }
+    if (content.size() > kMaxTextFileBytes) {
+        return file_limit_fault();
+    }
+    if (create) {
+        const auto parent = policy_.resolve_parent(workspace, path);
+        if (std::holds_alternative<Fault>(parent)) {
+            return std::get<Fault>(parent);
+        }
+        const auto target = std::get<std::filesystem::path>(parent) /
+                            std::filesystem::u8path(path.components.back());
+        std::error_code error;
+        if (std::filesystem::exists(target, error)) {
+            return conflict_fault();
+        }
+        if (error) {
+            return io_fault();
+        }
+        const auto installed =
+            install_file(target, content, true, std::nullopt);
+        if (std::holds_alternative<Fault>(installed)) {
+            return std::get<Fault>(installed);
+        }
+        return WriteOutput{path.generic,
+                           true,
+                           "",
+                           sha256_hex(content),
+                           0,
+                           content.size()};
+    }
+
+    const auto resolved = policy_.resolve_existing(workspace, path, false);
+    if (std::holds_alternative<Fault>(resolved)) {
+        return std::get<Fault>(resolved);
+    }
+    const auto& target = std::get<std::filesystem::path>(resolved);
+    const auto loaded = load_text_file(target);
+    if (std::holds_alternative<Fault>(loaded)) {
+        return std::get<Fault>(loaded);
+    }
+    const auto old_hash = sha256_hex(std::get<std::string>(loaded));
+    if (old_hash != *expected_sha256) {
+        return conflict_fault();
+    }
+    const auto installed =
+        install_file(target, content, false, expected_sha256);
+    if (std::holds_alternative<Fault>(installed)) {
+        return std::get<Fault>(installed);
+    }
+    return WriteOutput{path.generic,
+                       false,
+                       old_hash,
+                       sha256_hex(content),
+                       0,
+                       content.size()};
 }
 
 }  // namespace agent::workspace
