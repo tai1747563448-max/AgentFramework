@@ -95,4 +95,28 @@ POSIX, route the composition root through it, and correct the environment
 names. Focused MSVC tests pass; WSL warning-as-error tests additionally execute
 the directory-link rejection that the current Windows token cannot create.
 
-Final disconnected full verification remains pending after re-review.
+The independent fix re-review marked every original finding addressed and found
+no new Critical, Important, or Minor issue. Its verdict is **Ready: Yes**.
+
+## Final verification evidence
+
+- Fresh MSVC Debug configure and build succeeded in
+  `build/recovery-final3-vs2022` with `FETCHCONTENT_FULLY_DISCONNECTED=ON` and
+  explicit already-cached dependency source directories.
+- Fresh offline CTest passed 22/22, including the real crash/recovery workflow,
+  credential-free verification/evaluation, and terminal resume process tests.
+- WSL Ubuntu g++ 13 C++17 `-Wall -Wextra -Wpedantic -Werror` builds passed for
+  Reducer, Runtime, evaluator, CLI, and JSONL targets. The POSIX directory-link
+  resume-read rejection executed and passed. WSL Python RAG passed 15/15.
+- Credential-free `run` returned exit 2 with the fixed
+  `AGENT_BASE_URL is required` message before any Provider request.
+  `verify-log` and `evaluate-log` over the completed fixture both returned 0.
+- `ctest -N` listed exactly 22 offline tests and
+  `AGENT_ENABLE_LIVE_TESTS:BOOL=OFF`; the forbidden shell/multi-Agent capability
+  scan returned zero matches.
+- `git diff --check` passed. Local HEAD, upstream, remote-tracking ref, bare
+  backup ref, and `ls-remote` were identical at the verified implementation
+  commit `baad3a7aec0f1213964800304bd74a1dc5a151af`.
+
+No live Provider/network smoke was run. Offline success does not claim live
+Provider availability or model quality.
