@@ -1,14 +1,18 @@
 # Structured Build Tools Review Fixes
 
-Date: 2026-08-21  
-Branch: `feat/structured-build-tools`  
-Reviewed base: `3bc5e1da4428e0f1376426ee89184d2e81f2f29d`  
+Date: 2026-08-21
+
+Branch: `feat/structured-build-tools`
+
+Reviewed base: `3bc5e1da4428e0f1376426ee89184d2e81f2f29d`
+
 Remote: local bare `backup` only; GitHub was not used.
 
 ## Scope
 
-This fix round closes the independent review of the structured CMake build
-milestone. It does not add a shell, arbitrary executable or argument tool,
+This fix round addresses findings from the independent review of the
+structured CMake build milestone. It does not add a shell, arbitrary
+executable or argument tool,
 package management, Git, network access, RAG, recovery, or multi-agent
 behavior. The model-visible tool surface remains exactly the five workspace
 file tools plus `configure_project`, `build_project`, and `run_tests`.
