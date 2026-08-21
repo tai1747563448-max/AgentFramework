@@ -15,6 +15,8 @@ namespace agent {
 
 using RunCommand = std::function<RuntimeResult(
     const RunRequest&, const RuntimeProgressObserver&)>;
+using ResumeCommand = std::function<RuntimeResult(
+    const std::string&, const RuntimeProgressObserver&)>;
 using VerifyCommand =
     std::function<Result<TaskState>(const std::filesystem::path&)>;
 
@@ -48,11 +50,17 @@ public:
            VerifyCommand verify,
            std::ostream& output,
            std::ostream& error);
+    CliApp(RunCommand run,
+           ResumeCommand resume,
+           VerifyCommand verify,
+           std::ostream& output,
+           std::ostream& error);
 
     int execute(const std::vector<std::string>& args);
 
 private:
     RunCommand run_;
+    ResumeCommand resume_;
     VerifyCommand verify_;
     std::ostream& output_;
     std::ostream& error_;

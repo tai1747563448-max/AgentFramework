@@ -146,6 +146,13 @@ add_test(
         "-DEVENT_LOG=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/valid-completed-events.jsonl"
         "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/verify-log-process"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/verify_log_process_test.cmake")
+add_test(
+    NAME resume_terminal_process_local
+    COMMAND ${CMAKE_COMMAND}
+        "-DAGENT_EXE=$<TARGET_FILE:agent>"
+        "-DEVENT_LOG=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/valid-completed-events.jsonl"
+        "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/resume-process"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/resume_process_test.cmake")
 if(Python3_Interpreter_FOUND)
     add_agent_test(rag_integration_tests
         tests/integration/rag_integration_test.cpp)
