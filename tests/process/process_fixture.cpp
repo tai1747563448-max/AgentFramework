@@ -9,6 +9,7 @@
 #endif
 
 #include <chrono>
+#include <cstring>
 #include <cstdlib>
 #include <cwchar>
 #include <filesystem>
@@ -56,10 +57,12 @@ std::wstring quote_windows(const std::wstring& value) {
 }
 
 bool spawn_child(const std::filesystem::path& executable,
-                 const std::filesystem::path& marker,
+                 const std::filesystem::path& ready_marker,
+                 const std::filesystem::path& survival_marker,
                  const std::string& delay) {
     auto command = quote_windows(executable.native()) + L" tree-child " +
-                   quote_windows(marker.native()) + L" " +
+                   quote_windows(ready_marker.native()) + L" " +
+                   quote_windows(survival_marker.native()) + L" " +
                    std::wstring(delay.begin(), delay.end());
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
@@ -76,7 +79,8 @@ bool spawn_child(const std::filesystem::path& executable,
 }
 #else
 bool spawn_child(const std::filesystem::path& executable,
-                 const std::filesystem::path& marker,
+                 const std::filesystem::path& ready_marker,
+                 const std::filesystem::path& survival_marker,
                  const std::string& delay) {
     const pid_t child = fork();
     if (child < 0) {
@@ -84,7 +88,8 @@ bool spawn_child(const std::filesystem::path& executable,
     }
     if (child == 0) {
         execl(executable.c_str(), executable.c_str(), "tree-child",
-              marker.c_str(), delay.c_str(), static_cast<char*>(nullptr));
+              ready_marker.c_str(), survival_marker.c_str(), delay.c_str(),
+              static_cast<char*>(nullptr));
         _exit(127);
     }
     return true;
@@ -138,19 +143,45 @@ int fixture_main(const std::vector<std::string>& arguments) {
         stderr_writer.join();
         return exit_code;
     }
-    if (mode == "tree-child" && arguments.size() == 4) {
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(std::stoll(arguments[3])));
+    if (mode == "raw-invalid" && arguments.size() == 2) {
+        constexpr char invalid[] = {static_cast<char>(0xFF),
+                                    static_cast<char>(0xFF),
+                                    static_cast<char>(0xFF)};
+        std::cout.write(invalid, sizeof(invalid));
+        std::cout.flush();
+        return 0;
+    }
+    if (mode == "raw-mixed" && arguments.size() == 2) {
+        const std::string output =
+            std::string(u8"前🙂") + static_cast<char>(0xFF) + u8"后";
+        std::cout.write(output.data(),
+                        static_cast<std::streamsize>(output.size()));
+        std::cout.flush();
+        return 0;
+    }
+    if (mode == "raw-utf8-boundary" && arguments.size() == 2) {
+        constexpr const char* output = u8"🙂🙂";
+        std::cout.write(output, static_cast<std::streamsize>(std::strlen(output)));
+        std::cout.flush();
+        return 0;
+    }
+    if (mode == "tree-child" && arguments.size() == 5) {
         std::ofstream(std::filesystem::u8path(arguments[2]),
+                      std::ios::binary | std::ios::trunc)
+            << "ready";
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(std::stoll(arguments[4])));
+        std::ofstream(std::filesystem::u8path(arguments[3]),
                       std::ios::binary | std::ios::trunc)
             << "alive";
         return 0;
     }
-    if (mode == "tree-parent" && arguments.size() == 4) {
+    if (mode == "tree-parent" && arguments.size() == 5) {
         if (!spawn_child(
                 std::filesystem::absolute(
                     std::filesystem::u8path(arguments[0])),
-                std::filesystem::u8path(arguments[2]), arguments[3])) {
+                std::filesystem::u8path(arguments[2]),
+                std::filesystem::u8path(arguments[3]), arguments[4])) {
             return 70;
         }
         std::this_thread::sleep_for(std::chrono::seconds(10));

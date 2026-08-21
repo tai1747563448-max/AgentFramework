@@ -27,8 +27,21 @@ constexpr std::size_t kMaxResultBytes = 65'536;
 constexpr std::size_t kProcessStreamBytes = 64U * 1024U;
 constexpr std::size_t kRetainedPrefixCodePoints = 256;
 
-Value string_schema() {
-    return Value::object({{"type", "string"}});
+Value target_schema() {
+    return Value::object(
+        {{"type", "string"},
+         {"minLength", std::int64_t{1}},
+         {"maxLength", std::int64_t{128}},
+         {"pattern", "^[A-Za-z0-9_.+-]+$"}});
+}
+
+Value test_name_schema() {
+    return Value::object(
+        {{"type", "string"},
+         {"minLength", std::int64_t{1}},
+         {"maxLength", std::int64_t{200}},
+         {"description",
+          "1-200 UTF-8 bytes; matched as an exact literal test name."}});
 }
 
 Value configuration_schema() {
@@ -406,11 +419,11 @@ std::vector<ToolDefinition> CMakeToolGateway::definitions() const {
                    required({"configuration"})),
         definition("build_project", "Build the configured CMake workspace.",
                    {{"configuration", configuration_schema()},
-                    {"target", string_schema()}},
+                    {"target", target_schema()}},
                    required({"configuration"})),
         definition("run_tests", "Run CTest in the configured workspace.",
                    {{"configuration", configuration_schema()},
-                    {"test_name", string_schema()}},
+                    {"test_name", test_name_schema()}},
                    required({"configuration"}))};
 }
 

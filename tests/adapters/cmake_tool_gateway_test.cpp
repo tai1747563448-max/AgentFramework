@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <iostream>
 #include <optional>
 #include <string>
 #include <utility>
@@ -102,7 +103,17 @@ TEST_CASE(cmake_gateway_exposes_exact_three_closed_schemas) {
     fixtures::FakeProcessRunner process;
     agent::CMakeToolGateway gateway(process, 123'000);
     const auto definitions = gateway.definitions();
-    const auto string_schema = agent::Value::object({{"type", "string"}});
+    const auto target_schema = agent::Value::object(
+        {{"type", "string"},
+         {"minLength", std::int64_t{1}},
+         {"maxLength", std::int64_t{128}},
+         {"pattern", "^[A-Za-z0-9_.+-]+$"}});
+    const auto test_name_schema = agent::Value::object(
+        {{"type", "string"},
+         {"minLength", std::int64_t{1}},
+         {"maxLength", std::int64_t{200}},
+         {"description",
+          "1-200 UTF-8 bytes; matched as an exact literal test name."}});
     const std::vector<agent::ToolDefinition> expected{
         {"configure_project", "Configure the trusted workspace with CMake.",
          fixtures::object_schema(
@@ -111,12 +122,12 @@ TEST_CASE(cmake_gateway_exposes_exact_three_closed_schemas) {
         {"build_project", "Build the configured CMake workspace.",
          fixtures::object_schema(
              {{"configuration", fixtures::configuration_schema()},
-              {"target", string_schema}},
+              {"target", target_schema}},
              {"configuration"})},
         {"run_tests", "Run CTest in the configured workspace.",
          fixtures::object_schema(
              {{"configuration", fixtures::configuration_schema()},
-              {"test_name", string_schema}},
+              {"test_name", test_name_schema}},
              {"configuration"})}};
     REQUIRE(definitions == expected);
 }
@@ -266,6 +277,56 @@ TEST_CASE(cmake_gateway_canonicalizes_a_relative_workspace_before_execution) {
     REQUIRE(process.requests.size() == 1);
     REQUIRE(process.requests.front().working_directory ==
             std::filesystem::weakly_canonical(temp.path()));
+}
+
+TEST_CASE(cmake_gateway_rejects_linked_workspace_and_build_directories) {
+    test::ScopedTempDir temp("cmake-linked-directories");
+    const auto actual_root = temp.path() / "actual-root";
+    const auto root_alias = temp.path() / "root-alias";
+    const auto agent_link_root = temp.path() / "agent-link-root";
+    const auto build_link_root = temp.path() / "build-link-root";
+    const auto outside_agent = temp.path() / "outside-agent";
+    const auto outside_build = temp.path() / "outside-build";
+    std::filesystem::create_directories(actual_root);
+    std::filesystem::create_directories(agent_link_root);
+    std::filesystem::create_directories(build_link_root / ".agent");
+    std::filesystem::create_directories(outside_agent);
+    std::filesystem::create_directories(outside_build);
+
+    std::error_code error;
+    std::filesystem::create_directory_symlink(actual_root, root_alias, error);
+    if (error) {
+        std::cout << "SKIP CMake gateway link guards: environment cannot "
+                     "create directory symlinks\n";
+        return;
+    }
+    std::filesystem::create_directory_symlink(
+        outside_agent, agent_link_root / ".agent", error);
+    if (error) {
+        std::cout << "SKIP CMake gateway link guards: environment cannot "
+                     "create .agent symlink\n";
+        return;
+    }
+    std::filesystem::create_directory_symlink(
+        outside_build, build_link_root / ".agent/cmake-build", error);
+    if (error) {
+        std::cout << "SKIP CMake gateway link guards: environment cannot "
+                     "create build symlink\n";
+        return;
+    }
+
+    fixtures::FakeProcessRunner process;
+    agent::CMakeToolGateway gateway(process, 123'000);
+    const auto configure = fixtures::call(
+        "configure", "configure_project", {{"configuration", "Debug"}});
+    for (const auto& workspace :
+         {root_alias, agent_link_root, build_link_root}) {
+        const agent::ToolExecutionContext context{
+            workspace.generic_u8string()};
+        REQUIRE(fixtures::error_code(gateway.execute(configure, context)) ==
+                "access_denied");
+    }
+    REQUIRE(process.requests.empty());
 }
 
 TEST_CASE(cmake_gateway_returns_bounded_process_failure_evidence) {

@@ -90,6 +90,23 @@ TEST_CASE(real_cmake_gateway_configures_builds_tests_and_returns_failure_evidenc
     REQUIRE(failed.at("exit_code").get<std::int64_t>() != 0);
     REQUIRE(failed.at("timed_out") == false);
 
+    temp.write_text("tiny_test.cpp", "int main() { return 0; }\n");
+    result = build_gateway.execute(
+        fixtures::call("build-recovered", "build_project",
+                       {{"configuration", "Debug"},
+                        {"target", "tiny_test"}}),
+        context);
+    REQUIRE(result.has_value() && !result.value().is_error);
+    REQUIRE(fixtures::content_json(result).at("exit_code") == 0);
+
+    result = build_gateway.execute(
+        fixtures::call("test-recovered", "run_tests",
+                       {{"configuration", "Debug"},
+                        {"test_name", "tiny.pass[1]"}}),
+        context);
+    REQUIRE(result.has_value() && !result.value().is_error);
+    REQUIRE(fixtures::content_json(result).at("exit_code") == 0);
+
     agent::WorkspaceToolGateway files(temp.path() / "runtime_data");
     const auto listed = files.execute(
         fixtures::call("list", "list_files", {{"path", "."}}), context);

@@ -1,4 +1,5 @@
 #include "adapters/process/direct_process_runner.h"
+#include "adapters/workspace/workspace_text.h"
 #include "ports/process_runner.h"
 #include "test_support.h"
 
@@ -120,13 +121,70 @@ TEST_CASE(direct_process_bounds_concurrent_stdout_and_stderr) {
     REQUIRE(result.value().stderr_utf8.back() == 'T');
 }
 
+TEST_CASE(direct_process_marks_normalization_loss_as_truncation) {
+    test::ScopedTempDir temp("process-invalid-output");
+    agent::DirectProcessRunner runner;
+    auto process = fixtures::request(temp.path(), {"raw-invalid"});
+    process.max_stdout_bytes = 4;
+
+    const auto result = runner.run(process);
+    REQUIRE(result.has_value());
+    REQUIRE(result.value().exit_code == 0);
+    REQUIRE(!result.value().timed_out);
+    REQUIRE(result.value().stdout_utf8 == "\xEF\xBF\xBD");
+    REQUIRE(result.value().stdout_utf8.size() <= 4);
+    REQUIRE(result.value().stdout_truncated);
+}
+
+TEST_CASE(direct_process_preserves_valid_utf8_around_invalid_bytes) {
+    test::ScopedTempDir temp("process-mixed-output");
+    agent::DirectProcessRunner runner;
+    const auto process = fixtures::request(temp.path(), {"raw-mixed"});
+
+    const auto result = runner.run(process);
+    REQUIRE(result.has_value());
+    REQUIRE(result.value().exit_code == 0);
+    REQUIRE(result.value().stdout_utf8 ==
+            std::string(u8"前🙂") + "\xEF\xBF\xBD" + u8"后");
+    REQUIRE(!result.value().stdout_truncated);
+}
+
+TEST_CASE(direct_process_never_splits_utf8_at_the_capture_budget) {
+    test::ScopedTempDir temp("process-utf8-boundary");
+    agent::DirectProcessRunner runner;
+    auto process = fixtures::request(temp.path(), {"raw-utf8-boundary"});
+    process.max_stdout_bytes = 7;
+
+    const auto result = runner.run(process);
+    REQUIRE(result.has_value());
+    REQUIRE(result.value().stdout_utf8.size() <= 7);
+    REQUIRE(agent::workspace::is_strict_utf8_text(result.value().stdout_utf8));
+    REQUIRE(result.value().stdout_truncated);
+}
+
+#if defined(_WIN32)
+TEST_CASE(direct_process_reports_windows_exit_codes_with_signed_semantics) {
+    test::ScopedTempDir temp("process-negative-exit");
+    agent::DirectProcessRunner runner;
+    const auto process =
+        fixtures::request(temp.path(), {"spam", "0", "0", "-1"});
+
+    const auto result = runner.run(process);
+    REQUIRE(result.has_value());
+    REQUIRE(!result.value().timed_out);
+    REQUIRE(result.value().exit_code == -1);
+}
+#endif
+
 TEST_CASE(direct_process_timeout_kills_the_descendant_tree) {
     test::ScopedTempDir temp("process-timeout");
     agent::DirectProcessRunner runner;
-    const auto marker = temp.path() / "descendant-marker.txt";
+    const auto ready_marker = temp.path() / "descendant-ready.txt";
+    const auto survival_marker = temp.path() / "descendant-survived.txt";
     auto process = fixtures::request(
-        temp.path(), {"tree-parent", marker.generic_u8string(), "500"});
-    process.timeout_ms = 100;
+        temp.path(), {"tree-parent", ready_marker.generic_u8string(),
+                      survival_marker.generic_u8string(), "3000"});
+    process.timeout_ms = 1'500;
     const auto started = std::chrono::steady_clock::now();
 
     const auto result = runner.run(process);
@@ -135,8 +193,9 @@ TEST_CASE(direct_process_timeout_kills_the_descendant_tree) {
     REQUIRE(result.has_value());
     REQUIRE(result.value().timed_out);
     REQUIRE(elapsed < std::chrono::seconds(5));
-    std::this_thread::sleep_for(std::chrono::milliseconds(700));
-    REQUIRE(!std::filesystem::exists(marker));
+    REQUIRE(std::filesystem::exists(ready_marker));
+    std::this_thread::sleep_for(std::chrono::milliseconds(3'200));
+    REQUIRE(!std::filesystem::exists(survival_marker));
 }
 
 TEST_CASE(direct_process_missing_program_returns_a_fixed_error) {

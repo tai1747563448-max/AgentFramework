@@ -66,7 +66,9 @@ add_library(agent_runtime STATIC
     src/config/runtime_config.cpp
     src/cli/cli_app.cpp)
 target_include_directories(agent_runtime PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_link_libraries(agent_runtime PUBLIC agent_kernel PRIVATE dotenv_header_only)
+target_link_libraries(agent_runtime
+    PUBLIC agent_kernel Threads::Threads
+    PRIVATE dotenv_header_only)
 if(MSVC)
     target_compile_options(agent_runtime PRIVATE /W4 /permissive- /utf-8)
     target_compile_definitions(agent_runtime PRIVATE _CRT_SECURE_NO_WARNINGS)

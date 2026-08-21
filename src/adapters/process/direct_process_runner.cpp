@@ -15,6 +15,7 @@
 #endif
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -150,34 +151,13 @@ bool valid_utf8_unit(std::string_view text,
     return false;
 }
 
-std::string normalized_utf8(std::string bytes, std::size_t budget) {
-#if defined(_WIN32)
-    if (!workspace::is_strict_utf8_text(bytes) && !bytes.empty() &&
-        bytes.size() <= static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-        const int wide_size = MultiByteToWideChar(
-            CP_ACP, 0, bytes.data(), static_cast<int>(bytes.size()), nullptr, 0);
-        if (wide_size > 0) {
-            std::wstring wide(static_cast<std::size_t>(wide_size), L'\0');
-            if (MultiByteToWideChar(CP_ACP, 0, bytes.data(),
-                                    static_cast<int>(bytes.size()), wide.data(),
-                                    wide_size) == wide_size) {
-                const int utf8_size = WideCharToMultiByte(
-                    CP_UTF8, 0, wide.data(), wide_size, nullptr, 0, nullptr,
-                    nullptr);
-                if (utf8_size > 0) {
-                    std::string converted(static_cast<std::size_t>(utf8_size),
-                                          '\0');
-                    if (WideCharToMultiByte(
-                            CP_UTF8, 0, wide.data(), wide_size,
-                            converted.data(), utf8_size, nullptr,
-                            nullptr) == utf8_size) {
-                        bytes = std::move(converted);
-                    }
-                }
-            }
-        }
-    }
-#endif
+struct NormalizedOutput final {
+    std::string text;
+    bool truncated{false};
+};
+
+NormalizedOutput normalized_utf8(const std::string& bytes,
+                                 std::size_t budget) {
     std::string output;
     output.reserve(std::min(bytes.size(), budget));
     constexpr std::string_view replacement = "\xEF\xBF\xBD";
@@ -185,19 +165,19 @@ std::string normalized_utf8(std::string bytes, std::size_t budget) {
         std::size_t length = 1;
         if (valid_utf8_unit(bytes, offset, length)) {
             if (length > budget - output.size()) {
-                break;
+                return {std::move(output), true};
             }
             output.append(bytes, offset, length);
             offset += length;
         } else {
             if (replacement.size() > budget - output.size()) {
-                break;
+                return {std::move(output), true};
             }
             output.append(replacement);
             ++offset;
         }
     }
-    return output;
+    return {std::move(output), false};
 }
 
 bool valid_request(const ProcessRequest& request) {
@@ -542,15 +522,22 @@ Result<ProcessOutput> run_native(const ProcessRequest& request) {
         std::chrono::steady_clock::now() - started_at);
 
     ProcessOutput output;
-    output.exit_code = timed_out ? -1 : static_cast<std::int64_t>(exit_code);
+    output.exit_code =
+        timed_out
+            ? -1
+            : static_cast<std::int64_t>(static_cast<std::int32_t>(exit_code));
     output.timed_out = timed_out;
     output.duration_ms = duration.count();
-    output.stdout_utf8 = normalized_utf8(stdout_collector.bytes(),
-                                         request.max_stdout_bytes);
-    output.stderr_utf8 = normalized_utf8(stderr_collector.bytes(),
-                                         request.max_stderr_bytes);
-    output.stdout_truncated = stdout_collector.truncated();
-    output.stderr_truncated = stderr_collector.truncated();
+    auto normalized_stdout = normalized_utf8(stdout_collector.bytes(),
+                                             request.max_stdout_bytes);
+    auto normalized_stderr = normalized_utf8(stderr_collector.bytes(),
+                                             request.max_stderr_bytes);
+    output.stdout_utf8 = std::move(normalized_stdout.text);
+    output.stderr_utf8 = std::move(normalized_stderr.text);
+    output.stdout_truncated =
+        stdout_collector.truncated() || normalized_stdout.truncated;
+    output.stderr_truncated =
+        stderr_collector.truncated() || normalized_stderr.truncated;
     return Result<ProcessOutput>::success(std::move(output));
 }
 
@@ -594,6 +581,12 @@ bool make_pipe(UniqueFd& read, UniqueFd& write) {
     }
     read.reset(values[0]);
     write.reset(values[1]);
+    for (const int fd : values) {
+        const int flags = fcntl(fd, F_GETFD);
+        if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) != 0) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -646,6 +639,60 @@ std::vector<std::pair<std::string, std::string>> safe_environment(
     return {values.begin(), values.end()};
 }
 
+std::optional<std::string> resolved_executable(
+    const ProcessRequest& request,
+    const std::vector<std::pair<std::string, std::string>>& environment) {
+    const auto executable = std::filesystem::u8path(request.program);
+    const auto executable_name = executable.filename();
+    if (executable_name.empty()) {
+        return std::nullopt;
+    }
+    const auto usable = [](const std::filesystem::path& candidate) {
+        return access(candidate.c_str(), X_OK) == 0;
+    };
+    if (request.program.find('/') != std::string::npos) {
+        const auto candidate =
+            (executable.is_absolute()
+                 ? executable
+                 : request.working_directory / executable)
+                .lexically_normal();
+        return usable(candidate)
+                   ? std::optional<std::string>(candidate.generic_u8string())
+                   : std::nullopt;
+    }
+
+    std::string path_value = "/usr/local/bin:/usr/bin:/bin";
+    const auto found = std::find_if(
+        environment.begin(), environment.end(),
+        [](const auto& entry) { return entry.first == "PATH"; });
+    if (found != environment.end()) {
+        path_value = found->second;
+    }
+    std::size_t offset = 0;
+    for (;;) {
+        const auto delimiter = path_value.find(':', offset);
+        const auto length = delimiter == std::string::npos
+                                ? std::string::npos
+                                : delimiter - offset;
+        const auto entry = path_value.substr(offset, length);
+        auto directory = entry.empty() ? request.working_directory
+                                       : std::filesystem::u8path(entry);
+        if (directory.is_relative()) {
+            directory = request.working_directory / directory;
+        }
+        const auto candidate =
+            (directory / executable_name).lexically_normal();
+        if (usable(candidate)) {
+            return candidate.generic_u8string();
+        }
+        if (delimiter == std::string::npos) {
+            break;
+        }
+        offset = delimiter + 1;
+    }
+    return std::nullopt;
+}
+
 Result<ProcessOutput> run_native(const ProcessRequest& request) {
     UniqueFd stdout_read, stdout_write;
     UniqueFd stderr_read, stderr_write;
@@ -657,40 +704,70 @@ Result<ProcessOutput> run_native(const ProcessRequest& request) {
         !make_pipe(exec_read, exec_write)) {
         return Result<ProcessOutput>::failure(execution_failure());
     }
-    fcntl(exec_write.get(), F_SETFD, FD_CLOEXEC);
     const auto environment = safe_environment(request);
+    const auto executable = resolved_executable(request, environment);
+    if (!executable.has_value()) {
+        return Result<ProcessOutput>::failure(start_failure());
+    }
+    std::vector<std::string> environment_storage;
+    environment_storage.reserve(environment.size());
+    for (const auto& entry : environment) {
+        environment_storage.push_back(entry.first + "=" + entry.second);
+    }
+    std::vector<char*> environment_pointers;
+    environment_pointers.reserve(environment_storage.size() + 1);
+    for (auto& entry : environment_storage) {
+        environment_pointers.push_back(entry.data());
+    }
+    environment_pointers.push_back(nullptr);
+
+    std::vector<char*> argument_pointers;
+    argument_pointers.reserve(request.arguments.size() + 2);
+    argument_pointers.push_back(const_cast<char*>(request.program.c_str()));
+    for (const auto& argument : request.arguments) {
+        argument_pointers.push_back(const_cast<char*>(argument.c_str()));
+    }
+    argument_pointers.push_back(nullptr);
+
     const auto started_at = std::chrono::steady_clock::now();
     const pid_t child = fork();
     if (child < 0) {
         return Result<ProcessOutput>::failure(start_failure());
     }
     if (child == 0) {
-        setpgid(0, 0);
-        dup2(stdin_read.get(), STDIN_FILENO);
-        dup2(stdout_write.get(), STDOUT_FILENO);
-        dup2(stderr_write.get(), STDERR_FILENO);
-        if (chdir(request.working_directory.c_str()) != 0) {
+        const auto child_failure = [&](int exit_code) {
             const int code = 1;
-            write(exec_write.get(), &code, sizeof(code));
-            _exit(126);
+            const auto ignored = write(exec_write.get(), &code, sizeof(code));
+            static_cast<void>(ignored);
+            _exit(exit_code);
+        };
+        if (setpgid(0, 0) != 0 ||
+            dup2(stdin_read.get(), STDIN_FILENO) < 0 ||
+            dup2(stdout_write.get(), STDOUT_FILENO) < 0 ||
+            dup2(stderr_write.get(), STDERR_FILENO) < 0) {
+            child_failure(126);
         }
-        clearenv();
-        for (const auto& entry : environment) {
-            setenv(entry.first.c_str(), entry.second.c_str(), 1);
+        const int descriptors[] = {
+            stdin_read.get(),  stdin_write.get(), stdout_read.get(),
+            stdout_write.get(), stderr_read.get(), stderr_write.get(),
+            exec_read.get()};
+        for (const int descriptor : descriptors) {
+            if (descriptor > STDERR_FILENO) {
+                close(descriptor);
+            }
         }
-        std::vector<char*> arguments;
-        arguments.reserve(request.arguments.size() + 2);
-        arguments.push_back(const_cast<char*>(request.program.c_str()));
-        for (const auto& argument : request.arguments) {
-            arguments.push_back(const_cast<char*>(argument.c_str()));
+        if (chdir(request.working_directory.c_str()) != 0) {
+            child_failure(126);
         }
-        arguments.push_back(nullptr);
-        execvp(request.program.c_str(), arguments.data());
-        const int code = 1;
-        write(exec_write.get(), &code, sizeof(code));
-        _exit(127);
+        execve(executable->c_str(), argument_pointers.data(),
+               environment_pointers.data());
+        child_failure(127);
     }
-    setpgid(child, child);
+    if (setpgid(child, child) != 0 && errno != EACCES && errno != ESRCH) {
+        kill(child, SIGKILL);
+        waitpid(child, nullptr, 0);
+        return Result<ProcessOutput>::failure(start_failure());
+    }
     stdin_read.reset();
     stdout_write.reset();
     stderr_write.reset();
@@ -755,12 +832,16 @@ Result<ProcessOutput> run_native(const ProcessRequest& request) {
     output.exit_code = exit_code;
     output.timed_out = timed_out;
     output.duration_ms = duration.count();
-    output.stdout_utf8 = normalized_utf8(stdout_collector.bytes(),
-                                         request.max_stdout_bytes);
-    output.stderr_utf8 = normalized_utf8(stderr_collector.bytes(),
-                                         request.max_stderr_bytes);
-    output.stdout_truncated = stdout_collector.truncated();
-    output.stderr_truncated = stderr_collector.truncated();
+    auto normalized_stdout = normalized_utf8(stdout_collector.bytes(),
+                                             request.max_stdout_bytes);
+    auto normalized_stderr = normalized_utf8(stderr_collector.bytes(),
+                                             request.max_stderr_bytes);
+    output.stdout_utf8 = std::move(normalized_stdout.text);
+    output.stderr_utf8 = std::move(normalized_stderr.text);
+    output.stdout_truncated =
+        stdout_collector.truncated() || normalized_stdout.truncated;
+    output.stderr_truncated =
+        stderr_collector.truncated() || normalized_stderr.truncated;
     return Result<ProcessOutput>::success(std::move(output));
 }
 
