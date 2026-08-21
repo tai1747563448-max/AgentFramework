@@ -11,6 +11,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cmath>
 #include <filesystem>
 #include <initializer_list>
 #include <optional>
@@ -118,6 +119,110 @@ bool has_exact_keys(const nlohmann::json& object,
     return true;
 }
 
+bool citation_path_is_valid(const std::string& path) noexcept {
+    if (path.empty() || path.size() > 512 || path.front() == '/' ||
+        path.find('\\') != std::string::npos ||
+        path.find(':') != std::string::npos ||
+        !workspace::is_strict_utf8_text(path)) {
+        return false;
+    }
+
+    std::size_t component_start = 0;
+    while (component_start < path.size()) {
+        const auto separator = path.find('/', component_start);
+        const auto component_end = separator == std::string::npos
+                                       ? path.size()
+                                       : separator;
+        const auto length = component_end - component_start;
+        if (length == 0 ||
+            (length == 1 && path[component_start] == '.') ||
+            (length == 2 && path[component_start] == '.' &&
+             path[component_start + 1] == '.')) {
+            return false;
+        }
+        for (std::size_t index = component_start; index < component_end;
+             ++index) {
+            const auto byte = static_cast<unsigned char>(path[index]);
+            if (byte < 0x20U || byte == 0x7FU) {
+                return false;
+            }
+        }
+        if (separator == std::string::npos) {
+            return true;
+        }
+        component_start = separator + 1;
+    }
+    return false;
+}
+
+bool sha256_is_lower_hex(const std::string& digest) noexcept {
+    if (digest.size() != 64) {
+        return false;
+    }
+    for (const char character : digest) {
+        const bool decimal = character >= '0' && character <= '9';
+        const bool lower_hex = character >= 'a' && character <= 'f';
+        if (!decimal && !lower_hex) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool source_id_matches(const std::string& source_id,
+                       const std::string& path,
+                       std::int64_t start_line,
+                       std::int64_t end_line) {
+    const auto base = path + "#L" + std::to_string(start_line) + "-L" +
+                      std::to_string(end_line);
+    if (source_id == base) {
+        return true;
+    }
+    const auto part_prefix = base + "-P";
+    if (start_line != end_line ||
+        source_id.compare(0, part_prefix.size(), part_prefix) != 0 ||
+        source_id.size() == part_prefix.size() ||
+        source_id[part_prefix.size()] < '1' ||
+        source_id[part_prefix.size()] > '9') {
+        return false;
+    }
+    for (std::size_t index = part_prefix.size() + 1;
+         index < source_id.size(); ++index) {
+        if (source_id[index] < '0' || source_id[index] > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool citation_is_valid(const nlohmann::json& item) {
+    const auto& metadata = item.at("metadata");
+    if (!has_exact_keys(metadata, {"path", "start_line", "end_line",
+                                   "sha256", "score"}) ||
+        !metadata.at("path").is_string() ||
+        !metadata.at("start_line").is_number_integer() ||
+        !metadata.at("end_line").is_number_integer() ||
+        !metadata.at("sha256").is_string() ||
+        !metadata.at("score").is_number()) {
+        return false;
+    }
+
+    const auto& path = metadata.at("path").get_ref<const std::string&>();
+    const auto start_line = metadata.at("start_line").get<std::int64_t>();
+    const auto end_line = metadata.at("end_line").get<std::int64_t>();
+    const auto& digest =
+        metadata.at("sha256").get_ref<const std::string&>();
+    const auto score = metadata.at("score").get<double>();
+    const auto& content = item.at("content").get_ref<const std::string&>();
+    const auto& source_id =
+        item.at("source_id").get_ref<const std::string&>();
+    return citation_path_is_valid(path) && start_line > 0 &&
+           end_line >= start_line && sha256_is_lower_hex(digest) &&
+           digest == workspace::sha256_hex(content) && std::isfinite(score) &&
+           score >= 0.0 &&
+           source_id_matches(source_id, path, start_line, end_line);
+}
+
 Result<EvidencePack> decode_response(const std::string& text,
                                      std::size_t top_k) {
     try {
@@ -169,7 +274,8 @@ Result<EvidencePack> decode_response(const std::string& text,
             if (!has_exact_keys(item, {"source_id", "content", "metadata"}) ||
                 !item.at("source_id").is_string() ||
                 !item.at("content").is_string() ||
-                !item.at("metadata").is_object()) {
+                !item.at("metadata").is_object() ||
+                !citation_is_valid(item)) {
                 return Result<EvidencePack>::failure(invalid_response());
             }
             auto metadata = value_from_json(item.at("metadata"));

@@ -1,4 +1,5 @@
 #include "adapters/rag/python_rag_knowledge_provider.h"
+#include "adapters/workspace/workspace_text.h"
 #include "ports/process_runner.h"
 #include "test_support.h"
 
@@ -53,16 +54,29 @@ agent::TaskState state(std::string issue = u8"修复 parseIssue 中的 warning")
     return value;
 }
 
-nlohmann::json item(std::string source_id = "guide.md#L10-L24",
-                    std::string content = u8"证据 parseIssue") {
+nlohmann::json citation(std::string path,
+                        std::int64_t start_line,
+                        std::int64_t end_line,
+                        std::string content,
+                        std::optional<std::size_t> part = std::nullopt) {
+    const auto digest = agent::workspace::sha256_hex(content);
+    auto source_id = path + "#L" + std::to_string(start_line) + "-L" +
+                     std::to_string(end_line);
+    if (part.has_value()) {
+        source_id += "-P" + std::to_string(*part);
+    }
     return {{"source_id", std::move(source_id)},
             {"content", std::move(content)},
             {"metadata",
-             {{"path", "guide.md"},
-              {"start_line", 10},
-              {"end_line", 24},
-              {"sha256", std::string(64, 'a')},
+             {{"path", std::move(path)},
+              {"start_line", start_line},
+              {"end_line", end_line},
+              {"sha256", digest},
               {"score", 3.125}}}};
+}
+
+nlohmann::json item() {
+    return citation("guide.md", 10, 24, u8"证据 parseIssue");
 }
 
 std::string response(std::vector<nlohmann::json> items = {item()}) {
@@ -116,31 +130,103 @@ TEST_CASE(python_rag_adapter_sends_one_exact_bounded_process_request) {
     }
 }
 
-TEST_CASE(python_rag_adapter_preserves_item_order_and_recursive_metadata) {
+TEST_CASE(python_rag_adapter_preserves_item_order_and_exact_metadata) {
     fixtures::Files files("mapping");
     fixtures::FakeProcessRunner process;
-    auto first = fixtures::item("a.cpp#L1-L2", "first");
-    first["metadata"] = nlohmann::json{
-        {"path", "a.cpp"},
-        {"nested", nlohmann::json::array({true, nullptr, 7, 1.5})}};
-    auto second = fixtures::item("文档.md#L3-L4", u8"第二条");
-    process.output.stdout_utf8 = fixtures::response({first, second});
+    auto first = fixtures::citation("a.cpp", 1, 2, "first");
+    first["metadata"]["score"] = 1.5;
+    auto second = fixtures::citation(u8"文档.md", 3, 4, u8"第二条");
+    second["metadata"]["score"] = 1;
+    auto split = fixtures::citation(
+        "generated.txt", 7, 7, "split line", std::size_t{2});
+    split["metadata"]["score"] = 0.5;
+    process.output.stdout_utf8 = fixtures::response({first, second, split});
     agent::PythonRagKnowledgeProvider provider(process, files.config());
 
     const auto result = provider.retrieve(fixtures::state());
 
     REQUIRE(result.has_value());
-    REQUIRE(result.value().items.size() == 2);
+    REQUIRE(result.value().items.size() == 3);
     REQUIRE(result.value().items[0].source_id == "a.cpp#L1-L2");
     REQUIRE(result.value().items[0].content == "first");
     REQUIRE(result.value().items[0].metadata == agent::Value::object(
-                {{"nested", agent::Value::array(
-                                {agent::Value(true), agent::Value(),
-                                 agent::Value(std::int64_t{7}),
-                                 agent::Value(1.5)})},
-                 {"path", agent::Value("a.cpp")}}));
+                {{"end_line", agent::Value(std::int64_t{2})},
+                 {"path", agent::Value("a.cpp")},
+                 {"score", agent::Value(1.5)},
+                 {"sha256", agent::Value(agent::workspace::sha256_hex("first"))},
+                 {"start_line", agent::Value(std::int64_t{1})}}));
     REQUIRE(result.value().items[1].source_id == u8"文档.md#L3-L4");
     REQUIRE(result.value().items[1].content == u8"第二条");
+    REQUIRE(result.value().items[2].source_id ==
+            "generated.txt#L7-L7-P2");
+}
+
+TEST_CASE(python_rag_adapter_rejects_forged_citation_metadata) {
+    fixtures::Files files("forged-citation");
+    const auto valid = fixtures::item();
+    std::vector<nlohmann::json> invalid;
+
+    auto missing_key = valid;
+    missing_key["metadata"].erase("score");
+    invalid.push_back(std::move(missing_key));
+    auto extra_key = valid;
+    extra_key["metadata"]["extra"] = true;
+    invalid.push_back(std::move(extra_key));
+
+    for (const auto& path : {"C:/private.md", "/private.md", "../private.md",
+                             "docs/../private.md", "docs\\private.md"}) {
+        auto item = valid;
+        item["metadata"]["path"] = path;
+        item["source_id"] = std::string(path) + "#L10-L24";
+        invalid.push_back(std::move(item));
+    }
+
+    const std::vector<std::pair<nlohmann::json, std::string>> invalid_lines{
+        {nlohmann::json(0), "guide.md#L0-L24"},
+        {nlohmann::json(-1), "guide.md#L-1-L24"},
+        {nlohmann::json(1.5), "guide.md#L1-L24"},
+        {nlohmann::json(true), "guide.md#L1-L24"}};
+    for (const auto& line : invalid_lines) {
+        auto item = valid;
+        item["metadata"]["start_line"] = line.first;
+        item["source_id"] = line.second;
+        invalid.push_back(std::move(item));
+    }
+    auto reversed_lines = valid;
+    reversed_lines["metadata"]["start_line"] = 25;
+    reversed_lines["metadata"]["end_line"] = 24;
+    reversed_lines["source_id"] = "guide.md#L25-L24";
+    invalid.push_back(std::move(reversed_lines));
+
+    for (const auto& sha : std::vector<std::string>{
+             "not-a-sha", std::string(64, 'A'), std::string(64, '0')}) {
+        auto item = valid;
+        item["metadata"]["sha256"] = sha;
+        invalid.push_back(std::move(item));
+    }
+    for (const auto& score : {nlohmann::json(-1), nlohmann::json(true),
+                              nlohmann::json("high")}) {
+        auto item = valid;
+        item["metadata"]["score"] = score;
+        invalid.push_back(std::move(item));
+    }
+
+    for (const auto& source_id : {"forged-citation", "other.md#L10-L24",
+                                  "guide.md#L9-L24", "guide.md#L10-L24-P0",
+                                  "guide.md#L10-L24-P1"}) {
+        auto item = valid;
+        item["source_id"] = source_id;
+        invalid.push_back(std::move(item));
+    }
+
+    for (const auto& item : invalid) {
+        fixtures::FakeProcessRunner process;
+        process.output.stdout_utf8 = fixtures::response({item});
+        agent::PythonRagKnowledgeProvider provider(process, files.config());
+        fixtures::require_fixed_error(
+            provider.retrieve(fixtures::state()),
+            agent::ErrorCode::ProtocolFailure, "invalid rag response", false);
+    }
 }
 
 TEST_CASE(python_rag_adapter_maps_process_failures_without_leaking_raw_text) {
@@ -270,49 +356,64 @@ TEST_CASE(python_rag_adapter_rejects_top_k_duplicates_utf8_and_bounds) {
     fixtures::Files files("response-bounds");
     auto config = files.config();
     config.top_k = 1;
+
+    {
+        fixtures::FakeProcessRunner process;
+        process.output.stdout_utf8 = fixtures::response(
+            {fixtures::citation("a.md", 1, 1, "a"),
+             fixtures::citation("b.md", 1, 1, "b")});
+        agent::PythonRagKnowledgeProvider provider(process, config);
+        fixtures::require_fixed_error(
+            provider.retrieve(fixtures::state()),
+            agent::ErrorCode::ProtocolFailure, "invalid rag response", false);
+    }
+
+    config.top_k = 5;
+    const auto long_path = std::string(507, 's');
+    const auto long_source =
+        fixtures::citation(long_path, 1, 1, "content");
+    REQUIRE(long_source.at("source_id").get<std::string>().size() == 513);
     std::vector<std::string> bad_responses{
-        fixtures::response({fixtures::item("a", "a"),
-                            fixtures::item("b", "b")}),
-        fixtures::response({fixtures::item("same"),
-                            fixtures::item("same")}),
-        fixtures::response({fixtures::item("source", "")}),
+        fixtures::response({fixtures::item(), fixtures::item()}),
+        fixtures::response({fixtures::citation("empty.md", 1, 1, "")}),
+        fixtures::response({fixtures::citation(
+            "oversized.md", 1, 1, std::string(8'193, 'x'))}),
+        fixtures::response({long_source}),
         fixtures::response(
-            {fixtures::item("source", std::string(8'193, 'x'))}),
-        fixtures::response({fixtures::item(
-            std::string(513, 's'), "content")}),
-        fixtures::response({fixtures::item("source", "content")})};
+            {fixtures::citation("utf8.md", 1, 1, "content")})};
     const std::string content_prefix = "\"content\":\"";
     bad_responses.back().insert(
         bad_responses.back().find(content_prefix) + content_prefix.size(),
         std::string(1, static_cast<char>(0xFF)));
 
-    for (const auto& output : bad_responses) {
+    for (std::size_t index = 0; index < bad_responses.size(); ++index) {
         fixtures::FakeProcessRunner process;
-        process.output.stdout_utf8 = output;
+        process.output.stdout_utf8 = bad_responses.at(index);
         agent::PythonRagKnowledgeProvider provider(process, config);
+        const auto result = provider.retrieve(fixtures::state());
+        if (result.has_value()) {
+            throw std::runtime_error(
+                "response-bound case unexpectedly succeeded: " +
+                std::to_string(index));
+        }
         fixtures::require_fixed_error(
-            provider.retrieve(fixtures::state()),
+            result,
             agent::ErrorCode::ProtocolFailure, "invalid rag response", false);
     }
 
     config.top_k = 20;
     std::vector<nlohmann::json> total_too_large;
     for (std::size_t index = 0; index < 5; ++index) {
-        total_too_large.push_back(fixtures::item(
-            "source-" + std::to_string(index), std::string(7'000, 'x')));
+        total_too_large.push_back(fixtures::citation(
+            "source-" + std::to_string(index) + ".md", 1, 1,
+            std::string(7'000, 'x')));
     }
-    auto bad_metadata = fixtures::item("metadata", "content");
-    bad_metadata["metadata"] = {{"text", std::string(4'097, 'x')}};
-    for (const auto& output :
-         std::vector<std::string>{fixtures::response(total_too_large),
-                                  fixtures::response({bad_metadata})}) {
-        fixtures::FakeProcessRunner process;
-        process.output.stdout_utf8 = output;
-        agent::PythonRagKnowledgeProvider provider(process, config);
-        fixtures::require_fixed_error(
-            provider.retrieve(fixtures::state()),
-            agent::ErrorCode::ProtocolFailure, "invalid rag response", false);
-    }
+    fixtures::FakeProcessRunner process;
+    process.output.stdout_utf8 = fixtures::response(total_too_large);
+    agent::PythonRagKnowledgeProvider provider(process, config);
+    fixtures::require_fixed_error(
+        provider.retrieve(fixtures::state()),
+        agent::ErrorCode::ProtocolFailure, "invalid rag response", false);
 }
 
 TEST_CASE(python_rag_adapter_rejects_linked_or_nonregular_inputs) {

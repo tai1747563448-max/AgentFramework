@@ -55,4 +55,3 @@ def response_json(items: list[dict[str, object]]) -> str:
         separators=(",", ":"),
         allow_nan=False,
     )
-

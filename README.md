@@ -122,16 +122,21 @@ from the repository root in PowerShell:
 $python = (Get-Command python).Source
 $script = (Resolve-Path .\rag\agent_rag_cli.py).Path
 & $python -E -s -X utf8 $script build `
-  --source . `
+  --source .\docs `
   --index .\.rag\knowledge.sqlite3
 $index = (Resolve-Path .\.rag\knowledge.sqlite3).Path
 ```
 
-The builder accepts a bounded set of text/code extensions, skips secrets and
-protected directories, rejects links and multiply linked files, chunks in
-stable path/line order, and atomically replaces the SQLite file. Rebuilding
-removes stale chunks. Its result and failures contain only bounded summaries;
-source text and local absolute paths are not printed as diagnostics.
+The builder accepts a bounded set of text/code extensions, skips protected
+directories and conservatively named secret files, rejects links and multiply
+linked files, chunks in stable path/line order, and atomically replaces the
+SQLite file. The filename filter rejects stem tokens `secret`, `secrets`,
+`credential`, `credentials`, `password`, `passwords`, `passwd`, `token`, and
+`tokens`, separated by `.`, `-`, or `_`. This is not a content secret scanner:
+use a trusted, curated source tree (the example uses `docs`) and review it
+before building. Rebuilding removes stale chunks. Its result and failures
+contain only bounded summaries; source text and local absolute paths are not
+printed as diagnostics.
 
 Enable retrieval only after the index exists. `AGENT_RAG_SCRIPT` and
 `AGENT_RAG_INDEX` must name absolute canonical ordinary files without link
@@ -156,10 +161,12 @@ to one fixed command:
 
 The response is parsed as an exact versioned JSON object and converted to a
 structured `EvidencePack`. At most 20 items and 32 KiB of source content may
-become durable. Source IDs remain relative `path#Lx-Ly` citations; metadata
-retains relative path, line range, content SHA-256, and score. The Runtime,
-Reducer, and JSONL replay all enforce the same bounds, so a faulty sidecar or a
-forged event cannot bypass the invariant.
+become durable. The Python adapter requires each source ID to match its
+canonical relative `path#Lx-Ly[-Pn]` citation, requires an exact path/line/hash/
+score metadata schema, and recomputes the content SHA-256. Runtime, Reducer,
+and JSONL replay enforce the provider-neutral EvidencePack bounds. Reducer also
+requires each durable `ModelCallStarted.request.evidence` to exactly equal the
+immediately prepared context, so replay cannot substitute what the model saw.
 
 Evidence is labeled as untrusted reference data in the Provider request. It is
 not a system instruction and RAG is not a model-callable tool: enabling it does

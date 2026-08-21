@@ -144,6 +144,11 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                     return invalid_transition(
                         "model call start requires idle awaiting model state");
                 }
+                if (!evidence_pack_is_valid(typed_payload.request.evidence) ||
+                    !(typed_payload.request.evidence == state.evidence)) {
+                    return invalid_transition(
+                        "model request evidence does not match prepared context");
+                }
                 state.model_call_in_flight = true;
                 ++state.usage.model_rounds;
                 return Result<void>::success();

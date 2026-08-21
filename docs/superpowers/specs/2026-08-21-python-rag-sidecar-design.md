@@ -33,8 +33,10 @@ This milestone does not add:
 - changes to the task-state vocabulary or an additional failure state;
 - automatic retry, crash recovery, evaluation, Git mutation, or multi-agent
   behavior;
-- indexing of secrets, binary files, links/reparse points, `.git`, `.agent`,
-  `.rag`, build output, or runtime logs.
+- indexing of known secret stores or conservatively named secret-bearing files,
+  binary files, links/reparse points, `.git`, `.agent`, `.rag`, build output, or
+  runtime logs. V1 is not a content secret scanner, so the source tree remains
+  operator-curated and trusted.
 
 Embedding retrieval can be added later behind the same Python output contract.
 The deterministic lexical implementation is deliberately the first production
@@ -150,10 +152,12 @@ The first indexer accepts strict UTF-8 regular files with these source forms:
 The traversal is lexically sorted and never follows a symlink/reparse point or
 accepts a multiply linked regular file.
 It skips protected components, hidden runtime/index directories, common build
-directories, secret-bearing filenames, unsupported extensions, files larger
-than 1 MiB, invalid UTF-8, and NUL-containing files. It stops at fixed corpus
-budgets: 50,000 inspected entries, 10,000 accepted files, and 64 MiB accepted
-source bytes. Reaching a
+directories, and filenames whose stem contains a `.`, `-`, or `_` separated
+`secret`, `secrets`, `credential`, `credentials`, `password`, `passwords`,
+`passwd`, `token`, or `tokens` token. It also skips unsupported extensions,
+files larger than 1 MiB, invalid UTF-8, and NUL-containing files. It stops at
+fixed corpus budgets: 50,000 inspected entries, 10,000 accepted files, and 64
+MiB accepted source bytes. Reaching a
 budget is a build error, not silent partial success.
 
 Files are divided on line boundaries into chunks of at most 4,096 UTF-8 bytes,
@@ -252,6 +256,13 @@ truncated stdout, malformed JSON, duplicate source IDs, bad metadata, and all
 bound violations become fixed `RuntimeError` values. Raw stderr never enters an
 event, terminal output, or model request.
 
+For this Python protocol, metadata has exactly `path`, `start_line`, `end_line`,
+`sha256`, and `score`. The adapter requires a canonical relative POSIX path,
+positive ordered line numbers, a finite nonnegative score, and a 64-character
+lowercase SHA-256 equal to the returned content. `source_id` must be the exact
+`path#Lx-Ly` form, or `path#Lx-Lx-Pn` with a positive part number for a split
+physical line.
+
 The adapter maps valid items to the existing `EvidencePack` without flattening
 them into a conversation message. The Anthropic adapter already labels the
 serialized evidence as untrusted reference data.
@@ -273,6 +284,10 @@ but otherwise requires:
 - nonempty content, each at most 8 KiB and total at most 32 KiB;
 - metadata at most 16 levels, 256 nodes, and 4 KiB of keys/string values per
   item; all doubles finite and all strings strict UTF-8 without NUL.
+
+When applying `ModelCallStarted`, the Reducer revalidates the nested request
+EvidencePack and requires it to equal the immediately prepared durable context.
+This binds the audit record to the evidence actually submitted to the model.
 
 A faulty knowledge provider therefore appends exactly one
 `ContextPreparationFailed` event and enters the existing `Failed` state. A

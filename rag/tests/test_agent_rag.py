@@ -191,6 +191,34 @@ class IndexAndQueryTests(unittest.TestCase):
         if link_created:
             self.assertGreaterEqual(summary.links_skipped, 2)
 
+    def test_secret_bearing_filenames_are_never_indexed(self) -> None:
+        self._write("allowed.md", "public architecture guidance\n")
+        self._write("secrets.md", "SENTINEL_SECRET_DOCUMENT\n")
+        self._write("credentials.py", "SENTINEL_CREDENTIAL_SOURCE\n")
+        self._write("token.txt", "SENTINEL_TOKEN_VALUE\n")
+        self._write("deploy-passwords.rst", "SENTINEL_PASSWORD_LIST\n")
+
+        summary = build_index(self.source, self.index)
+        secret_items = query_index(
+            self.index,
+            "SENTINEL SECRET CREDENTIAL TOKEN PASSWORD",
+            top_k=20,
+            max_total_bytes=32_768,
+        )
+        public_items = query_index(
+            self.index,
+            "public architecture",
+            top_k=20,
+            max_total_bytes=32_768,
+        )
+
+        self.assertEqual(summary.files_indexed, 1)
+        self.assertGreaterEqual(summary.files_skipped, 4)
+        self.assertEqual(secret_items, [])
+        self.assertEqual(
+            [item["metadata"]["path"] for item in public_items], ["allowed.md"]
+        )
+
     def test_oversized_unicode_line_uses_stable_part_ids_and_byte_bounds(self) -> None:
         self._write("generated.txt", "知识库" * 20 + "\n")
         limits = BuildLimits(

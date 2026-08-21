@@ -52,4 +52,3 @@ def main(arguments: list[str] | None = None) -> int:
         else:
             sys.stderr.write("rag command failed\n")
         return 2
-

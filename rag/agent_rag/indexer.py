@@ -82,6 +82,17 @@ _PROTECTED_FILES = {
     ".npmrc",
     ".pypirc",
 }
+_SECRET_FILENAME_TOKENS = {
+    "secret",
+    "secrets",
+    "credential",
+    "credentials",
+    "password",
+    "passwords",
+    "passwd",
+    "token",
+    "tokens",
+}
 
 
 def _validate_limits(limits: BuildLimits) -> None:
@@ -137,11 +148,20 @@ def _protected_directory(name: str) -> bool:
     )
 
 
+def _secret_bearing_filename(name: str) -> bool:
+    stem = Path(name).stem.casefold()
+    for separator in (".", "-", "_"):
+        stem = stem.replace(separator, " ")
+    return any(
+        token in _SECRET_FILENAME_TOKENS for token in stem.split()
+    )
+
+
 def _supported_file(path: Path) -> bool:
     lowered = path.name.casefold()
     if lowered in _PROTECTED_FILES or (
         lowered.startswith(".env.") and lowered != ".env.example"
-    ):
+    ) or _secret_bearing_filename(path.name):
         return False
     return path.name == "CMakeLists.txt" or path.suffix.casefold() in _ALLOWED_SUFFIXES
 

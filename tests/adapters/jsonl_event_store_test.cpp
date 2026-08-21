@@ -479,6 +479,39 @@ TEST_CASE(jsonl_rejects_forged_invalid_context_evidence) {
     REQUIRE(loaded.error().code == agent::ErrorCode::PersistenceFailure);
 }
 
+TEST_CASE(jsonl_rejects_model_request_evidence_that_differs_from_context) {
+    for (const bool duplicate_request_evidence : {false, true}) {
+        test::ScopedTempDir temp("jsonl-request-evidence-binding");
+        const auto task = fixtures::valid_task_id(
+            duplicate_request_evidence ? "invalid-request-evidence"
+                                       : "mismatched-request-evidence");
+        auto request = fixtures::request();
+        request.evidence.items.front().source_id = u8"伪造来源";
+        request.evidence.items.front().content = u8"另一份有效证据";
+        if (duplicate_request_evidence) {
+            request.evidence.items.push_back(request.evidence.items.front());
+        }
+        const std::vector<agent::RuntimeEvent> forged{
+            fixtures::task_started(task, 1, "issue"),
+            fixtures::event(task, 2,
+                            agent::ContextPreparationStartedPayload{}),
+            fixtures::event(
+                task, 3,
+                agent::ContextPreparedPayload{fixtures::evidence()}),
+            fixtures::event(
+                task, 4,
+                agent::ModelCallStartedPayload{std::move(request)})};
+        const auto file =
+            temp.write_text("events.jsonl", fixtures::as_jsonl(forged));
+        agent::JsonlEventStore store(temp.path());
+
+        const auto loaded = store.read_file(file);
+
+        REQUIRE(!loaded.has_value());
+        REQUIRE(loaded.error().code == agent::ErrorCode::PersistenceFailure);
+    }
+}
+
 TEST_CASE(jsonl_append_reports_unwritable_runtime_root) {
     test::ScopedTempDir temp("jsonl-unwritable-root");
     const auto root_file = temp.write_text("not-a-directory", "occupied");

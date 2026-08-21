@@ -60,10 +60,12 @@ agent::RuntimeEvent context_prepared(const std::string& task_id,
 }
 
 agent::RuntimeEvent model_started(const std::string& task_id,
-                                  std::uint64_t sequence) {
+                                  std::uint64_t sequence,
+                                  const std::string& source_id = "source") {
+    agent::ModelRequest request{"runtime prompt", {}, {}, 30'000};
+    request.evidence = evidence(source_id);
     return event(task_id, sequence,
-                 agent::ModelCallStartedPayload{
-                     {"runtime prompt", {}, {}, 30'000}});
+                 agent::ModelCallStartedPayload{std::move(request)});
 }
 
 agent::RuntimeEvent model_succeeded(const std::string& task_id,
@@ -140,7 +142,7 @@ std::vector<agent::RuntimeEvent> completed_text_trace(const std::string& task_id
         task_started(task_id, 1, issue),
         context_started(task_id, 2),
         context_prepared(task_id, 3, "source-1"),
-        model_started(task_id, 4),
+        model_started(task_id, 4, "source-1"),
         model_succeeded(task_id, 5, {agent::TextBlock{final_text}},
                         agent::StopReason::EndTurn),
         task_completed(task_id, 6, final_text),
@@ -154,7 +156,7 @@ std::vector<agent::RuntimeEvent> completed_two_tool_trace(const std::string& tas
         task_started(task_id, 1, "inspect and build"),
         context_started(task_id, 2),
         context_prepared(task_id, 3, "source-1"),
-        model_started(task_id, 4),
+        model_started(task_id, 4, "source-1"),
         model_succeeded(task_id, 5,
                         {agent::TextBlock{"working"}, agent::ToolUseBlock{call_1},
                          agent::ToolUseBlock{call_2}},
@@ -165,7 +167,7 @@ std::vector<agent::RuntimeEvent> completed_two_tool_trace(const std::string& tas
         tool_succeeded(task_id, 9, second_result()),
         context_started(task_id, 10),
         context_prepared(task_id, 11, "source-2"),
-        model_started(task_id, 12),
+        model_started(task_id, 12, "source-2"),
         model_succeeded(task_id, 13, {agent::TextBlock{"done"}},
                         agent::StopReason::EndTurn),
         task_completed(task_id, 14, "done"),
@@ -320,6 +322,37 @@ TEST_CASE(reducer_rejects_invalid_context_evidence_before_state_mutation) {
     REQUIRE(state.value().status == agent::TaskStatus::PreparingContext);
     REQUIRE(state.value().evidence.items.empty());
     REQUIRE(state.value().last_sequence == 2);
+}
+
+TEST_CASE(reducer_binds_model_request_evidence_to_prepared_context) {
+    const auto task = std::string("evidence-binding");
+    const std::vector<agent::RuntimeEvent> prefix{
+        fixtures::task_started(task, 1, "issue"),
+        fixtures::context_started(task, 2),
+        fixtures::context_prepared(task, 3, "prepared-source")};
+    auto state = agent::replay_events(prefix);
+    REQUIRE(state.has_value());
+
+    const auto mismatch = agent::reduce_event(
+        state.value(), fixtures::model_started(task, 4, "forged-source"));
+
+    REQUIRE(!mismatch.has_value());
+    REQUIRE(mismatch.error().code == agent::ErrorCode::InvalidTransition);
+    REQUIRE(state.value().status == agent::TaskStatus::AwaitingModel);
+    REQUIRE(!state.value().model_call_in_flight);
+    REQUIRE(state.value().usage.model_rounds == 0);
+    REQUIRE(state.value().last_sequence == 3);
+
+    auto invalid_request = fixtures::model_started(task, 4, "prepared-source");
+    auto& request = std::get<agent::ModelCallStartedPayload>(
+                        invalid_request.payload)
+                        .request;
+    request.evidence.items.push_back(request.evidence.items.front());
+    const auto invalid = agent::reduce_event(state.value(), invalid_request);
+
+    REQUIRE(!invalid.has_value());
+    REQUIRE(invalid.error().code == agent::ErrorCode::InvalidTransition);
+    REQUIRE(state.value().last_sequence == 3);
 }
 
 TEST_CASE(model_failure_is_terminal_and_rejects_continuation) {
@@ -808,7 +841,7 @@ TEST_CASE(generic_budget_terminals_accept_reconstructibly_legal_traces) {
                                {1, 12, 90'000, 30'000}),
         fixtures::context_started(model_task, 2),
         fixtures::context_prepared(model_task, 3, "source-1"),
-        fixtures::model_started(model_task, 4),
+        fixtures::model_started(model_task, 4, "source-1"),
         fixtures::model_succeeded(
             model_task, 5,
             {agent::ToolUseBlock{fixtures::first_call()}},
@@ -938,7 +971,7 @@ TEST_CASE(generic_budget_terminal_requires_exact_payload_for_each_name) {
                                  {1, 12, 90'000, 30'000}),
           fixtures::context_started("tamper-model", 2),
           fixtures::context_prepared("tamper-model", 3, "source-1"),
-          fixtures::model_started("tamper-model", 4),
+          fixtures::model_started("tamper-model", 4, "source-1"),
           fixtures::model_succeeded(
               "tamper-model", 5,
               {agent::ToolUseBlock{fixtures::first_call()}},
@@ -994,7 +1027,7 @@ TEST_CASE(generic_budget_terminal_rejects_nonidle_runtime_states) {
                                  {2, 1, 90'000, 30'000}),
           fixtures::context_started("budget-model-active", 2),
           fixtures::context_prepared("budget-model-active", 3, "source-1"),
-          fixtures::model_started("budget-model-active", 4),
+          fixtures::model_started("budget-model-active", 4, "source-1"),
           fixtures::model_succeeded(
               "budget-model-active", 5,
               {agent::ToolUseBlock{fixtures::first_call()}},
@@ -1005,7 +1038,7 @@ TEST_CASE(generic_budget_terminal_rejects_nonidle_runtime_states) {
                                    fixtures::first_result()),
           fixtures::context_started("budget-model-active", 8),
           fixtures::context_prepared("budget-model-active", 9, "source-2"),
-          fixtures::model_started("budget-model-active", 10)}},
+          fixtures::model_started("budget-model-active", 10, "source-2")}},
         {"budget-tool-active",
          {fixtures::task_started("budget-tool-active", 1, "issue",
                                  {1, 1, 90'000, 30'000}),
@@ -1100,7 +1133,7 @@ TEST_CASE(tool_call_budget_terminal_requires_exhausted_pending_work_and_status) 
                                {8, 1, 90'000, 30'000}),
         fixtures::context_started(wrong_status_task, 2),
         fixtures::context_prepared(wrong_status_task, 3, "source-1"),
-        fixtures::model_started(wrong_status_task, 4),
+        fixtures::model_started(wrong_status_task, 4, "source-1"),
         fixtures::model_succeeded(
             wrong_status_task, 5,
             {agent::ToolUseBlock{fixtures::first_call()}},
