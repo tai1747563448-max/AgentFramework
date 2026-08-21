@@ -3,6 +3,8 @@
 #include "adapters/empty/empty_knowledge_provider.h"
 #include "adapters/empty/empty_tool_gateway.h"
 #include "adapters/persistence/jsonl_event_store.h"
+#include "adapters/workspace/workspace_text.h"
+#include "adapters/workspace/workspace_tool_gateway.h"
 #include "application/runtime_engine.h"
 #include "application/state_reducer.h"
 #include "cli/cli_app.h"
@@ -30,7 +32,8 @@ public:
         : responses_(std::move(responses)) {}
 
     agent::Result<agent::ModelResponse> complete(
-        const agent::ModelRequest&) override {
+        const agent::ModelRequest& request) override {
+        requests.push_back(request);
         if (next_response_ >= responses_.size()) {
             return agent::Result<agent::ModelResponse>::failure(
                 {agent::ErrorCode::ProtocolFailure,
@@ -39,6 +42,8 @@ public:
         return agent::Result<agent::ModelResponse>::success(
             responses_.at(next_response_++));
     }
+
+    std::vector<agent::ModelRequest> requests;
 
 private:
     std::vector<agent::ModelResponse> responses_;
@@ -112,6 +117,12 @@ struct RealRuntimeFixture {
                        agent::JsonlEventStore& store)
         : engine(model, tools, knowledge, store, clock, ids, cancellation) {}
 
+    RealRuntimeFixture(agent::ModelClient& model,
+                       agent::ToolGateway& external_tools,
+                       agent::JsonlEventStore& store)
+        : engine(model, external_tools, knowledge, store, clock, ids,
+                 cancellation) {}
+
     RealRuntimeFixture(const RealRuntimeFixture&) = delete;
     RealRuntimeFixture& operator=(const RealRuntimeFixture&) = delete;
     RealRuntimeFixture(RealRuntimeFixture&&) = delete;
@@ -141,6 +152,47 @@ agent::RunRequest run_request(std::string issue,
 agent::ModelResponse text_response(std::string text) {
     return {{agent::TextBlock{std::move(text)}}, agent::StopReason::EndTurn,
             "end_turn", 5, 3, "provider-request-integration"};
+}
+
+agent::ToolCall list_call(std::string id, std::string path) {
+    return {std::move(id), "list_files",
+            agent::Value::object({
+                {"path", std::move(path)},
+                {"recursive", false},
+                {"max_results", std::int64_t{100}}})};
+}
+
+agent::ToolCall read_call(std::string id,
+                          std::string path,
+                          std::int64_t start_line,
+                          std::int64_t max_lines) {
+    return {std::move(id), "read_file",
+            agent::Value::object({
+                {"path", std::move(path)},
+                {"start_line", start_line},
+                {"max_lines", max_lines}})};
+}
+
+agent::ToolCall replace_call(std::string id,
+                             std::string path,
+                             std::string old_text,
+                             std::string new_text,
+                             std::int64_t occurrences,
+                             std::string hash) {
+    return {std::move(id), "replace_text",
+            agent::Value::object({
+                {"path", std::move(path)},
+                {"old_text", std::move(old_text)},
+                {"new_text", std::move(new_text)},
+                {"expected_occurrences", occurrences},
+                {"expected_sha256", std::move(hash)}})};
+}
+
+agent::ModelResponse tool_response(agent::ToolCall call,
+                                   std::string request_id) {
+    return {{agent::ToolUseBlock{std::move(call)}},
+            agent::StopReason::ToolUse, "tool_use", 5, 3,
+            std::move(request_id)};
 }
 
 test::RealRuntimeFixture real_runtime_with(
@@ -177,6 +229,86 @@ TEST_CASE(fake_end_to_end_writes_and_replays_unicode_task) {
     const auto replayed = agent::replay_events(loaded.value());
     REQUIRE(replayed.has_value());
     REQUIRE(replayed.value() == *result.state);
+}
+
+TEST_CASE(real_workspace_gateway_completes_versioned_file_workflow) {
+    test::ScopedTempDir root("runtime-real-workspace-tools");
+    const auto workspace = root.path() / "workspace";
+    const auto runtime_root = root.path() / "runtime_data";
+    const auto outside = root.path() / "outside.txt";
+    std::filesystem::create_directories(workspace / ".git");
+    std::filesystem::create_directories(runtime_root);
+    {
+        std::ofstream(workspace / "answer.txt", std::ios::binary) << "answer=41\n";
+        std::ofstream(workspace / ".git/sentinel", std::ios::binary)
+            << "git-sentinel\n";
+        std::ofstream(runtime_root / "sentinel", std::ios::binary)
+            << "runtime-sentinel\n";
+        std::ofstream(outside, std::ios::binary) << "outside-sentinel\n";
+    }
+    const auto original_hash = agent::workspace::sha256_hex("answer=41\n");
+    test::FakeModel model({
+        fixtures::tool_response(fixtures::list_call("call-list", "."),
+                                "provider-request-list"),
+        fixtures::tool_response(
+            fixtures::read_call("call-read-before", "answer.txt", 1, 20),
+            "provider-request-read-before"),
+        fixtures::tool_response(
+            fixtures::replace_call("call-replace", "answer.txt", "41", "42",
+                                   1, original_hash),
+            "provider-request-replace"),
+        fixtures::tool_response(
+            fixtures::read_call("call-read-after", "answer.txt", 1, 20),
+            "provider-request-read-after"),
+        fixtures::text_response(u8"已把答案改为 42，并重新读取验证。")});
+    agent::WorkspaceToolGateway tools(runtime_root);
+    agent::JsonlEventStore store(runtime_root);
+    test::RealRuntimeFixture runtime(model, tools, store);
+
+    const auto result = runtime.run(
+        {u8"把答案从 41 改为 42，并重新读取验证。",
+         workspace.generic_u8string(), u8"你是编码代理。",
+         {5, 4, 30'000, 5'000}});
+
+    REQUIRE(result.state.has_value());
+    REQUIRE(!result.fatal_error.has_value());
+    REQUIRE(result.state->status == agent::TaskStatus::Completed);
+    REQUIRE(result.state->final_text ==
+            std::optional<std::string>{u8"已把答案改为 42，并重新读取验证。"});
+    REQUIRE(fixtures::read_all(workspace / "answer.txt") == "answer=42\n");
+    REQUIRE(fixtures::read_all(workspace / ".git/sentinel") ==
+            "git-sentinel\n");
+    REQUIRE(fixtures::read_all(runtime_root / "sentinel") ==
+            "runtime-sentinel\n");
+    REQUIRE(fixtures::read_all(outside) == "outside-sentinel\n");
+
+    const auto event_path = store.event_path(result.state->task_id);
+    REQUIRE(event_path.has_value());
+    const auto loaded = store.read_file(event_path.value());
+    REQUIRE(loaded.has_value());
+    std::vector<std::string> observed_tools;
+    for (const auto& event : loaded.value()) {
+        if (const auto* started =
+                std::get_if<agent::ToolCallStartedPayload>(&event.payload)) {
+            observed_tools.push_back(started->call.name);
+        }
+    }
+    REQUIRE((observed_tools ==
+             std::vector<std::string>{"list_files", "read_file",
+                                      "replace_text", "read_file"}));
+    const auto replayed = agent::replay_events(loaded.value());
+    REQUIRE(replayed.has_value());
+    REQUIRE(replayed.value() == *result.state);
+
+    REQUIRE(model.requests.size() == 5);
+    for (const auto& request : model.requests) {
+        REQUIRE(request.tools.size() == 5);
+        REQUIRE(request.tools.at(0).name == "list_files");
+        REQUIRE(request.tools.at(1).name == "read_file");
+        REQUIRE(request.tools.at(2).name == "search_text");
+        REQUIRE(request.tools.at(3).name == "replace_text");
+        REQUIRE(request.tools.at(4).name == "write_file");
+    }
 }
 
 TEST_CASE(cli_progress_exactly_matches_real_runtime_jsonl_durable_order) {

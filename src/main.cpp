@@ -1,11 +1,11 @@
 #include "adapters/anthropic/anthropic_messages_client.h"
 #include "adapters/anthropic/cpr_http_transport.h"
 #include "adapters/empty/empty_knowledge_provider.h"
-#include "adapters/empty/empty_tool_gateway.h"
 #include "adapters/persistence/jsonl_event_store.h"
 #include "adapters/system/random_id_generator.h"
 #include "adapters/system/signal_cancellation.h"
 #include "adapters/system/system_clock.h"
+#include "adapters/workspace/workspace_tool_gateway.h"
 #include "application/runtime_engine.h"
 #include "application/state_reducer.h"
 #include "cli/cli_app.h"
@@ -71,7 +71,7 @@ int run_agent(std::vector<std::string> args) {
 
         agent::CprHttpTransport transport;
         agent::AnthropicMessagesClient model(config.value().anthropic, transport);
-        agent::EmptyToolGateway tools;
+        agent::WorkspaceToolGateway tools(config.value().runtime_root);
         agent::EmptyKnowledgeProvider knowledge;
         agent::JsonlEventStore events(config.value().runtime_root);
         agent::SystemClock clock;

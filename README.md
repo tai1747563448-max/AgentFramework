@@ -20,8 +20,9 @@ The dependency direction points inward:
   exit-code change.
 - `src/ports` defines model, tool, knowledge, event-store, clock, ID, and
   cancellation interfaces.
-- `src/adapters` supplies Anthropic Messages HTTP, JSONL persistence, empty
-  tool/knowledge adapters, and system clock/ID/cancellation implementations.
+- `src/adapters` supplies Anthropic Messages HTTP, JSONL persistence, bounded
+  workspace file tools, an empty knowledge adapter, and system
+  clock/ID/cancellation implementations.
 - `src/main.cpp` is the composition root; `src/cli` parses `run` and
   `verify-log`, uses fixed failure messages, and bounds the fields printed by
   progress and log verification. A successful `run` renders final text as
@@ -42,9 +43,41 @@ tool block; `end_turn` and `stop_sequence` require nonempty tool-free text;
 `max_tokens` terminates as `BudgetExceeded`; unknown or inconsistent stops are
 direct `ModelCallFailed` protocol failures.
 
-This milestone does not provide real coding tools, real RAG, crash recovery,
+This milestone provides versioned text-file inspection and editing, but not
+build/test process execution, Git mutation, real RAG, crash recovery,
 automatic retry, parallel execution, multiple agents, a second provider, an
-HTTP service, a TUI, MCP, or plugins.
+HTTP service, a TUI, MCP, or plugins. Structured build/test execution and the
+Python RAG sidecar are the next milestones; they are not implied by the file
+tools or by offline test success.
+
+## Workspace file tools
+
+Every `run` exposes exactly five tools to the model:
+
+- `list_files` returns stable, workspace-relative directory entries.
+- `read_file` returns bounded UTF-8 lines and the SHA-256 of the complete
+  file.
+- `search_text` performs deterministic literal, non-overlapping search;
+  case-insensitive mode folds ASCII only.
+- `replace_text` requires the current SHA-256 and exact non-overlapping match
+  count before changing a file.
+- `write_file` either creates a missing file without replacement or overwrites
+  an existing file only when its SHA-256 still matches.
+
+Tool paths are relative to the `--workspace` supplied for that durable task.
+Absolute paths, `..`, links/reparse points, multiply linked files, `.git`,
+`.worktrees`, secret-bearing `.env*` files (except `.env.example`), common
+credential files, runtime data, and reserved `.agent-tmp-*` names are refused
+or omitted. Writes use an exclusively created same-directory temporary file,
+flush it, atomically install it, and verify the installed bytes. A stale hash
+or match count is a retryable tool conflict and leaves the target unchanged.
+
+Text files are strict UTF-8 without NUL and at most 1 MiB. A tool result is at
+most 64 KiB; listings and searches return at most 200 results. Recursive
+search additionally stops at 2000 entries, 500 files, or 16 MiB scanned and
+reports the exact truncation reason. These checks are safety and determinism
+limits, not a sandbox against a hostile process concurrently racing the same
+workspace.
 
 ## Build and offline tests on Visual Studio 2022
 
@@ -102,8 +135,8 @@ configuration, HTTP transport, or model client. Use the exact binding:
   --events .\runtime_data\tasks\<task-id>\events.jsonl
 ```
 
-Verification prints only the validated task ID, terminal status, and last
-sequence. It rejects malformed JSON, unknown schema, noncontiguous or mixed
+Verification prints only the validated task ID, current replayed status, and
+last sequence. It rejects malformed JSON, unknown schema, noncontiguous or mixed
 task sequences, invalid transitions, and unsafe task IDs without modifying the
 file. Combining `verify-log` with `--env-file` is invalid input.
 
