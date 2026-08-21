@@ -1,5 +1,8 @@
 # AgentFramework Runtime Kernel
 
+完整的中文架构、运行说明、真实崩溃恢复工作流和逐文件代码地图见
+[`docs/AGENT_FRAMEWORK_GUIDE.zh-CN.md`](docs/AGENT_FRAMEWORK_GUIDE.zh-CN.md)。
+
 This repository contains the first, deliberately bounded Runtime Kernel for a
 C++17 coding agent. It runs one foreground task through an event-sourced state
 machine, persists JSONL events, and can verify and replay a task log.
