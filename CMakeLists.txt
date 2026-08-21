@@ -147,6 +147,12 @@ add_test(
         "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/verify-log-process"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/verify_log_process_test.cmake")
 if(Python3_Interpreter_FOUND)
+    add_agent_test(rag_integration_tests
+        tests/integration/rag_integration_test.cpp)
+    target_link_libraries(rag_integration_tests PRIVATE agent_runtime)
+    target_compile_definitions(rag_integration_tests PRIVATE
+        AGENT_RAG_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
+        AGENT_RAG_SCRIPT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/rag/agent_rag_cli.py")
     add_test(
         NAME python_rag_tests
         COMMAND "${Python3_EXECUTABLE}" -E -s -X utf8 -m unittest
