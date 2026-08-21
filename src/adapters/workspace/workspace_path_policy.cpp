@@ -186,18 +186,37 @@ bool WorkspacePathPolicy::is_protected(
     if (error) {
         return true;
     }
+    const auto workspace_physical =
+        std::filesystem::weakly_canonical(workspace_absolute, error);
+    if (error) {
+        return true;
+    }
     const auto runtime_absolute =
         std::filesystem::absolute(runtime_root_, error).lexically_normal();
-    if (error || !contained(workspace_absolute, runtime_absolute)) {
+    if (error) {
+        return true;
+    }
+    const auto runtime_physical =
+        std::filesystem::weakly_canonical(runtime_absolute, error);
+    if (error) {
+        return true;
+    }
+    if (!contained(workspace_physical, runtime_physical)) {
         return false;
     }
-    const auto candidate = relative.components.empty()
-                               ? workspace_absolute
-                               : (workspace_absolute /
-                                  std::filesystem::u8path(relative.generic))
-                                     .lexically_normal();
-    return path_equal(candidate, runtime_absolute) ||
-           contained(runtime_absolute, candidate);
+    const auto candidate_absolute =
+        relative.components.empty()
+            ? workspace_absolute
+            : (workspace_absolute /
+               std::filesystem::u8path(relative.generic))
+                  .lexically_normal();
+    const auto candidate_physical =
+        std::filesystem::weakly_canonical(candidate_absolute, error);
+    if (error) {
+        return true;
+    }
+    return path_equal(candidate_physical, runtime_physical) ||
+           contained(runtime_physical, candidate_physical);
 }
 
 Outcome<std::filesystem::path> WorkspacePathPolicy::resolve_existing(
@@ -208,19 +227,26 @@ Outcome<std::filesystem::path> WorkspacePathPolicy::resolve_existing(
         return denied_path();
     }
     std::error_code error;
-    const auto root = std::filesystem::weakly_canonical(
-        std::filesystem::absolute(workspace, error), error);
-    if (error || !std::filesystem::exists(root, error) || error) {
+    const auto supplied_root =
+        std::filesystem::absolute(workspace, error).lexically_normal();
+    if (error || !std::filesystem::exists(supplied_root, error) || error) {
         return missing_path();
     }
-    if (!std::filesystem::is_directory(root, error) || error) {
+    if (!std::filesystem::is_directory(supplied_root, error) || error) {
         return unsupported_path();
     }
-    if (is_reparse_or_link(root, error)) {
+    if (is_reparse_or_link(supplied_root, error)) {
         return denied_path();
     }
     if (error) {
         return io_path();
+    }
+    const auto root = std::filesystem::weakly_canonical(supplied_root, error);
+    if (error) {
+        return io_path();
+    }
+    if (!path_equal(supplied_root, root)) {
+        return denied_path();
     }
 
     auto current = root;

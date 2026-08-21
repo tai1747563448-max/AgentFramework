@@ -1,6 +1,7 @@
 #include "adapters/workspace/workspace_tool_gateway.h"
 
 #include "adapters/json/value_json.h"
+#include "adapters/workspace/workspace_text.h"
 
 #include <nlohmann/json.hpp>
 
@@ -103,24 +104,82 @@ Result<ToolResult> success_result(const std::string& call_id,
         {call_id, std::move(serialized), false});
 }
 
-bool value_budget(const Value& value,
-                  std::size_t depth,
-                  std::size_t& nodes) {
+bool add_encoded_bytes(std::size_t& encoded, std::size_t bytes) {
+    if (bytes > kMaxArgumentsBytes - encoded) {
+        return false;
+    }
+    encoded += bytes;
+    return true;
+}
+
+bool add_json_string(std::string_view text, std::size_t& encoded) {
+    if (!workspace::is_strict_utf8_text(text) ||
+        !add_encoded_bytes(encoded, 2)) {
+        return false;
+    }
+    for (const auto raw : text) {
+        const auto value = static_cast<unsigned char>(raw);
+        std::size_t bytes = 1;
+        if (value == static_cast<unsigned char>('"') ||
+            value == static_cast<unsigned char>('\\') || value == '\b' ||
+            value == '\f' || value == '\n' || value == '\r' || value == '\t') {
+            bytes = 2;
+        } else if (value < 0x20U) {
+            bytes = 6;
+        }
+        if (!add_encoded_bytes(encoded, bytes)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool bounded_json_value(const Value& value,
+                        std::size_t depth,
+                        std::size_t& nodes,
+                        std::size_t& encoded) {
     if (depth > kMaxValueDepth || ++nodes > kMaxValueNodes) {
         return false;
     }
     if (value.is_array()) {
+        if (!add_encoded_bytes(encoded, 2)) {
+            return false;
+        }
+        bool first = true;
         for (const auto& item : value.as_array()) {
-            if (!value_budget(item, depth + 1, nodes)) {
+            if ((!first && !add_encoded_bytes(encoded, 1)) ||
+                !bounded_json_value(item, depth + 1, nodes, encoded)) {
                 return false;
             }
+            first = false;
         }
     } else if (value.is_object()) {
+        if (!add_encoded_bytes(encoded, 2)) {
+            return false;
+        }
+        bool first = true;
         for (const auto& item : value.as_object()) {
-            if (!value_budget(item.second, depth + 1, nodes)) {
+            if ((!first && !add_encoded_bytes(encoded, 1)) ||
+                !add_json_string(item.first, encoded) ||
+                !add_encoded_bytes(encoded, 1) ||
+                !bounded_json_value(item.second, depth + 1, nodes, encoded)) {
                 return false;
             }
+            first = false;
         }
+    } else if (std::holds_alternative<std::string>(value.storage())) {
+        return add_json_string(value.as_string(), encoded);
+    } else if (std::holds_alternative<std::nullptr_t>(value.storage())) {
+        return add_encoded_bytes(encoded, 4);
+    } else if (std::holds_alternative<bool>(value.storage())) {
+        return add_encoded_bytes(encoded, value.as_bool() ? 4 : 5);
+    } else if (value.is_integer()) {
+        return add_encoded_bytes(encoded,
+                                 std::to_string(value.as_integer()).size());
+    } else if (value.is_double()) {
+        return add_encoded_bytes(encoded, value_to_json(value).dump().size());
+    } else {
+        return false;
     }
     return true;
 }
@@ -196,6 +255,19 @@ nlohmann::json list_json(const std::string& path,
             {"omitted_entries", output.omitted_entries}};
 }
 
+nlohmann::json bounded_list_json(const std::string& path,
+                                 workspace::ListOutput output) {
+    auto encoded = list_json(path, output);
+    while (encoded.dump().size() > kMaxResultBytes &&
+           !output.entries.empty()) {
+        output.entries.pop_back();
+        output.truncated = true;
+        output.truncation_reason = "output_bytes";
+        encoded = list_json(path, output);
+    }
+    return encoded;
+}
+
 nlohmann::json read_json(const workspace::ReadOutput& output) {
     const auto& page = output.page;
     nlohmann::json next = page.next_start_line.has_value()
@@ -209,6 +281,36 @@ nlohmann::json read_json(const workspace::ReadOutput& output) {
             {"content", page.content},
             {"truncated", page.next_start_line.has_value()},
             {"next_start_line", std::move(next)}};
+}
+
+std::optional<nlohmann::json> bounded_read_json(
+    workspace::ReadOutput output) {
+    auto encoded = read_json(output);
+    while (encoded.dump().size() > kMaxResultBytes) {
+        auto& page = output.page;
+        if (page.content.empty() || page.end_line < page.start_line) {
+            return std::nullopt;
+        }
+        std::size_t before_last_line = page.content.size();
+        if (page.content.back() == '\n') {
+            --before_last_line;
+        }
+        const auto separator = before_last_line == 0
+                                   ? std::string::npos
+                                   : page.content.rfind(
+                                         '\n', before_last_line - 1);
+        const auto last_line_start = separator == std::string::npos
+                                         ? 0
+                                         : separator + 1;
+        if (last_line_start == 0) {
+            return std::nullopt;
+        }
+        page.content.resize(last_line_start);
+        page.next_start_line = page.end_line;
+        --page.end_line;
+        encoded = read_json(output);
+    }
+    return encoded;
 }
 
 nlohmann::json search_json(const std::string& path,
@@ -297,9 +399,9 @@ Result<ToolResult> WorkspaceToolGateway::execute(
     const ToolExecutionContext& context) {
     try {
         std::size_t nodes = 0;
+        std::size_t encoded = 0;
         if (!call.arguments.is_object() ||
-            !value_budget(call.arguments, 1, nodes) ||
-            value_to_json(call.arguments).dump().size() > kMaxArgumentsBytes) {
+            !bounded_json_value(call.arguments, 1, nodes, encoded)) {
             return Result<ToolResult>::success(fault_result(
                 call.id, invalid_arguments("invalid tool arguments")));
         }
@@ -336,8 +438,9 @@ Result<ToolResult> WorkspaceToolGateway::execute(
                     fault_result(call.id, std::get<workspace::Fault>(listed)));
             }
             return success_result(
-                call.id, list_json(*path_text,
-                                   std::get<workspace::ListOutput>(listed)));
+                call.id,
+                bounded_list_json(
+                    *path_text, std::get<workspace::ListOutput>(listed)));
         }
         if (call.name == "read_file") {
             if (!optional_exact_keys(args, {"path"},
@@ -370,8 +473,15 @@ Result<ToolResult> WorkspaceToolGateway::execute(
                 return Result<ToolResult>::success(
                     fault_result(call.id, std::get<workspace::Fault>(read)));
             }
-            return success_result(
-                call.id, read_json(std::get<workspace::ReadOutput>(read)));
+            auto read_content = bounded_read_json(
+                std::get<workspace::ReadOutput>(read));
+            if (!read_content.has_value()) {
+                return Result<ToolResult>::success(fault_result(
+                    call.id,
+                    {workspace::FaultCode::LimitExceeded,
+                     "workspace tool result exceeds the limit", false}));
+            }
+            return success_result(call.id, std::move(*read_content));
         }
         if (call.name == "search_text") {
             if (!optional_exact_keys(args, {"path", "query"},

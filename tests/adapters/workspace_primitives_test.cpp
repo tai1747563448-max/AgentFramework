@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <iostream>
 #include <string>
 #include <variant>
 #include <vector>
@@ -163,4 +164,41 @@ TEST_CASE(workspace_policy_requires_the_requested_leaf_kind_and_existing_parent)
     const auto parent = policy.resolve_parent(temp.path(), value(missing_parent));
     REQUIRE(std::holds_alternative<agent::workspace::Fault>(parent));
     REQUIRE(fault(parent).code == agent::workspace::FaultCode::NotFound);
+}
+
+TEST_CASE(workspace_policy_rejects_linked_roots_and_canonical_runtime_aliases) {
+    test::ScopedTempDir temp("workspace-root-link-policy");
+    const auto physical = temp.path() / "physical";
+    const auto alias = temp.path() / "alias";
+    std::filesystem::create_directories(physical / "private_runtime");
+    {
+        std::ofstream(physical / "safe.txt", std::ios::binary) << "safe\n";
+        std::ofstream(physical / "private_runtime/secret.txt", std::ios::binary)
+            << "private\n";
+    }
+    std::error_code link_error;
+    std::filesystem::create_directory_symlink(physical, alias, link_error);
+    if (link_error) {
+        std::cout << "SKIP workspace root-link policy: environment cannot "
+                     "create a directory symlink\n";
+        return;
+    }
+
+    agent::workspace::WorkspacePathPolicy root_policy(
+        temp.path() / "runtime_data");
+    const auto safe = root_policy.parse("safe.txt");
+    const auto linked_root =
+        root_policy.resolve_existing(alias, value(safe), false);
+    REQUIRE(std::holds_alternative<agent::workspace::Fault>(linked_root));
+    REQUIRE(fault(linked_root).code ==
+            agent::workspace::FaultCode::AccessDenied);
+
+    agent::workspace::WorkspacePathPolicy runtime_alias_policy(
+        alias / "private_runtime");
+    const auto secret = runtime_alias_policy.parse("private_runtime/secret.txt");
+    const auto protected_runtime = runtime_alias_policy.resolve_existing(
+        physical, value(secret), false);
+    REQUIRE(std::holds_alternative<agent::workspace::Fault>(protected_runtime));
+    REQUIRE(fault(protected_runtime).code ==
+            agent::workspace::FaultCode::AccessDenied);
 }

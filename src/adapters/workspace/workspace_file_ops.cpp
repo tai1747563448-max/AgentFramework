@@ -396,7 +396,8 @@ std::pair<std::string, bool> line_fragment(std::string_view line,
     return {std::string(line.substr(begin, end - begin)), true};
 }
 
-void mark_truncated(SearchOutput& output, std::string reason) {
+template <typename Output>
+void mark_truncated(Output& output, std::string reason) {
     if (!output.truncated) {
         output.truncated = true;
         output.truncation_reason = std::move(reason);
@@ -432,7 +433,8 @@ Outcome<ListOutput> WorkspaceFileOps::list(
         std::get<std::filesystem::path>(resolved)};
     ListOutput output;
     std::size_t inspected = 0;
-    while (!pending.empty()) {
+    bool entry_budget_reached = false;
+    while (!pending.empty() && !entry_budget_reached) {
         const auto directory = std::move(pending.back());
         pending.pop_back();
         std::vector<std::filesystem::path> children;
@@ -440,11 +442,20 @@ Outcome<ListOutput> WorkspaceFileOps::list(
         if (error) {
             return io_fault();
         }
-        for (const auto& entry : iterator) {
-            children.push_back(entry.path());
-        }
-        if (error) {
-            return io_fault();
+        const std::filesystem::directory_iterator end;
+        while (iterator != end) {
+            if (inspected >= kMaxTraversalEntries) {
+                entry_budget_reached = true;
+                mark_truncated(output, "entry_budget");
+                pending.clear();
+                break;
+            }
+            children.push_back(iterator->path());
+            ++inspected;
+            iterator.increment(error);
+            if (error) {
+                return io_fault();
+            }
         }
         std::sort(children.begin(), children.end(),
                   [&](const auto& left, const auto& right) {
@@ -452,13 +463,6 @@ Outcome<ListOutput> WorkspaceFileOps::list(
                              relative_utf8(workspace_root, right);
                   });
         for (const auto& child : children) {
-            if (inspected >= kMaxTraversalEntries) {
-                output.truncated = true;
-                output.truncation_reason = "entry_budget";
-                pending.clear();
-                break;
-            }
-            ++inspected;
             const auto logical_text = relative_utf8(workspace_root, child);
             const auto logical = policy_.parse(logical_text);
             if (std::holds_alternative<Fault>(logical)) {
@@ -480,7 +484,7 @@ Outcome<ListOutput> WorkspaceFileOps::list(
                     continue;
                 }
                 output.entries.push_back({logical_text, true, 0});
-                if (recursive) {
+                if (recursive && !entry_budget_reached) {
                     pending.push_back(child);
                 }
             } else if (std::filesystem::is_regular_file(status)) {
@@ -508,8 +512,7 @@ Outcome<ListOutput> WorkspaceFileOps::list(
               });
     if (output.entries.size() > max_results) {
         output.entries.resize(max_results);
-        output.truncated = true;
-        output.truncation_reason = "max_results";
+        mark_truncated(output, "max_results");
     }
     return output;
 }
@@ -589,7 +592,13 @@ Outcome<SearchOutput> WorkspaceFileOps::search(
             }
             const std::filesystem::directory_iterator end;
             while (iterator != end) {
+                if (inspected >= kMaxTraversalEntries) {
+                    entry_budget_reached = true;
+                    mark_truncated(output, "entry_budget");
+                    break;
+                }
                 children.push_back(iterator->path());
+                ++inspected;
                 iterator.increment(error);
                 if (error) {
                     return io_fault();
@@ -599,14 +608,8 @@ Outcome<SearchOutput> WorkspaceFileOps::search(
                       [&](const auto& left, const auto& right) {
                           return relative_utf8(root, left) <
                                  relative_utf8(root, right);
-                      });
+            });
             for (const auto& child : children) {
-                if (inspected >= kMaxTraversalEntries) {
-                    entry_budget_reached = true;
-                    mark_truncated(output, "entry_budget");
-                    break;
-                }
-                ++inspected;
                 const auto logical_text = relative_utf8(root, child);
                 const auto logical = policy_.parse(logical_text);
                 if (std::holds_alternative<Fault>(logical)) {

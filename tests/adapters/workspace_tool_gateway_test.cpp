@@ -98,23 +98,69 @@ std::string error_code(const agent::Result<agent::ToolResult>& result) {
     return content_json(result).at("error").at("code").get<std::string>();
 }
 
+std::string error_message(const agent::Result<agent::ToolResult>& result) {
+    REQUIRE(result.has_value());
+    REQUIRE(result.value().is_error);
+    return content_json(result).at("error").at("message").get<std::string>();
+}
+
 }  // namespace fixtures
 
 TEST_CASE(workspace_gateway_exposes_exact_five_closed_schemas) {
     agent::WorkspaceToolGateway gateway("runtime_data");
     const auto definitions = gateway.definitions();
-    REQUIRE(definitions.size() == 5);
-    REQUIRE(definitions.at(0).name == "list_files");
-    REQUIRE(definitions.at(1).name == "read_file");
-    REQUIRE(definitions.at(2).name == "search_text");
-    REQUIRE(definitions.at(3).name == "replace_text");
-    REQUIRE(definitions.at(4).name == "write_file");
-    for (const auto& definition : definitions) {
-        REQUIRE(definition.input_schema.at("type").as_string() == "object");
-        REQUIRE(!definition.input_schema.at("additionalProperties").as_bool());
-        REQUIRE(definition.input_schema.at("properties").is_object());
-        REQUIRE(definition.input_schema.at("required").is_array());
-    }
+    const auto string_schema = agent::Value::object({{"type", "string"}});
+    const auto boolean_schema = agent::Value::object({{"type", "boolean"}});
+    const auto integer_schema = [](std::int64_t minimum,
+                                   std::int64_t maximum) {
+        return agent::Value::object({{"type", "integer"},
+                                     {"minimum", minimum},
+                                     {"maximum", maximum}});
+    };
+    const auto object_schema = [](agent::Value::Object properties,
+                                  agent::Value::Array required) {
+        return agent::Value::object({
+            {"type", "object"},
+            {"properties", agent::Value::object(std::move(properties))},
+            {"required", agent::Value::array(std::move(required))},
+            {"additionalProperties", false}});
+    };
+    const std::vector<agent::ToolDefinition> expected{
+        {"list_files", "List files under the task workspace.",
+         object_schema({{"path", string_schema},
+                        {"recursive", boolean_schema},
+                        {"max_results", integer_schema(1, 200)}},
+                       {"path"})},
+        {"read_file", "Read bounded UTF-8 lines from a workspace file.",
+         object_schema({{"path", string_schema},
+                        {"start_line", integer_schema(1, 10'000'000)},
+                        {"max_lines", integer_schema(1, 1000)}},
+                       {"path"})},
+        {"search_text", "Search literal text under the task workspace.",
+         object_schema({{"path", string_schema},
+                        {"query", string_schema},
+                        {"case_sensitive", boolean_schema},
+                        {"max_results", integer_schema(1, 200)}},
+                       {"path", "query"})},
+        {"replace_text", "Replace exact versioned text in one file.",
+         object_schema({{"path", string_schema},
+                        {"old_text", string_schema},
+                        {"new_text", string_schema},
+                        {"expected_occurrences", integer_schema(1, 1000)},
+                        {"expected_sha256", string_schema}},
+                       {"path", "old_text", "new_text",
+                        "expected_occurrences", "expected_sha256"})},
+        {"write_file", "Create or overwrite one versioned UTF-8 file.",
+         object_schema(
+             {{"path", string_schema},
+              {"content", string_schema},
+              {"mode", agent::Value::object(
+                           {{"type", "string"},
+                            {"enum", agent::Value::array(
+                                         {"create", "overwrite"})}})},
+              {"expected_sha256", string_schema}},
+             {"path", "content", "mode"})}};
+    REQUIRE(definitions == expected);
 }
 
 TEST_CASE(workspace_gateway_returns_bounded_errors_for_unknown_or_bad_arguments) {
@@ -144,6 +190,34 @@ TEST_CASE(workspace_gateway_returns_bounded_errors_for_unknown_or_bad_arguments)
     const auto bad_range = gateway.execute(
         fixtures::read_call("call-range", "missing.txt", 0, 200), context);
     REQUIRE(fixtures::error_code(bad_range) == "invalid_arguments");
+
+    const std::string invalid_utf8(1, static_cast<char>(0xFF));
+    const auto invalid_value = gateway.execute(
+        fixtures::list_call("call-invalid-utf8", invalid_utf8), context);
+    REQUIRE(invalid_value.has_value());
+    REQUIRE(fixtures::error_code(invalid_value) == "invalid_arguments");
+    agent::Value::Object invalid_key_args{{"path", "."}};
+    invalid_key_args.emplace(invalid_utf8, true);
+    const auto invalid_key = gateway.execute(
+        {"call-invalid-key", "list_files",
+         agent::Value::object(std::move(invalid_key_args))},
+        context);
+    REQUIRE(invalid_key.has_value());
+    REQUIRE(fixtures::error_code(invalid_key) == "invalid_arguments");
+
+    constexpr std::size_t kArgumentLimit = 2U * 1024U * 1024U;
+    const auto exact_budget = gateway.execute(
+        {"call-exact-budget", "unknown",
+         agent::Value::object(
+             {{"blob", std::string(kArgumentLimit - 11, 'x')}})},
+        context);
+    REQUIRE(fixtures::error_message(exact_budget) == "unknown workspace tool");
+    const auto over_budget = gateway.execute(
+        {"call-over-budget", "unknown",
+         agent::Value::object(
+             {{"blob", std::string(kArgumentLimit - 10, 'x')}})},
+        context);
+    REQUIRE(fixtures::error_message(over_budget) == "invalid tool arguments");
     REQUIRE(unknown.value().content.size() < 256);
 }
 
@@ -257,6 +331,69 @@ TEST_CASE(workspace_read_handles_empty_and_rejects_oversized_or_invalid_text) {
     REQUIRE(fixtures::error_code(gateway.execute(
                 fixtures::read_call("call-large", "too-large.txt"), context)) ==
             "limit_exceeded");
+}
+
+TEST_CASE(workspace_list_truncates_before_the_serialized_result_limit) {
+    test::ScopedTempDir temp("workspace-list-output-budget");
+    const std::string directory = [] {
+        std::string value;
+        for (std::size_t index = 0; index < 60; ++index) {
+            value += u8"界";
+        }
+        return value;
+    }();
+    const std::string filename_prefix = [] {
+        std::string value;
+        for (std::size_t index = 0; index < 80; ++index) {
+            value += u8"文";
+        }
+        return value;
+    }();
+    for (std::size_t index = 0; index < 200; ++index) {
+        temp.write_text(
+            std::filesystem::u8path(directory + "/" + filename_prefix +
+                                    std::to_string(index) + ".txt"),
+            "x\n");
+    }
+    agent::WorkspaceToolGateway gateway(temp.path() / "runtime_data");
+    const agent::ToolExecutionContext context{temp.path().generic_u8string()};
+    const auto result = gateway.execute(
+        fixtures::list_call("call-list-output", ".", true, 200), context);
+
+    REQUIRE(result.has_value() && !result.value().is_error);
+    REQUIRE(result.value().content.size() <= 65536);
+    const auto json = fixtures::content_json(result);
+    REQUIRE(json.at("entries").size() < 200);
+    REQUIRE(json.at("truncated") == true);
+    REQUIRE(json.at("truncation_reason") == "output_bytes");
+}
+
+TEST_CASE(workspace_read_truncates_whole_lines_for_json_escaping) {
+    test::ScopedTempDir temp("workspace-read-output-budget");
+    std::string many_lines;
+    for (std::size_t line = 0; line < 20; ++line) {
+        many_lines.append(1000, static_cast<char>(0x01));
+        many_lines.push_back('\n');
+    }
+    temp.write_text("many.txt", many_lines);
+    temp.write_text("one.txt", std::string(12'000, static_cast<char>(0x01)));
+    agent::WorkspaceToolGateway gateway(temp.path() / "runtime_data");
+    const agent::ToolExecutionContext context{temp.path().generic_u8string()};
+
+    const auto many = gateway.execute(
+        fixtures::read_call("call-read-output", "many.txt", 1, 20), context);
+    REQUIRE(many.has_value() && !many.value().is_error);
+    REQUIRE(many.value().content.size() <= 65536);
+    const auto json = fixtures::content_json(many);
+    REQUIRE(json.at("start_line") == 1);
+    REQUIRE(json.at("end_line").get<std::size_t>() < 20);
+    REQUIRE(json.at("truncated") == true);
+    REQUIRE(json.at("next_start_line") ==
+            json.at("end_line").get<std::size_t>() + 1);
+
+    REQUIRE(fixtures::error_code(gateway.execute(
+                fixtures::read_call("call-read-one-output", "one.txt", 1, 1),
+                context)) == "limit_exceeded");
 }
 
 TEST_CASE(workspace_read_rejects_hard_links_and_does_not_follow_symlinks) {
@@ -389,6 +526,13 @@ TEST_CASE(workspace_search_reports_entry_file_and_byte_scan_budgets) {
         REQUIRE(!result.value().is_error);
         REQUIRE(json.at("truncated") == true);
         REQUIRE(json.at("truncation_reason") == "entry_budget");
+        const auto listed = gateway.execute(
+            fixtures::list_call("call-list-entry-budget", ".", true, 200),
+            context);
+        const auto listed_json = fixtures::content_json(listed);
+        REQUIRE(listed_json.at("entries").size() == 200);
+        REQUIRE(listed_json.at("truncated") == true);
+        REQUIRE(listed_json.at("truncation_reason") == "entry_budget");
     }
     {
         test::ScopedTempDir temp("workspace-search-file-budget");
