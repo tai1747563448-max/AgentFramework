@@ -304,8 +304,7 @@ RuntimeResult RuntimeEngine::continue_task(
 
                 model_request = ModelRequest{
                     system_prompt, state->messages, std::move(definitions),
-                    state->budgets.model_timeout_ms};
-                model_request.evidence = state->evidence;
+                    state->budgets.model_timeout_ms, state->evidence};
 
                 transition = guard_external_call(
                     state, task_id, started_at_ms, observer,

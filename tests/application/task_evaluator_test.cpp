@@ -32,10 +32,8 @@ agent::EvidencePack evidence(std::string prefix, std::size_t count) {
 
 agent::ModelRequest request(std::vector<agent::Message> messages,
                             agent::EvidencePack evidence_pack) {
-    agent::ModelRequest result{
-        "coding prompt", std::move(messages), {}, 5'000};
-    result.evidence = std::move(evidence_pack);
-    return result;
+    return {"coding prompt", std::move(messages), {}, 5'000,
+            std::move(evidence_pack)};
 }
 
 std::vector<agent::RuntimeEvent> completed_tool_trace() {

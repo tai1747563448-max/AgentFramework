@@ -76,10 +76,8 @@ agent::ModelRequest request(std::string issue = "issue") {
         {agent::Role::User, {agent::TextBlock{std::move(issue)}}}};
     std::vector<agent::ToolDefinition> tools = {
         {"read_file", u8"读取文件", input_schema}};
-    agent::ModelRequest result{
-        u8"你是编码代理。", std::move(messages), std::move(tools), 30'000};
-    result.evidence = evidence();
-    return result;
+    return {u8"你是编码代理。", std::move(messages), std::move(tools),
+            30'000, evidence()};
 }
 
 agent::ModelRequest complex_codec_request() {

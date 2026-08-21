@@ -68,8 +68,8 @@ agent::RuntimeEvent model_started(const std::string& task_id,
                                   std::string system_prompt =
                                       "runtime prompt") {
     agent::ModelRequest request{std::move(system_prompt),
-                                std::move(messages), {}, 30'000};
-    request.evidence = evidence(source_id);
+                                std::move(messages), {}, 30'000,
+                                evidence(source_id)};
     return event(task_id, sequence,
                  agent::ModelCallStartedPayload{std::move(request)});
 }
