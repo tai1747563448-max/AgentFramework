@@ -117,12 +117,14 @@ TEST_CASE(workspace_policy_blocks_metadata_secrets_and_runtime_data) {
     temp.write_text(".env.example", "NAME=value\n");
     temp.write_text(".git/config", "ignored\n");
     temp.write_text(".agent/control.json", "ignored\n");
+    temp.write_text(".rag/knowledge.sqlite3", "ignored\n");
     temp.write_text(".agent-cache/keep.txt", "ok\n");
     temp.write_text("runtime_data/events.jsonl", "ignored\n");
     temp.write_text("safe.txt", "ok\n");
     agent::workspace::WorkspacePathPolicy policy(temp.path() / "runtime_data");
 
     for (const auto& path : {".env", ".git/config", ".agent/control.json",
+                             ".rag/knowledge.sqlite3",
                              "runtime_data/events.jsonl"}) {
         const auto parsed = policy.parse(path);
         REQUIRE(std::holds_alternative<agent::workspace::RelativePath>(parsed));
@@ -149,6 +151,12 @@ TEST_CASE(workspace_policy_blocks_metadata_secrets_and_runtime_data) {
     const auto resolved_similar = policy.resolve_existing(
         temp.path(), value(similar), false);
     REQUIRE(std::holds_alternative<std::filesystem::path>(resolved_similar));
+
+    const auto rag_write = policy.parse(".rag/new-index.sqlite3");
+    const auto rag_parent = policy.resolve_parent(temp.path(), value(rag_write));
+    REQUIRE(std::holds_alternative<agent::workspace::Fault>(rag_parent));
+    REQUIRE(fault(rag_parent).code ==
+            agent::workspace::FaultCode::AccessDenied);
 }
 
 TEST_CASE(workspace_policy_requires_the_requested_leaf_kind_and_existing_parent) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "adapters/anthropic/anthropic_messages_client.h"
+#include "adapters/rag/python_rag_knowledge_provider.h"
 #include "domain/result.h"
 #include "domain/task_state.h"
 
@@ -27,6 +28,8 @@ struct RuntimeConfig {
     std::filesystem::path runtime_root;
     bool build_tools_enabled{false};
     std::int64_t build_timeout_ms{300'000};
+    bool rag_enabled{false};
+    PythonRagConfig rag;
     std::string system_prompt;
 };
 

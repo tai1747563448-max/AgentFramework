@@ -260,6 +260,8 @@ Result<RuntimeConfig> load_runtime_config(const Environment& environment) {
         exact_flag(environment, "AGENT_ENABLE_BUILD_TOOLS", false);
     const auto build_timeout_seconds =
         positive_integer(environment, "AGENT_BUILD_TIMEOUT_SECONDS", 300);
+    const auto rag_enabled =
+        exact_flag(environment, "AGENT_ENABLE_RAG", false);
     if (!max_tokens.has_value() || !model_rounds.has_value() ||
         !tool_calls.has_value() || !task_seconds.has_value() ||
         !timeout_seconds.has_value() || !build_timeout_seconds.has_value()) {
@@ -268,6 +270,9 @@ Result<RuntimeConfig> load_runtime_config(const Environment& environment) {
     }
     if (!build_tools_enabled.has_value()) {
         return invalid_config("build tool flag must be exactly 0 or 1");
+    }
+    if (!rag_enabled.has_value()) {
+        return invalid_config("rag flag must be exactly 0 or 1");
     }
     if (build_timeout_seconds.value() > 600) {
         return invalid_config(
@@ -291,6 +296,44 @@ Result<RuntimeConfig> load_runtime_config(const Environment& environment) {
     }
     const auto system_prompt = environment.get("AGENT_SYSTEM_PROMPT");
 
+    PythonRagConfig rag;
+    if (rag_enabled.value()) {
+        const auto python = environment.get("AGENT_RAG_PYTHON");
+        if (python.has_value() && python->empty()) {
+            return invalid_config("AGENT_RAG_PYTHON must not be empty");
+        }
+        const auto script = nonempty(environment, "AGENT_RAG_SCRIPT");
+        const auto index = nonempty(environment, "AGENT_RAG_INDEX");
+        if (!script.has_value() || !index.has_value()) {
+            return invalid_config(
+                "enabled rag requires script and index paths");
+        }
+        const auto top_k =
+            positive_integer(environment, "AGENT_RAG_TOP_K", 5);
+        const auto rag_timeout =
+            positive_integer(environment, "AGENT_RAG_TIMEOUT_SECONDS", 10);
+        if (!top_k.has_value() || !rag_timeout.has_value()) {
+            return invalid_config(
+                "rag numeric configuration must be a positive integer");
+        }
+        if (top_k.value() > 20) {
+            return invalid_config("rag top-k must be between 1 and 20");
+        }
+        if (rag_timeout.value() > 60) {
+            return invalid_config("rag timeout must be between 1 and 60 seconds");
+        }
+        try {
+            rag.python_program = python.has_value() ? *python : "python";
+            rag.script_path = std::filesystem::u8path(*script);
+            rag.index_path = std::filesystem::u8path(*index);
+            rag.top_k = static_cast<std::size_t>(top_k.value());
+            rag.timeout_seconds =
+                static_cast<std::int64_t>(rag_timeout.value());
+        } catch (const std::filesystem::filesystem_error&) {
+            return invalid_config("rag path configuration is invalid");
+        }
+    }
+
     RuntimeConfig config;
     config.anthropic = {*base_url,
                         *model,
@@ -310,6 +353,8 @@ Result<RuntimeConfig> load_runtime_config(const Environment& environment) {
     config.build_tools_enabled = build_tools_enabled.value();
     config.build_timeout_ms = static_cast<std::int64_t>(
         build_timeout_seconds.value() * 1000);
+    config.rag_enabled = rag_enabled.value();
+    config.rag = std::move(rag);
     config.system_prompt =
         system_prompt.has_value() ? *system_prompt : kDefaultSystemPrompt;
     return Result<RuntimeConfig>::success(std::move(config));
