@@ -21,8 +21,8 @@ The dependency direction points inward:
 - `src/ports` defines model, tool, knowledge, event-store, clock, ID, and
   cancellation interfaces.
 - `src/adapters` supplies Anthropic Messages HTTP, JSONL persistence, bounded
-  workspace file tools, an empty knowledge adapter, and system
-  clock/ID/cancellation implementations.
+  workspace file tools, opt-in structured CMake/CTest tools, an empty
+  knowledge adapter, and system clock/ID/cancellation implementations.
 - `src/main.cpp` is the composition root; `src/cli` parses `run` and
   `verify-log`, uses fixed failure messages, and bounds the fields printed by
   progress and log verification. A successful `run` renders final text as
@@ -43,16 +43,17 @@ tool block; `end_turn` and `stop_sequence` require nonempty tool-free text;
 `max_tokens` terminates as `BudgetExceeded`; unknown or inconsistent stops are
 direct `ModelCallFailed` protocol failures.
 
-This milestone provides versioned text-file inspection and editing, but not
-build/test process execution, Git mutation, real RAG, crash recovery,
-automatic retry, parallel execution, multiple agents, a second provider, an
-HTTP service, a TUI, MCP, or plugins. Structured build/test execution and the
-Python RAG sidecar are the next milestones; they are not implied by the file
-tools or by offline test success.
+This milestone provides versioned text-file inspection/editing and an opt-in,
+structured build/test loop. It does not provide a model-selectable shell, Git
+mutation, real RAG, crash recovery, automatic retry policy, parallel
+execution, multiple agents, a second provider, an HTTP service, a TUI, MCP, or
+plugins. The Python RAG sidecar is the next independent milestone; it is not
+implied by build-tool or offline-test success.
 
 ## Workspace file tools
 
-Every `run` exposes exactly five tools to the model:
+Every `run` exposes exactly five workspace file tools to the model; the
+explicit build-tool opt-in adds the three tools documented below:
 
 - `list_files` returns stable, workspace-relative directory entries.
 - `read_file` returns bounded UTF-8 lines and the SHA-256 of the complete
@@ -67,10 +68,11 @@ Every `run` exposes exactly five tools to the model:
 Tool paths are relative to the `--workspace` supplied for that durable task.
 Absolute paths, `..`, links/reparse points, multiply linked files, `.git`,
 `.worktrees`, secret-bearing `.env*` files (except `.env.example`), common
-credential files, runtime data, and reserved `.agent-tmp-*` names are refused
-or omitted. Writes use an exclusively created same-directory temporary file,
-flush it, atomically install it, and verify the installed bytes. A stale hash
-or match count is a retryable tool conflict and leaves the target unchanged.
+credential files, runtime data, `.agent`, and reserved `.agent-tmp-*` names are
+refused or omitted. Writes use an exclusively created same-directory temporary
+file, flush it, atomically install it, and verify the installed bytes. A stale
+hash or match count is a retryable tool conflict and leaves the target
+unchanged.
 
 Text files are strict UTF-8 without NUL and at most 1 MiB. A tool result is at
 most 64 KiB; listings and searches return at most 200 results. Recursive
@@ -78,6 +80,31 @@ search additionally stops at 2000 entries, 500 files, or 16 MiB scanned and
 reports the exact truncation reason. These checks are safety and determinism
 limits, not a sandbox against a hostile process concurrently racing the same
 workspace.
+
+## Structured build and test tools (opt-in)
+
+Build tools are disabled by default. Set `AGENT_ENABLE_BUILD_TOOLS=1` only for
+a trusted local workspace. This adds exactly three closed-schema tools after
+the five file tools:
+
+- `configure_project` configures `Debug` or `Release` with CMake.
+- `build_project` builds all targets or one strictly validated target.
+- `run_tests` runs all CTest tests or one exact, regex-escaped test name.
+
+The adapter always uses `<workspace>/.agent/cmake-build`, fixed `cmake` or
+`ctest` programs, and adapter-owned argument vectors. The model cannot select
+a program, shell, working directory, environment variable, package command,
+Git command, or network command. `AGENT_BUILD_TIMEOUT_SECONDS` defaults to 300
+and must be an integer from 1 through 600. Process stdout/stderr and the final
+JSON tool result are bounded; a nonzero exit or timeout is returned as
+`ToolResult{is_error=true}` so the model can inspect the failure, edit, and
+retry without changing the task state machine.
+
+No shell is involved, but this is not an OS sandbox. CMake configuration,
+compilers, and project tests execute code from the workspace with the current
+user's filesystem permissions. The child environment is reduced and provider
+credentials are excluded, yet enabling these tools still authorizes trusted
+workspace code execution. Keep them disabled for unknown repositories.
 
 ## Build and offline tests on Visual Studio 2022
 

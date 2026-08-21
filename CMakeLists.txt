@@ -57,13 +57,18 @@ add_library(agent_runtime STATIC
     src/adapters/workspace/workspace_path_policy.cpp
     src/adapters/workspace/workspace_file_ops.cpp
     src/adapters/workspace/workspace_tool_gateway.cpp
+    src/adapters/process/direct_process_runner.cpp
+    src/adapters/build/cmake_tool_gateway.cpp
+    src/adapters/tools/composite_tool_gateway.cpp
     src/adapters/system/system_clock.cpp
     src/adapters/system/random_id_generator.cpp
     src/adapters/system/signal_cancellation.cpp
     src/config/runtime_config.cpp
     src/cli/cli_app.cpp)
 target_include_directories(agent_runtime PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_link_libraries(agent_runtime PUBLIC agent_kernel PRIVATE dotenv_header_only)
+target_link_libraries(agent_runtime
+    PUBLIC agent_kernel Threads::Threads
+    PRIVATE dotenv_header_only)
 if(MSVC)
     target_compile_options(agent_runtime PRIVATE /W4 /permissive- /utf-8)
     target_compile_definitions(agent_runtime PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -109,6 +114,24 @@ add_agent_test(workspace_primitives_tests tests/adapters/workspace_primitives_te
 target_link_libraries(workspace_primitives_tests PRIVATE agent_runtime)
 add_agent_test(workspace_tool_gateway_tests tests/adapters/workspace_tool_gateway_test.cpp)
 target_link_libraries(workspace_tool_gateway_tests PRIVATE agent_runtime)
+add_executable(process_fixture tests/process/process_fixture.cpp)
+target_link_libraries(process_fixture PRIVATE nlohmann_json::nlohmann_json Threads::Threads)
+if(MSVC)
+    target_compile_options(process_fixture PRIVATE /W4 /permissive- /utf-8)
+    target_compile_definitions(process_fixture PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+add_agent_test(direct_process_runner_tests tests/adapters/direct_process_runner_test.cpp)
+target_link_libraries(direct_process_runner_tests PRIVATE agent_runtime Threads::Threads)
+add_dependencies(direct_process_runner_tests process_fixture)
+target_compile_definitions(direct_process_runner_tests PRIVATE
+    AGENT_PROCESS_FIXTURE_PATH="$<TARGET_FILE:process_fixture>"
+    _CRT_SECURE_NO_WARNINGS)
+add_agent_test(composite_tool_gateway_tests tests/adapters/composite_tool_gateway_test.cpp)
+target_link_libraries(composite_tool_gateway_tests PRIVATE agent_runtime)
+add_agent_test(cmake_tool_gateway_tests tests/adapters/cmake_tool_gateway_test.cpp)
+target_link_libraries(cmake_tool_gateway_tests PRIVATE agent_runtime)
+add_agent_test(build_tool_integration_tests tests/integration/build_tool_integration_test.cpp)
+target_link_libraries(build_tool_integration_tests PRIVATE agent_runtime)
 add_test(
     NAME verify_log_process_credential_free
     COMMAND ${CMAKE_COMMAND}

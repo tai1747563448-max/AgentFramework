@@ -1,8 +1,10 @@
 #include "adapters/anthropic/anthropic_messages_client.h"
 #include "adapters/anthropic/http_transport.h"
+#include "adapters/build/cmake_tool_gateway.h"
 #include "adapters/empty/empty_knowledge_provider.h"
 #include "adapters/empty/empty_tool_gateway.h"
 #include "adapters/persistence/jsonl_event_store.h"
+#include "adapters/tools/composite_tool_gateway.h"
 #include "adapters/workspace/workspace_text.h"
 #include "adapters/workspace/workspace_tool_gateway.h"
 #include "application/runtime_engine.h"
@@ -12,7 +14,10 @@
 #include "ports/clock.h"
 #include "ports/id_generator.h"
 #include "ports/model_client.h"
+#include "ports/process_runner.h"
 #include "test_support.h"
+
+#include <nlohmann/json.hpp>
 
 #include <cstdint>
 #include <filesystem>
@@ -80,6 +85,29 @@ public:
     bool requested() const noexcept override {
         return false;
     }
+};
+
+class ScriptedProcessRunner final : public agent::ProcessRunner {
+public:
+    explicit ScriptedProcessRunner(std::vector<agent::ProcessOutput> outputs)
+        : outputs_(std::move(outputs)) {}
+
+    agent::Result<agent::ProcessOutput> run(
+        const agent::ProcessRequest& request) override {
+        requests.push_back(request);
+        if (next_ >= outputs_.size()) {
+            return agent::Result<agent::ProcessOutput>::failure(
+                {agent::ErrorCode::ProtocolFailure,
+                 "scripted process output exhausted", false});
+        }
+        return agent::Result<agent::ProcessOutput>::success(outputs_.at(next_++));
+    }
+
+    std::vector<agent::ProcessRequest> requests;
+
+private:
+    std::vector<agent::ProcessOutput> outputs_;
+    std::size_t next_{0};
 };
 
 class SecretFailingHttp final : public agent::HttpTransport {
@@ -186,6 +214,12 @@ agent::ToolCall replace_call(std::string id,
                 {"new_text", std::move(new_text)},
                 {"expected_occurrences", occurrences},
                 {"expected_sha256", std::move(hash)}})};
+}
+
+agent::ToolCall build_call(std::string id) {
+    return {std::move(id), "build_project",
+            agent::Value::object({{"configuration", "Debug"},
+                                  {"target", "agent_tests"}})};
 }
 
 agent::ModelResponse tool_response(agent::ToolCall call,
@@ -309,6 +343,102 @@ TEST_CASE(real_workspace_gateway_completes_versioned_file_workflow) {
         REQUIRE(request.tools.at(3).name == "replace_text");
         REQUIRE(request.tools.at(4).name == "write_file");
     }
+}
+
+TEST_CASE(production_equivalent_composition_exposes_five_or_eight_tools) {
+    test::ScopedTempDir temp("runtime-tool-composition");
+    agent::WorkspaceToolGateway files(temp.path() / "runtime_data");
+    test::ScriptedProcessRunner process({});
+    agent::CMakeToolGateway builds(process, 300'000);
+
+    for (const bool enabled : {false, true}) {
+        std::vector<std::reference_wrapper<agent::ToolGateway>> gateways{files};
+        if (enabled) {
+            gateways.push_back(builds);
+        }
+        agent::CompositeToolGateway composite(std::move(gateways));
+        const auto definitions = composite.definitions();
+        const std::vector<std::string> expected =
+            enabled
+                ? std::vector<std::string>{
+                      "list_files", "read_file", "search_text", "replace_text",
+                      "write_file", "configure_project", "build_project",
+                      "run_tests"}
+                : std::vector<std::string>{
+                      "list_files", "read_file", "search_text", "replace_text",
+                      "write_file"};
+        REQUIRE(definitions.size() == expected.size());
+        for (std::size_t index = 0; index < expected.size(); ++index) {
+            REQUIRE(definitions.at(index).name == expected.at(index));
+        }
+    }
+}
+
+TEST_CASE(runtime_persists_failed_build_result_then_successful_retry) {
+    test::ScopedTempDir root("runtime-build-retry");
+    const auto workspace = root.path() / "workspace";
+    const auto runtime_root = root.path() / "runtime_data";
+    std::filesystem::create_directories(workspace);
+    test::ScriptedProcessRunner process({
+        {1, false, 11, "", "first build failed", false, false},
+        {0, false, 9, "second build passed", "", false, false}});
+    agent::WorkspaceToolGateway files(runtime_root);
+    agent::CMakeToolGateway builds(process, 300'000);
+    agent::CompositeToolGateway tools({files, builds});
+    agent::JsonlEventStore store(runtime_root);
+    test::FakeModel model({
+        fixtures::tool_response(fixtures::build_call("call-build-fail"),
+                                "provider-request-build-fail"),
+        fixtures::tool_response(fixtures::build_call("call-build-pass"),
+                                "provider-request-build-pass"),
+        fixtures::text_response("build verified")});
+    test::RealRuntimeFixture runtime(model, tools, store);
+
+    const auto result = runtime.run(
+        {"build and test the project", workspace.generic_u8string(),
+         "inspect, edit, and verify", {4, 2, 30'000, 5'000}});
+
+    REQUIRE(result.state.has_value());
+    REQUIRE(!result.fatal_error.has_value());
+    REQUIRE(result.state->status == agent::TaskStatus::Completed);
+    REQUIRE(result.state->final_text ==
+            std::optional<std::string>{"build verified"});
+    REQUIRE(process.requests.size() == 2);
+    REQUIRE(model.requests.size() == 3);
+    for (const auto& request : model.requests) {
+        REQUIRE(request.tools.size() == 8);
+    }
+
+    const auto* failed_result = std::get_if<agent::ToolResultBlock>(
+        &model.requests.at(1).messages.back().content.front());
+    REQUIRE(failed_result != nullptr);
+    REQUIRE(failed_result->result.is_error);
+    REQUIRE(nlohmann::json::parse(failed_result->result.content)
+                .at("exit_code") == 1);
+    const auto* passed_result = std::get_if<agent::ToolResultBlock>(
+        &model.requests.at(2).messages.back().content.front());
+    REQUIRE(passed_result != nullptr);
+    REQUIRE(!passed_result->result.is_error);
+    REQUIRE(nlohmann::json::parse(passed_result->result.content)
+                .at("exit_code") == 0);
+
+    const auto event_path = store.event_path(result.state->task_id);
+    REQUIRE(event_path.has_value());
+    const auto loaded = store.read_file(event_path.value());
+    REQUIRE(loaded.has_value());
+    std::size_t succeeded = 0;
+    std::size_t failed = 0;
+    for (const auto& event : loaded.value()) {
+        if (std::holds_alternative<agent::ToolCallSucceededPayload>(
+                event.payload)) {
+            ++succeeded;
+        }
+        if (std::holds_alternative<agent::ToolCallFailedPayload>(event.payload)) {
+            ++failed;
+        }
+    }
+    REQUIRE(succeeded == 2);
+    REQUIRE(failed == 0);
 }
 
 TEST_CASE(cli_progress_exactly_matches_real_runtime_jsonl_durable_order) {

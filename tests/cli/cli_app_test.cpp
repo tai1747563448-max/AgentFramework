@@ -721,8 +721,11 @@ TEST_CASE(config_loads_defaults_and_api_key_authentication) {
     REQUIRE(config.value().budgets.max_task_time_ms == 1'800'000);
     REQUIRE(config.value().budgets.model_timeout_ms == 120'000);
     REQUIRE(config.value().runtime_root == std::filesystem::path("runtime_data"));
+    REQUIRE(config.value().build_tools_enabled == false);
+    REQUIRE(config.value().build_timeout_ms == 300'000);
     REQUIRE(config.value().system_prompt ==
-            "You are a coding agent runtime. Use only tools explicitly provided.");
+            "You are a coding agent. Inspect the workspace, make focused edits, "
+            "and verify the result. Use only the tools explicitly provided.");
 }
 
 TEST_CASE(config_loads_explicit_values_and_bearer_authentication) {
@@ -735,6 +738,8 @@ TEST_CASE(config_loads_explicit_values_and_bearer_authentication) {
         {"AGENT_MAX_TOOL_CALLS", "11"},
         {"AGENT_MAX_TASK_SECONDS", "31"},
         {"AGENT_MODEL_TIMEOUT_SECONDS", "13"},
+        {"AGENT_ENABLE_BUILD_TOOLS", "1"},
+        {"AGENT_BUILD_TIMEOUT_SECONDS", "17"},
         {"AGENT_RUNTIME_ROOT", u8"运行数据"},
         {"AGENT_SYSTEM_PROMPT", u8"仅使用已提供的工具。"},
     };
@@ -747,7 +752,53 @@ TEST_CASE(config_loads_explicit_values_and_bearer_authentication) {
     REQUIRE((config.value().budgets ==
              agent::RuntimeBudgets{7, 11, 31'000, 13'000}));
     REQUIRE(config.value().runtime_root == std::filesystem::u8path(u8"运行数据"));
+    REQUIRE(config.value().build_tools_enabled == true);
+    REQUIRE(config.value().build_timeout_ms == 17'000);
     REQUIRE(config.value().system_prompt == u8"仅使用已提供的工具。");
+}
+
+TEST_CASE(config_parses_build_tool_opt_in_as_exact_zero_or_one) {
+    for (const auto& entry :
+         std::vector<std::pair<std::string, bool>>{{"0", false},
+                                                   {"1", true}}) {
+        test::MapEnvironment env{
+            {"AGENT_BASE_URL", "https://provider.example"},
+            {"AGENT_MODEL", "model-id"},
+            {"AGENT_API_KEY", "credential"},
+            {"AGENT_ENABLE_BUILD_TOOLS", entry.first}};
+        const auto config = agent::load_runtime_config(env);
+        REQUIRE(config.has_value());
+        REQUIRE(config.value().build_tools_enabled == entry.second);
+        REQUIRE(config.value().build_timeout_ms == 300'000);
+    }
+}
+
+TEST_CASE(config_rejects_malformed_build_opt_in_and_out_of_range_timeout) {
+    const std::vector<std::pair<std::string, std::string>> invalid_values = {
+        {"AGENT_ENABLE_BUILD_TOOLS", ""},
+        {"AGENT_ENABLE_BUILD_TOOLS", "true"},
+        {"AGENT_ENABLE_BUILD_TOOLS", "01"},
+        {"AGENT_ENABLE_BUILD_TOOLS", "2"},
+        {"AGENT_ENABLE_BUILD_TOOLS", "-1"},
+        {"AGENT_BUILD_TIMEOUT_SECONDS", ""},
+        {"AGENT_BUILD_TIMEOUT_SECONDS", "0"},
+        {"AGENT_BUILD_TIMEOUT_SECONDS", "-1"},
+        {"AGENT_BUILD_TIMEOUT_SECONDS", "601"},
+        {"AGENT_BUILD_TIMEOUT_SECONDS", "18446744073709551616"}};
+    for (const auto& invalid : invalid_values) {
+        test::MapEnvironment env{
+            {"AGENT_BASE_URL", "https://provider.example"},
+            {"AGENT_MODEL", "model-id"},
+            {"AGENT_API_KEY", "credential"},
+            {invalid.first, invalid.second}};
+        const auto config = agent::load_runtime_config(env);
+        REQUIRE(!config.has_value());
+        REQUIRE(config.error().code == agent::ErrorCode::InvalidConfiguration);
+        if (!invalid.second.empty()) {
+            REQUIRE(config.error().message.find(invalid.second) ==
+                    std::string::npos);
+        }
+    }
 }
 
 TEST_CASE(config_rejects_missing_or_multiple_authentication_modes) {

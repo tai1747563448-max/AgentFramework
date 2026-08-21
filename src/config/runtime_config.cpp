@@ -20,7 +20,8 @@ namespace agent {
 namespace {
 
 constexpr const char* kDefaultSystemPrompt =
-    "You are a coding agent runtime. Use only tools explicitly provided.";
+    "You are a coding agent. Inspect the workspace, make focused edits, "
+    "and verify the result. Use only the tools explicitly provided.";
 
 class NullOutputBuffer final : public std::streambuf {
 protected:
@@ -77,6 +78,24 @@ Result<std::uint64_t> positive_integer(const Environment& environment,
              false});
     }
     return Result<std::uint64_t>::success(value);
+}
+
+Result<bool> exact_flag(const Environment& environment,
+                        const char* name,
+                        bool default_value) {
+    const auto configured = environment.get(name);
+    if (!configured.has_value()) {
+        return Result<bool>::success(default_value);
+    }
+    if (*configured == "0") {
+        return Result<bool>::success(false);
+    }
+    if (*configured == "1") {
+        return Result<bool>::success(true);
+    }
+    return Result<bool>::failure(
+        {ErrorCode::InvalidConfiguration,
+         "flag configuration must be exactly 0 or 1", false});
 }
 
 Result<std::string> dotenv_filename(const std::filesystem::path& path) {
@@ -237,11 +256,22 @@ Result<RuntimeConfig> load_runtime_config(const Environment& environment) {
         positive_integer(environment, "AGENT_MAX_TASK_SECONDS", 1800);
     const auto timeout_seconds =
         positive_integer(environment, "AGENT_MODEL_TIMEOUT_SECONDS", 120);
+    const auto build_tools_enabled =
+        exact_flag(environment, "AGENT_ENABLE_BUILD_TOOLS", false);
+    const auto build_timeout_seconds =
+        positive_integer(environment, "AGENT_BUILD_TIMEOUT_SECONDS", 300);
     if (!max_tokens.has_value() || !model_rounds.has_value() ||
         !tool_calls.has_value() || !task_seconds.has_value() ||
-        !timeout_seconds.has_value()) {
+        !timeout_seconds.has_value() || !build_timeout_seconds.has_value()) {
         return invalid_config(
             "numeric configuration must be a positive in-range integer");
+    }
+    if (!build_tools_enabled.has_value()) {
+        return invalid_config("build tool flag must be exactly 0 or 1");
+    }
+    if (build_timeout_seconds.value() > 600) {
+        return invalid_config(
+            "build timeout must be between 1 and 600 seconds");
     }
 
     constexpr auto kInt64Max =
@@ -250,7 +280,8 @@ Result<RuntimeConfig> load_runtime_config(const Environment& environment) {
         model_rounds.value() > std::numeric_limits<std::size_t>::max() ||
         tool_calls.value() > std::numeric_limits<std::size_t>::max() ||
         task_seconds.value() > kInt64Max / 1000 ||
-        timeout_seconds.value() > kInt64Max / 1000) {
+        timeout_seconds.value() > kInt64Max / 1000 ||
+        build_timeout_seconds.value() > kInt64Max / 1000) {
         return invalid_config("numeric configuration is out of range");
     }
 
@@ -276,6 +307,9 @@ Result<RuntimeConfig> load_runtime_config(const Environment& environment) {
     config.runtime_root = runtime_root_value.has_value()
                               ? std::filesystem::u8path(*runtime_root_value)
                               : std::filesystem::path("runtime_data");
+    config.build_tools_enabled = build_tools_enabled.value();
+    config.build_timeout_ms = static_cast<std::int64_t>(
+        build_timeout_seconds.value() * 1000);
     config.system_prompt =
         system_prompt.has_value() ? *system_prompt : kDefaultSystemPrompt;
     return Result<RuntimeConfig>::success(std::move(config));

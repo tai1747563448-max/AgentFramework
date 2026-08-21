@@ -116,11 +116,14 @@ TEST_CASE(workspace_policy_blocks_metadata_secrets_and_runtime_data) {
     temp.write_text(".env", "SECRET=value\n");
     temp.write_text(".env.example", "NAME=value\n");
     temp.write_text(".git/config", "ignored\n");
+    temp.write_text(".agent/control.json", "ignored\n");
+    temp.write_text(".agent-cache/keep.txt", "ok\n");
     temp.write_text("runtime_data/events.jsonl", "ignored\n");
     temp.write_text("safe.txt", "ok\n");
     agent::workspace::WorkspacePathPolicy policy(temp.path() / "runtime_data");
 
-    for (const auto& path : {".env", ".git/config", "runtime_data/events.jsonl"}) {
+    for (const auto& path : {".env", ".git/config", ".agent/control.json",
+                             "runtime_data/events.jsonl"}) {
         const auto parsed = policy.parse(path);
         REQUIRE(std::holds_alternative<agent::workspace::RelativePath>(parsed));
         const auto resolved = policy.resolve_existing(
@@ -141,6 +144,11 @@ TEST_CASE(workspace_policy_blocks_metadata_secrets_and_runtime_data) {
     const auto resolved_safe = policy.resolve_existing(
         temp.path(), value(safe), false);
     REQUIRE(std::holds_alternative<std::filesystem::path>(resolved_safe));
+
+    const auto similar = policy.parse(".agent-cache/keep.txt");
+    const auto resolved_similar = policy.resolve_existing(
+        temp.path(), value(similar), false);
+    REQUIRE(std::holds_alternative<std::filesystem::path>(resolved_similar));
 }
 
 TEST_CASE(workspace_policy_requires_the_requested_leaf_kind_and_existing_parent) {

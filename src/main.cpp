@@ -1,10 +1,13 @@
 #include "adapters/anthropic/anthropic_messages_client.h"
 #include "adapters/anthropic/cpr_http_transport.h"
+#include "adapters/build/cmake_tool_gateway.h"
 #include "adapters/empty/empty_knowledge_provider.h"
 #include "adapters/persistence/jsonl_event_store.h"
+#include "adapters/process/direct_process_runner.h"
 #include "adapters/system/random_id_generator.h"
 #include "adapters/system/signal_cancellation.h"
 #include "adapters/system/system_clock.h"
+#include "adapters/tools/composite_tool_gateway.h"
 #include "adapters/workspace/workspace_tool_gateway.h"
 #include "application/runtime_engine.h"
 #include "application/state_reducer.h"
@@ -13,6 +16,7 @@
 
 #include <exception>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -71,7 +75,16 @@ int run_agent(std::vector<std::string> args) {
 
         agent::CprHttpTransport transport;
         agent::AnthropicMessagesClient model(config.value().anthropic, transport);
-        agent::WorkspaceToolGateway tools(config.value().runtime_root);
+        agent::DirectProcessRunner process;
+        agent::WorkspaceToolGateway file_tools(config.value().runtime_root);
+        agent::CMakeToolGateway build_tools(
+            process, config.value().build_timeout_ms);
+        std::vector<std::reference_wrapper<agent::ToolGateway>> gateways{
+            std::ref(file_tools)};
+        if (config.value().build_tools_enabled) {
+            gateways.push_back(std::ref(build_tools));
+        }
+        agent::CompositeToolGateway tools(std::move(gateways));
         agent::EmptyKnowledgeProvider knowledge;
         agent::JsonlEventStore events(config.value().runtime_root);
         agent::SystemClock clock;

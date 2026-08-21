@@ -25,6 +25,8 @@ struct RuntimeConfig {
     AnthropicConfig anthropic;
     RuntimeBudgets budgets;
     std::filesystem::path runtime_root;
+    bool build_tools_enabled{false};
+    std::int64_t build_timeout_ms{300'000};
     std::string system_prompt;
 };
 
