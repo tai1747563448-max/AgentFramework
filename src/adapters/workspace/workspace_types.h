@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <variant>
@@ -38,6 +39,25 @@ struct LinePage {
     std::size_t total_lines{0};
     std::string content;
     std::optional<std::size_t> next_start_line;
+};
+
+struct WorkspaceEntry {
+    std::string path;
+    bool directory{false};
+    std::uintmax_t size_bytes{0};
+};
+
+struct ListOutput {
+    std::vector<WorkspaceEntry> entries;
+    bool truncated{false};
+    std::string truncation_reason;
+    std::size_t omitted_entries{0};
+};
+
+struct ReadOutput {
+    std::string path;
+    std::string sha256;
+    LinePage page;
 };
 
 }  // namespace agent::workspace

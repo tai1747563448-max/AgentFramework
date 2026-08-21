@@ -55,6 +55,8 @@ add_library(agent_runtime STATIC
     src/adapters/empty/empty_knowledge_provider.cpp
     src/adapters/workspace/workspace_text.cpp
     src/adapters/workspace/workspace_path_policy.cpp
+    src/adapters/workspace/workspace_file_ops.cpp
+    src/adapters/workspace/workspace_tool_gateway.cpp
     src/adapters/system/system_clock.cpp
     src/adapters/system/random_id_generator.cpp
     src/adapters/system/signal_cancellation.cpp
@@ -105,6 +107,8 @@ add_agent_test(runtime_integration_tests tests/integration/runtime_integration_t
 target_link_libraries(runtime_integration_tests PRIVATE agent_runtime)
 add_agent_test(workspace_primitives_tests tests/adapters/workspace_primitives_test.cpp)
 target_link_libraries(workspace_primitives_tests PRIVATE agent_runtime)
+add_agent_test(workspace_tool_gateway_tests tests/adapters/workspace_tool_gateway_test.cpp)
+target_link_libraries(workspace_tool_gateway_tests PRIVATE agent_runtime)
 add_test(
     NAME verify_log_process_credential_free
     COMMAND ${CMAKE_COMMAND}
