@@ -256,8 +256,16 @@ claims exactly-once external effects.
 Durable cumulative model/tool counts continue across attempts. The wall-clock
 limit is monotonic only within one process attempt and restarts for an explicit
 resume; this is a documented V1 limitation, not a durable elapsed-time budget.
+Those counters measure persisted logical call intents. Reexecuting the same
+in-flight intent does not increment them, so repeated operator resumes after
+pre-outcome crashes are not a globally bounded count of physical attempts.
 Nonterminal resume needs the same local Provider/tool/RAG configuration as a
 fresh run. A terminal resume makes no Provider request.
+
+Resume storage is more restrictive than arbitrary `verify-log` input: it opens
+the runtime root, `tasks`, task directory, and `events.jsonl` without following
+link/reparse components, requires a regular single-link leaf, and binds the
+decoded task ID to the requested ID before any Provider, RAG, or tool call.
 
 ## Verify an event log
 

@@ -68,11 +68,31 @@ result. `.git`, runtime sentinel, and an outside sentinel remain unchanged.
 - Recovery is at-least-once for external calls. Exactly-once effects are not
   claimed; safe tools use version/hash preconditions so duplicates can be
   reconciled.
+- Durable model/tool counts measure logical call intents, not physical recovery
+  attempts. Repeated manual resumes after pre-outcome crashes are not globally
+  bounded by those counters.
 - Model/tool count budgets are durable. The monotonic wall timer restarts for a
   new explicit process attempt.
 - The real workflow uses a scripted model and makes no Provider/network call.
   It proves orchestration and adapter composition, not live Provider quality.
 
-## Review and final verification
+## Independent review fixes
 
-Pending independent review and a fresh disconnected full build/CTest run.
+The first independent recovery review reported no Critical finding and three
+Important findings:
+
+1. a recovered in-flight wall-time terminal was rejected by the Reducer;
+2. the design overstated durable logical counts as a physical-attempt bound;
+3. resume used the general link-following log reader before external calls.
+
+It also found that the resume process fixture unset two obsolete environment
+names. Focused RED proved the wall guard returned fatal `InvalidTransition`,
+`JsonlEventStore` had no safe task-read API, and a hard-linked valid task log
+made the real `agent resume` process return success. The fixes permit an exact
+time-budget terminal from recovered in-flight model/tool states, document the
+logical-count semantics, add a task-ID-bound no-follow read on Windows and
+POSIX, route the composition root through it, and correct the environment
+names. Focused MSVC tests pass; WSL warning-as-error tests additionally execute
+the directory-link rejection that the current Windows token cannot create.
+
+Final disconnected full verification remains pending after re-review.

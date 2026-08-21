@@ -1090,7 +1090,7 @@ TEST_CASE(generic_budget_terminal_requires_exact_payload_for_each_name) {
     }
 }
 
-TEST_CASE(generic_budget_terminal_rejects_nonidle_runtime_states) {
+TEST_CASE(generic_budget_terminal_distinguishes_time_from_count_guards) {
     struct RuntimePrefix {
         const char* task;
         std::vector<agent::RuntimeEvent> events;
@@ -1100,22 +1100,11 @@ TEST_CASE(generic_budget_terminal_rejects_nonidle_runtime_states) {
          {fixtures::task_started("budget-created", 1, "issue",
                                  {1, 1, 90'000, 30'000})}},
         {"budget-model-active",
-         {fixtures::task_started("budget-model-active", 1, "issue",
-                                 {2, 1, 90'000, 30'000}),
-          fixtures::context_started("budget-model-active", 2),
-          fixtures::context_prepared("budget-model-active", 3, "source-1"),
-          fixtures::model_started("budget-model-active", 4, "source-1"),
-          fixtures::model_succeeded(
-              "budget-model-active", 5,
-              {agent::ToolUseBlock{fixtures::first_call()}},
-              agent::StopReason::ToolUse),
-          fixtures::tool_started("budget-model-active", 6,
-                                 fixtures::first_call()),
-          fixtures::tool_succeeded("budget-model-active", 7,
-                                   fixtures::first_result()),
-          fixtures::context_started("budget-model-active", 8),
-          fixtures::context_prepared("budget-model-active", 9, "source-2"),
-          fixtures::model_started("budget-model-active", 10, "source-2")}},
+          {fixtures::task_started("budget-model-active", 1, "issue",
+                                  {2, 1, 90'000, 30'000}),
+           fixtures::context_started("budget-model-active", 2),
+           fixtures::context_prepared("budget-model-active", 3, "source-1"),
+           fixtures::model_started("budget-model-active", 4, "source-1")}},
         {"budget-tool-active",
          {fixtures::task_started("budget-tool-active", 1, "issue",
                                  {1, 1, 90'000, 30'000}),
@@ -1130,13 +1119,12 @@ TEST_CASE(generic_budget_terminal_rejects_nonidle_runtime_states) {
           fixtures::tool_started("budget-tool-active", 6,
                                  fixtures::first_call())}},
     };
-    const std::vector<std::pair<std::string, std::string>> budgets = {
-        {"max_task_time_ms", "max_task_time_ms budget exceeded"},
+    const std::vector<std::pair<std::string, std::string>> count_budgets = {
         {"max_model_rounds", "max_model_rounds budget exceeded"},
         {"max_tool_calls", "max_tool_calls budget exceeded"},
     };
     for (const auto& prefix : prefixes) {
-        for (const auto& budget : budgets) {
+        for (const auto& budget : count_budgets) {
             auto events = prefix.events;
             events.push_back(fixtures::event(
                 prefix.task, events.back().sequence + 1,
@@ -1147,6 +1135,31 @@ TEST_CASE(generic_budget_terminal_rejects_nonidle_runtime_states) {
             REQUIRE(!result.has_value());
             REQUIRE(result.error().code == agent::ErrorCode::InvalidTransition);
         }
+    }
+
+    {
+        auto events = prefixes.front().events;
+        events.push_back(fixtures::event(
+            prefixes.front().task, 2,
+            agent::TaskBudgetExceededPayload{
+                "max_task_time_ms",
+                {agent::ErrorCode::BudgetExceeded,
+                 "max_task_time_ms budget exceeded", false}}));
+        const auto result = agent::replay_events(events);
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == agent::ErrorCode::InvalidTransition);
+    }
+    for (std::size_t index = 1; index < prefixes.size(); ++index) {
+        auto events = prefixes[index].events;
+        events.push_back(fixtures::event(
+            prefixes[index].task, events.back().sequence + 1,
+            agent::TaskBudgetExceededPayload{
+                "max_task_time_ms",
+                {agent::ErrorCode::BudgetExceeded,
+                 "max_task_time_ms budget exceeded", false}}));
+        const auto result = agent::replay_events(events);
+        REQUIRE(result.has_value());
+        REQUIRE(result.value().status == agent::TaskStatus::BudgetExceeded);
     }
 }
 

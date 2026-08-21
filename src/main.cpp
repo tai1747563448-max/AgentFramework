@@ -133,15 +133,7 @@ int run_agent(std::vector<std::string> args) {
         agent::ResumeCommand resume = [&]
             (const std::string& task_id,
              const agent::RuntimeProgressObserver& observer) {
-            const auto path = events.event_path(task_id);
-            if (!path.has_value()) {
-                return agent::RuntimeResult{
-                    std::nullopt,
-                    agent::RuntimeError{
-                        agent::ErrorCode::PersistenceFailure,
-                        "task event log could not be loaded", false}};
-            }
-            auto loaded = events.read_file(path.value());
+            auto loaded = events.read_task(task_id);
             if (!loaded.has_value() || loaded.value().empty() ||
                 loaded.value().front().task_id != task_id) {
                 return agent::RuntimeResult{

@@ -117,16 +117,19 @@ The same state-driven continuation loop serves both a fresh `run` and a
 ### 3.5 Budgets and cancellation
 
 Durable model/tool usage counters continue across restarts. An in-flight call
-already consumed its count when its `*Started` event was reduced, so its one
-recovery reexecution is allowed without incrementing the counter again. A new
-call still observes the normal count guard.
+already consumed its logical-call count when its `*Started` event was reduced,
+so a recovery reexecution does not increment the counter again. A new call
+still observes the normal count guard.
 
 Cancellation and wall-time guards run before every recovered external call.
 The monotonic wall-time budget starts at the beginning of each explicit `run`
 or `resume` process attempt. V1 cannot compare monotonic readings across
 processes, so it deliberately does not claim a lifetime wall-clock budget.
-Repeated operator resumes remain bounded by the durable call-count budgets
-whenever an external call intent was persisted.
+The durable call-count budgets limit logical call intents, not physical
+at-least-once attempts. An operator can repeatedly invoke `resume` after a
+process dies before persisting the same call's outcome; V1 has no durable
+attempt counter and does not claim that such manual attempts are globally
+bounded.
 
 ## 4. Credential-free evaluation
 

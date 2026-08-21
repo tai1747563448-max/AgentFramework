@@ -299,8 +299,9 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                         typed_payload.budget_name + " budget exceeded", false};
                     if ((!is_time_budget && !is_model_budget && !is_tool_budget) ||
                         !(typed_payload.error == expected_error) ||
-                        state.model_call_in_flight ||
-                        state.active_tool_call_id.has_value() ||
+                        (!is_time_budget &&
+                         (state.model_call_in_flight ||
+                          state.active_tool_call_id.has_value())) ||
                         follows_max_tokens || follows_text_completion) {
                         return invalid_transition(
                             "task budget terminal is not a legal generic guard");

@@ -617,6 +617,55 @@ TEST_CASE(jsonl_append_rejects_a_leaf_hard_link_without_modifying_its_target) {
     REQUIRE(fixtures::read_all(external) == original_external_bytes);
 }
 
+TEST_CASE(jsonl_task_read_rejects_a_leaf_hard_link) {
+    test::ScopedTempDir temp("jsonl-read-hard-link");
+    const auto task = fixtures::valid_task_id("read-hard-link");
+    const auto runtime_root = temp.path() / "runtime";
+    const auto task_directory = runtime_root / "tasks" / task;
+    std::filesystem::create_directories(task_directory);
+    const auto external = temp.write_text(
+        "outside/events.jsonl",
+        fixtures::as_jsonl({fixtures::task_started(task, 1, "issue")}));
+    std::error_code link_error;
+    std::filesystem::create_hard_link(
+        external, task_directory / "events.jsonl", link_error);
+    REQUIRE(!link_error);
+    agent::JsonlEventStore store(runtime_root);
+
+    const auto loaded = store.read_task(task);
+
+    REQUIRE(!loaded.has_value());
+    REQUIRE(loaded.error().code == agent::ErrorCode::PersistenceFailure);
+}
+
+TEST_CASE(jsonl_task_read_never_follows_link_components) {
+    test::ScopedTempDir temp("jsonl-read-links");
+    const auto task = fixtures::valid_task_id("read-links");
+    const auto runtime_root = temp.path() / "runtime";
+    std::filesystem::create_directories(runtime_root / "tasks");
+    const auto external_directory = temp.path() / "outside" / task;
+    std::filesystem::create_directories(external_directory);
+    temp.write_text(
+        std::filesystem::relative(external_directory / "events.jsonl",
+                                  temp.path()),
+        fixtures::as_jsonl({fixtures::task_started(task, 1, "issue")}));
+    std::error_code link_error;
+    std::filesystem::create_directory_symlink(
+        external_directory, runtime_root / "tasks" / task, link_error);
+    if (link_error) {
+        std::cout << "SKIP task-read directory-link regression: environment "
+                     "cannot create a directory link ("
+                  << link_error.message() << ")\n";
+        return;
+    }
+    agent::JsonlEventStore store(runtime_root);
+
+    const auto loaded = store.read_task(task);
+
+    REQUIRE(!loaded.has_value());
+    REQUIRE(loaded.error().code == agent::ErrorCode::PersistenceFailure);
+}
+
 TEST_CASE(event_json_rejects_extra_keys_in_every_schema_owned_object_family) {
     using Json = nlohmann::json;
     std::vector<Json> invalid_records;

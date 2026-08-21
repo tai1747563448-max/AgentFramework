@@ -14,8 +14,8 @@ set(ENV{AGENT_MODEL} "offline-resume-model")
 set(ENV{AGENT_API_KEY} "offline-resume-credential")
 unset(ENV{AGENT_AUTH_TOKEN})
 set(ENV{AGENT_RUNTIME_ROOT} "${runtime_root}")
-unset(ENV{AGENT_BUILD_TOOLS_ENABLED})
-unset(ENV{AGENT_RAG_ENABLED})
+unset(ENV{AGENT_ENABLE_BUILD_TOOLS})
+unset(ENV{AGENT_ENABLE_RAG})
 
 execute_process(
     COMMAND "${AGENT_EXE}" resume --task-id "${task_id}"
@@ -60,4 +60,30 @@ if(NOT mismatch_output STREQUAL "")
 endif()
 if(mismatch_error MATCHES "0000000b|0000000c")
     message(FATAL_ERROR "mismatched task log reflected a task identifier")
+endif()
+
+set(linked_runtime_root "${TEST_ROOT}/linked-runtime")
+set(linked_task_root "${linked_runtime_root}/tasks/${task_id}")
+file(MAKE_DIRECTORY "${linked_task_root}")
+file(CREATE_LINK "${EVENT_LOG}" "${linked_task_root}/events.jsonl"
+    RESULT link_result)
+if(NOT link_result STREQUAL "0")
+    message(FATAL_ERROR "failed to create mandatory resume hard-link fixture")
+endif()
+set(ENV{AGENT_RUNTIME_ROOT} "${linked_runtime_root}")
+execute_process(
+    COMMAND "${AGENT_EXE}" resume --task-id "${task_id}"
+    WORKING_DIRECTORY "${TEST_ROOT}"
+    RESULT_VARIABLE linked_result
+    OUTPUT_VARIABLE linked_output
+    ERROR_VARIABLE linked_error)
+if(NOT linked_result EQUAL 6)
+    message(FATAL_ERROR
+        "hard-linked resume log returned ${linked_result}, expected 6")
+endif()
+if(NOT linked_output STREQUAL "")
+    message(FATAL_ERROR "hard-linked resume log wrote unexpected stdout")
+endif()
+if(linked_error MATCHES "${task_id}")
+    message(FATAL_ERROR "hard-linked resume log reflected a task identifier")
 endif()

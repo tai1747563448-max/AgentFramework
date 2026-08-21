@@ -654,6 +654,58 @@ TEST_CASE(resume_applies_cancellation_before_reissuing_in_flight_call) {
     REQUIRE(resumed.events.count(agent::EventKind::TaskCancelled) == 1);
 }
 
+TEST_CASE(resume_applies_wall_budget_before_reissuing_each_in_flight_call) {
+    {
+        auto request = fixtures::run_request("time out recovered model");
+        request.budgets.max_task_time_ms = 50;
+        test::EngineFixture<test::FailingEventStore> interrupted(
+            test::FakeModel({fixtures::text_response("lost")}),
+            test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}),
+            test::FailingEventStore(5));
+        interrupted.run(request);
+        REQUIRE(interrupted.events.events.size() == 4);
+
+        test::EngineFixture resumed(
+            test::FakeModel({fixtures::text_response("must not run")}),
+            test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}),
+            test::MemoryEventStore{}, test::FakeClock({1'000, 1'050}));
+        const auto result = resumed.resume(interrupted.events.events);
+
+        REQUIRE(result.state.has_value());
+        REQUIRE(!result.fatal_error.has_value());
+        REQUIRE(result.state->status == agent::TaskStatus::BudgetExceeded);
+        REQUIRE(resumed.model.requests.empty());
+        REQUIRE(resumed.events.count(agent::EventKind::TaskBudgetExceeded) == 1);
+    }
+    {
+        auto request = fixtures::run_request("time out recovered tool");
+        request.budgets.max_task_time_ms = 50;
+        const auto call = fixtures::call("call-edit", "replace_text");
+        test::EngineFixture<test::FailingEventStore> interrupted(
+            test::FakeModel({fixtures::tool_response({call})}),
+            test::FakeTools(
+                {agent::ToolResult{"call-edit", "lost", false}}),
+            test::FakeKnowledge(agent::EvidencePack{}),
+            test::FailingEventStore(7));
+        interrupted.run(request);
+        REQUIRE(interrupted.events.events.size() == 6);
+
+        test::EngineFixture resumed(
+            test::FakeModel(std::vector<agent::ModelResponse>{}),
+            test::FakeTools(
+                {agent::ToolResult{"call-edit", "must not run", false}}),
+            test::FakeKnowledge(agent::EvidencePack{}),
+            test::MemoryEventStore{}, test::FakeClock({2'000, 2'050}));
+        const auto result = resumed.resume(interrupted.events.events);
+
+        REQUIRE(result.state.has_value());
+        REQUIRE(!result.fatal_error.has_value());
+        REQUIRE(result.state->status == agent::TaskStatus::BudgetExceeded);
+        REQUIRE(resumed.tools.executed_calls.empty());
+        REQUIRE(resumed.events.count(agent::EventKind::TaskBudgetExceeded) == 1);
+    }
+}
+
 TEST_CASE(runtime_progress_type_is_exactly_the_safe_four_field_projection) {
     const agent::RuntimeProgress progress{
         "task-00000000000000000000000000000001", 7,
