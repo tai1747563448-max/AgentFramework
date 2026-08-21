@@ -43,6 +43,7 @@ struct TaskState {
     RuntimeUsage usage;
     std::uint64_t last_sequence{0};
     bool model_call_in_flight{false};
+    std::optional<ModelRequest> last_model_request;
     std::optional<StopReason> accepted_model_stop_reason;
     std::vector<Message> messages;
     EvidencePack evidence;
@@ -98,6 +99,7 @@ inline bool operator==(const TaskState& left, const TaskState& right) {
            left.budgets == right.budgets && left.usage == right.usage &&
            left.last_sequence == right.last_sequence &&
            left.model_call_in_flight == right.model_call_in_flight &&
+           left.last_model_request == right.last_model_request &&
            left.accepted_model_stop_reason == right.accepted_model_stop_reason &&
            left.messages == right.messages &&
            left.evidence == right.evidence &&

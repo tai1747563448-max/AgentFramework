@@ -65,7 +65,7 @@ agent::EvidencePack evidence() {
                                   agent::Value()})}})}}};
 }
 
-agent::ModelRequest request() {
+agent::ModelRequest request(std::string issue = "issue") {
     const auto path_schema =
         agent::Value::object({{"type", agent::Value("string")}});
     const auto properties =
@@ -73,16 +73,23 @@ agent::ModelRequest request() {
     const auto input_schema = agent::Value::object(
         {{"type", agent::Value("object")}, {"properties", properties}});
     std::vector<agent::Message> messages = {
-        {agent::Role::System, {agent::TextBlock{u8"严格执行。"}}},
-        {agent::Role::User,
-         {agent::TextBlock{u8"检查警告"},
-          agent::ToolResultBlock{{"prior-call", u8"旧结果", false}}}},
-    };
+        {agent::Role::User, {agent::TextBlock{std::move(issue)}}}};
     std::vector<agent::ToolDefinition> tools = {
         {"read_file", u8"读取文件", input_schema}};
     agent::ModelRequest result{
         u8"你是编码代理。", std::move(messages), std::move(tools), 30'000};
     result.evidence = evidence();
+    return result;
+}
+
+agent::ModelRequest complex_codec_request() {
+    auto result = request();
+    result.messages = {
+        {agent::Role::System, {agent::TextBlock{u8"严格执行。"}}},
+        {agent::Role::User,
+         {agent::TextBlock{u8"检查警告"},
+          agent::ToolResultBlock{{"prior-call", u8"旧结果", false}}}},
+    };
     return result;
 }
 
@@ -111,7 +118,8 @@ std::vector<agent::RuntimeEvent> completed_text_trace(
         task_started(durable_task_id, 1, issue),
         event(durable_task_id, 2, agent::ContextPreparationStartedPayload{}),
         event(durable_task_id, 3, agent::ContextPreparedPayload{evidence()}),
-        event(durable_task_id, 4, agent::ModelCallStartedPayload{request()}),
+        event(durable_task_id, 4,
+              agent::ModelCallStartedPayload{request(issue)}),
         event(durable_task_id, 5,
               agent::ModelCallSucceededPayload{
                   {{agent::TextBlock{final_text}}, agent::StopReason::EndTurn,
@@ -186,7 +194,7 @@ TEST_CASE(event_json_round_trip_preserves_every_typed_payload) {
         agent::ContextPreparationStartedPayload{},
         agent::ContextPreparedPayload{fixtures::evidence()},
         agent::ContextPreparationFailedPayload{complete_error},
-        agent::ModelCallStartedPayload{fixtures::request()},
+        agent::ModelCallStartedPayload{fixtures::complex_codec_request()},
         agent::ModelCallSucceededPayload{fixtures::response_with_tool()},
         agent::ModelCallFailedPayload{complete_error},
         agent::ToolCallStartedPayload{call},
@@ -509,6 +517,40 @@ TEST_CASE(jsonl_rejects_model_request_evidence_that_differs_from_context) {
 
         REQUIRE(!loaded.has_value());
         REQUIRE(loaded.error().code == agent::ErrorCode::PersistenceFailure);
+    }
+}
+
+TEST_CASE(jsonl_rejects_model_request_messages_or_timeout_not_bound_to_task) {
+    for (const bool forge_messages : {false, true}) {
+        test::ScopedTempDir temp("jsonl-request-state-binding");
+        const auto task = fixtures::valid_task_id(
+            forge_messages ? "forged-messages" : "forged-timeout");
+        auto request = fixtures::request("issue");
+        if (forge_messages) {
+            request.messages.front().content.front() =
+                agent::TextBlock{"forged issue"};
+        } else {
+            request.timeout_ms = 29'999;
+        }
+        const std::vector<agent::RuntimeEvent> forged{
+            fixtures::task_started(task, 1, "issue"),
+            fixtures::event(
+                task, 2, agent::ContextPreparationStartedPayload{}),
+            fixtures::event(
+                task, 3,
+                agent::ContextPreparedPayload{fixtures::evidence()}),
+            fixtures::event(
+                task, 4,
+                agent::ModelCallStartedPayload{std::move(request)})};
+        const auto file =
+            temp.write_text("events.jsonl", fixtures::as_jsonl(forged));
+        agent::JsonlEventStore store(temp.path());
+
+        const auto loaded = store.read_file(file);
+
+        REQUIRE(!loaded.has_value());
+        REQUIRE(loaded.error().code ==
+                agent::ErrorCode::PersistenceFailure);
     }
 }
 

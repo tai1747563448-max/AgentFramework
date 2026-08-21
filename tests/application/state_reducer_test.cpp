@@ -61,8 +61,14 @@ agent::RuntimeEvent context_prepared(const std::string& task_id,
 
 agent::RuntimeEvent model_started(const std::string& task_id,
                                   std::uint64_t sequence,
-                                  const std::string& source_id = "source") {
-    agent::ModelRequest request{"runtime prompt", {}, {}, 30'000};
+                                  const std::string& source_id = "source",
+                                  std::vector<agent::Message> messages = {
+                                      {agent::Role::User,
+                                       {agent::TextBlock{"issue"}}}},
+                                  std::string system_prompt =
+                                      "runtime prompt") {
+    agent::ModelRequest request{std::move(system_prompt),
+                                std::move(messages), {}, 30'000};
     request.evidence = evidence(source_id);
     return event(task_id, sequence,
                  agent::ModelCallStartedPayload{std::move(request)});
@@ -142,7 +148,9 @@ std::vector<agent::RuntimeEvent> completed_text_trace(const std::string& task_id
         task_started(task_id, 1, issue),
         context_started(task_id, 2),
         context_prepared(task_id, 3, "source-1"),
-        model_started(task_id, 4, "source-1"),
+        model_started(task_id, 4, "source-1",
+                      {{agent::Role::User,
+                        {agent::TextBlock{issue}}}}),
         model_succeeded(task_id, 5, {agent::TextBlock{final_text}},
                         agent::StopReason::EndTurn),
         task_completed(task_id, 6, final_text),
@@ -156,7 +164,9 @@ std::vector<agent::RuntimeEvent> completed_two_tool_trace(const std::string& tas
         task_started(task_id, 1, "inspect and build"),
         context_started(task_id, 2),
         context_prepared(task_id, 3, "source-1"),
-        model_started(task_id, 4, "source-1"),
+        model_started(task_id, 4, "source-1",
+                      {{agent::Role::User,
+                        {agent::TextBlock{"inspect and build"}}}}),
         model_succeeded(task_id, 5,
                         {agent::TextBlock{"working"}, agent::ToolUseBlock{call_1},
                          agent::ToolUseBlock{call_2}},
@@ -167,7 +177,16 @@ std::vector<agent::RuntimeEvent> completed_two_tool_trace(const std::string& tas
         tool_succeeded(task_id, 9, second_result()),
         context_started(task_id, 10),
         context_prepared(task_id, 11, "source-2"),
-        model_started(task_id, 12, "source-2"),
+        model_started(
+            task_id, 12, "source-2",
+            {{agent::Role::User,
+              {agent::TextBlock{"inspect and build"}}},
+             {agent::Role::Assistant,
+              {agent::TextBlock{"working"}, agent::ToolUseBlock{call_1},
+               agent::ToolUseBlock{call_2}}},
+             {agent::Role::User,
+              {agent::ToolResultBlock{first_result()},
+               agent::ToolResultBlock{second_result()}}}}),
         model_succeeded(task_id, 13, {agent::TextBlock{"done"}},
                         agent::StopReason::EndTurn),
         task_completed(task_id, 14, "done"),
@@ -353,6 +372,64 @@ TEST_CASE(reducer_binds_model_request_evidence_to_prepared_context) {
     REQUIRE(!invalid.has_value());
     REQUIRE(invalid.error().code == agent::ErrorCode::InvalidTransition);
     REQUIRE(state.value().last_sequence == 3);
+}
+
+TEST_CASE(reducer_binds_model_request_messages_timeout_and_system_prompt) {
+    const auto task = std::string("request-binding");
+    const std::vector<agent::RuntimeEvent> prefix{
+        fixtures::task_started(task, 1, "issue"),
+        fixtures::context_started(task, 2),
+        fixtures::context_prepared(task, 3, "source-1")};
+    const auto state = agent::replay_events(prefix);
+    REQUIRE(state.has_value());
+
+    auto wrong_messages = fixtures::model_started(task, 4, "source-1");
+    std::get<agent::ModelCallStartedPayload>(wrong_messages.payload)
+        .request.messages.front().content.front() =
+        agent::TextBlock{"forged issue"};
+    const auto messages_result =
+        agent::reduce_event(state.value(), wrong_messages);
+    REQUIRE(!messages_result.has_value());
+    REQUIRE(messages_result.error().code ==
+            agent::ErrorCode::InvalidTransition);
+
+    auto wrong_timeout = fixtures::model_started(task, 4, "source-1");
+    std::get<agent::ModelCallStartedPayload>(wrong_timeout.payload)
+        .request.timeout_ms = 29'999;
+    const auto timeout_result =
+        agent::reduce_event(state.value(), wrong_timeout);
+    REQUIRE(!timeout_result.has_value());
+    REQUIRE(timeout_result.error().code ==
+            agent::ErrorCode::InvalidTransition);
+
+    const auto call = fixtures::first_call();
+    auto continued = prefix;
+    continued.push_back(fixtures::model_started(task, 4, "source-1"));
+    const auto in_flight = agent::replay_events(continued);
+    REQUIRE(in_flight.has_value());
+    REQUIRE(in_flight.value().last_model_request.has_value());
+    REQUIRE(*in_flight.value().last_model_request ==
+            std::get<agent::ModelCallStartedPayload>(
+                continued.back().payload)
+                .request);
+    continued.push_back(fixtures::model_succeeded(
+        task, 5, {agent::ToolUseBlock{call}}, agent::StopReason::ToolUse));
+    continued.push_back(fixtures::tool_started(task, 6, call));
+    continued.push_back(
+        fixtures::tool_succeeded(task, 7, fixtures::first_result()));
+    continued.push_back(fixtures::context_started(task, 8));
+    continued.push_back(fixtures::context_prepared(task, 9, "source-2"));
+    const auto later_state = agent::replay_events(continued);
+    REQUIRE(later_state.has_value());
+
+    const auto changed_prompt = fixtures::model_started(
+        task, 10, "source-2", later_state.value().messages,
+        "forged replacement prompt");
+    const auto prompt_result =
+        agent::reduce_event(later_state.value(), changed_prompt);
+    REQUIRE(!prompt_result.has_value());
+    REQUIRE(prompt_result.error().code ==
+            agent::ErrorCode::InvalidTransition);
 }
 
 TEST_CASE(model_failure_is_terminal_and_rejects_continuation) {
