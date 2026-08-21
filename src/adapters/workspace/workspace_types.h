@@ -60,4 +60,20 @@ struct ReadOutput {
     LinePage page;
 };
 
+struct SearchMatch {
+    std::string path;
+    std::size_t line{0};
+    std::size_t column{0};
+    std::string text;
+    bool line_truncated{false};
+};
+
+struct SearchOutput {
+    std::vector<SearchMatch> matches;
+    bool truncated{false};
+    std::string truncation_reason;
+    std::size_t scanned_files{0};
+    std::size_t omitted_entries{0};
+};
+
 }  // namespace agent::workspace

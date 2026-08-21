@@ -211,6 +211,37 @@ nlohmann::json read_json(const workspace::ReadOutput& output) {
             {"next_start_line", std::move(next)}};
 }
 
+nlohmann::json search_json(const std::string& path,
+                           const workspace::SearchOutput& output) {
+    auto matches = nlohmann::json::array();
+    for (const auto& match : output.matches) {
+        matches.push_back({{"path", match.path},
+                           {"line", match.line},
+                           {"column", match.column},
+                           {"text", match.text},
+                           {"line_truncated", match.line_truncated}});
+    }
+    return {{"path", path},
+            {"matches", std::move(matches)},
+            {"truncated", output.truncated},
+            {"truncation_reason", output.truncation_reason},
+            {"scanned_files", output.scanned_files},
+            {"omitted_entries", output.omitted_entries}};
+}
+
+nlohmann::json bounded_search_json(const std::string& path,
+                                   workspace::SearchOutput output) {
+    auto encoded = search_json(path, output);
+    while (encoded.dump().size() > kMaxResultBytes &&
+           !output.matches.empty()) {
+        output.matches.pop_back();
+        output.truncated = true;
+        output.truncation_reason = "output_bytes";
+        encoded = search_json(path, output);
+    }
+    return encoded;
+}
+
 }  // namespace
 
 WorkspaceToolGateway::WorkspaceToolGateway(std::filesystem::path runtime_root)
@@ -332,6 +363,47 @@ Result<ToolResult> WorkspaceToolGateway::execute(
             }
             return success_result(
                 call.id, read_json(std::get<workspace::ReadOutput>(read)));
+        }
+        if (call.name == "search_text") {
+            if (!optional_exact_keys(args, {"path", "query"},
+                                     {"case_sensitive", "max_results"})) {
+                return Result<ToolResult>::success(fault_result(
+                    call.id,
+                    invalid_arguments("invalid search_text arguments")));
+            }
+            const auto path_text = string_value(args, "path");
+            const auto query = string_value(args, "query");
+            const auto case_sensitive =
+                args.find("case_sensitive") == args.end()
+                    ? std::optional<bool>{true}
+                    : bool_value(args, "case_sensitive");
+            const auto max_results =
+                args.find("max_results") == args.end()
+                    ? std::optional<std::size_t>{100}
+                    : size_value(args, "max_results", 1, 200);
+            if (!path_text.has_value() || !query.has_value() ||
+                !case_sensitive.has_value() || !max_results.has_value()) {
+                return Result<ToolResult>::success(fault_result(
+                    call.id,
+                    invalid_arguments("invalid search_text arguments")));
+            }
+            const auto parsed = policy_.parse(*path_text);
+            if (std::holds_alternative<workspace::Fault>(parsed)) {
+                return Result<ToolResult>::success(
+                    fault_result(call.id, std::get<workspace::Fault>(parsed)));
+            }
+            const auto searched = files_.search(
+                workspace, std::get<workspace::RelativePath>(parsed), *query,
+                *case_sensitive, *max_results);
+            if (std::holds_alternative<workspace::Fault>(searched)) {
+                return Result<ToolResult>::success(fault_result(
+                    call.id, std::get<workspace::Fault>(searched)));
+            }
+            return success_result(
+                call.id,
+                bounded_search_json(
+                    *path_text,
+                    std::get<workspace::SearchOutput>(searched)));
         }
         return Result<ToolResult>::success(fault_result(
             call.id, invalid_arguments("unknown workspace tool")));
