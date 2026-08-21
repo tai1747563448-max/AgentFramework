@@ -32,6 +32,14 @@ std::string concatenated_text(const std::vector<ContentBlock>& content) {
 }
 
 Result<void> validate_model_response(const ModelResponse& response) {
+    if (!is_known_stop_reason_pair(response.stop_reason,
+                                   response.raw_stop_reason)) {
+        return invalid_transition("model stop reason fields do not match");
+    }
+    if (!response_tool_uses_are_valid(response)) {
+        return invalid_transition(
+            "model response contains an invalid tool-use block");
+    }
     bool contains_tool_use = false;
     bool contains_tool_result = false;
     for (const auto& block : response.content) {

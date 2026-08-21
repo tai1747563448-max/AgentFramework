@@ -69,10 +69,32 @@ agent::RuntimeEvent model_started(const std::string& task_id,
 agent::RuntimeEvent model_succeeded(const std::string& task_id,
                                     std::uint64_t sequence,
                                     std::vector<agent::ContentBlock> content,
-                                    agent::StopReason stop_reason) {
+                                    agent::StopReason stop_reason,
+                                    std::optional<std::string> raw_stop_reason =
+                                        std::nullopt) {
+    if (!raw_stop_reason.has_value()) {
+        switch (stop_reason) {
+        case agent::StopReason::EndTurn:
+            raw_stop_reason = "end_turn";
+            break;
+        case agent::StopReason::ToolUse:
+            raw_stop_reason = "tool_use";
+            break;
+        case agent::StopReason::MaxTokens:
+            raw_stop_reason = "max_tokens";
+            break;
+        case agent::StopReason::StopSequence:
+            raw_stop_reason = "stop_sequence";
+            break;
+        case agent::StopReason::Unknown:
+            raw_stop_reason = "unknown";
+            break;
+        }
+    }
     return event(task_id, sequence,
                  agent::ModelCallSucceededPayload{
-                     {std::move(content), stop_reason, "stop", 11, 5, "request-1"}});
+                     {std::move(content), stop_reason,
+                      std::move(*raw_stop_reason), 11, 5, "request-1"}});
 }
 
 agent::ToolCall first_call() {
@@ -473,6 +495,84 @@ TEST_CASE(replay_binds_every_stop_reason_to_its_content_shape) {
     REQUIRE(empty_max_tokens.value().messages.back().content.empty());
     REQUIRE(empty_max_tokens.value().terminal_error ==
             std::optional<agent::RuntimeError>{budget_error});
+}
+
+TEST_CASE(replay_rejects_mismatched_canonical_and_raw_stop_reasons) {
+    const std::string task = "stop-pair-forgery";
+    const auto prefix = std::vector<agent::RuntimeEvent>{
+        fixtures::task_started(task, 1, "issue"),
+        fixtures::context_started(task, 2),
+        fixtures::context_prepared(task, 3, "source"),
+        fixtures::model_started(task, 4),
+    };
+    const auto started = agent::replay_events(prefix);
+    REQUIRE(started.has_value());
+
+    struct InvalidCase {
+        agent::StopReason stop_reason;
+        const char* raw_stop_reason;
+        std::vector<agent::ContentBlock> content;
+    };
+    const std::vector<InvalidCase> invalid = {
+        {agent::StopReason::MaxTokens, "end_turn", {}},
+        {agent::StopReason::EndTurn, "tool_use",
+         {agent::TextBlock{"done"}}},
+        {agent::StopReason::ToolUse, "stop_sequence",
+         {agent::ToolUseBlock{fixtures::first_call()}}},
+        {agent::StopReason::StopSequence, "max_tokens",
+         {agent::TextBlock{"done"}}},
+    };
+
+    for (const auto& item : invalid) {
+        const auto forged = fixtures::model_succeeded(
+            task, 5, item.content, item.stop_reason,
+            std::string{item.raw_stop_reason});
+        const auto reduced = agent::reduce_event(started.value(), forged);
+        REQUIRE(!reduced.has_value());
+        REQUIRE(reduced.error().code == agent::ErrorCode::InvalidTransition);
+
+        auto trace = prefix;
+        trace.push_back(forged);
+        if (item.stop_reason == agent::StopReason::MaxTokens) {
+            trace.push_back(fixtures::event(
+                task, 6,
+                agent::TaskBudgetExceededPayload{
+                    "max_tokens",
+                    {agent::ErrorCode::BudgetExceeded,
+                     "model output token budget exceeded", false}}));
+        }
+        const auto replayed = agent::replay_events(trace);
+        REQUIRE(!replayed.has_value());
+        REQUIRE(replayed.error().code == agent::ErrorCode::InvalidTransition);
+    }
+}
+
+TEST_CASE(replay_rejects_invalid_or_duplicate_response_tool_calls) {
+    const std::string task = "tool-call-validation";
+    const auto object_arguments =
+        agent::Value::object({{"path", agent::Value("src/main.cpp")}});
+    const std::vector<std::vector<agent::ContentBlock>> invalid = {
+        {agent::ToolUseBlock{{"", "read_file", object_arguments}}},
+        {agent::ToolUseBlock{{"call-1", "", object_arguments}}},
+        {agent::ToolUseBlock{
+            {"call-1", "read_file", agent::Value(std::int64_t{7})}}},
+        {agent::ToolUseBlock{{"call-1", "read_file", object_arguments}},
+         agent::ToolUseBlock{{"call-1", "compile", object_arguments}}},
+    };
+
+    for (const auto& content : invalid) {
+        const auto result = agent::replay_events({
+            fixtures::task_started(task, 1, "issue"),
+            fixtures::context_started(task, 2),
+            fixtures::context_prepared(task, 3, "source"),
+            fixtures::model_started(task, 4),
+            fixtures::model_succeeded(task, 5, content,
+                                      agent::StopReason::ToolUse),
+        });
+
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == agent::ErrorCode::InvalidTransition);
+    }
 }
 
 TEST_CASE(replay_rejects_forged_model_tool_result_blocks_for_every_stop_shape) {

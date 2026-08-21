@@ -226,6 +226,15 @@ RuntimeResult RuntimeEngine::run(
                     {ErrorCode::ProtocolFailure, message, false}},
                 observer);
         };
+        if (!is_known_stop_reason_pair(response.value().stop_reason,
+                                       response.value().raw_stop_reason)) {
+            return protocol_failure(
+                "model stop reason fields do not match");
+        }
+        if (!response_tool_uses_are_valid(response.value())) {
+            return protocol_failure(
+                "model response contains an invalid tool-use block");
+        }
         if (contains_tool_result(response.value())) {
             return protocol_failure(
                 "model response contains an invalid tool-result block");
@@ -314,6 +323,16 @@ RuntimeResult RuntimeEngine::run(
                 return append_event(
                     state, task_id,
                     ToolCallFailedPayload{call.id, tool_result.error()},
+                    observer);
+            }
+            if (tool_result.value().tool_call_id != call.id) {
+                return append_event(
+                    state, task_id,
+                    ToolCallFailedPayload{
+                        call.id,
+                        {ErrorCode::ProtocolFailure,
+                         "tool result ID does not match active tool call",
+                         false}},
                     observer);
             }
 

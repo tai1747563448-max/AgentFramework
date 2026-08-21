@@ -290,3 +290,13 @@ After both task-scoped reviews have no Critical/Important findings:
 3. Run credential-free `run`, credential-free `verify-log`, `ctest -N`, `git diff --check main..HEAD`, production `pending_failure` scan, bounded credential-pattern scan, branch/backup SHA checks, and feature/main tracked-worktree checks.
 4. Dispatch a new whole-branch reviewer from the live main merge-base to HEAD. Fix every Critical/Important finding and repeat a scoped re-review; Minor items remain explicit evidence gaps, not hidden claims.
 5. Only after the final whole-branch review says ready may the SDD workspaces be removed and the local integration choices be presented. Do not merge, delete the feature branch, or contact GitHub without the user's choice.
+
+## Final whole-branch review fix-wave invariants (2026-08-21)
+
+The final review identified five additional load-bearing boundaries. The single permitted repair wave keeps the existing V1 architecture and adds only these invariants:
+
+- `CprHttpTransport` explicitly disables redirects; a loopback transport regression proves a 3xx is returned and its target receives no request.
+- Engine and Reducer accept only the four exact canonical/raw stop-reason pairs. A forged `MaxTokens/end_turn` success cannot be accepted and therefore cannot causally reach `TaskBudgetExceeded(max_tokens)` during replay.
+- Anthropic, Engine, and Reducer require response-side tool calls to have nonempty ID/name, object arguments, and unique IDs within one response. JSONL replay enforces the same rule; unique ordered multi-tool responses and outgoing user tool results remain legal.
+- A successful ToolGateway value with the wrong ID maps to exactly one direct `ToolCallFailed` for the active call using fixed `ProtocolFailure`; it never emits `ToolCallSucceeded` or generic `TaskFailed`.
+- JSONL append opens the leaf no-follow, validates that same handle as a contained regular single-link object, writes the complete line through it, and durably flushes it. Windows rejects reparse leaves and validates final handle paths; POSIX walks stable directory handles with `openat`/`O_NOFOLLOW`. Existing external symlink/reparse and hard-link targets are never modified.

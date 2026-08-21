@@ -1,17 +1,172 @@
 #include "adapters/anthropic/anthropic_messages_client.h"
+#include "adapters/anthropic/cpr_http_transport.h"
 #include "adapters/anthropic/http_transport.h"
 #include "test_support.h"
 
 #include <nlohmann/json.hpp>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
+#include <algorithm>
+#include <chrono>
+#include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace test {
+
+#ifdef _WIN32
+using SocketHandle = SOCKET;
+constexpr SocketHandle kInvalidSocket = INVALID_SOCKET;
+#else
+using SocketHandle = int;
+constexpr SocketHandle kInvalidSocket = -1;
+#endif
+
+class SocketRuntime {
+public:
+    SocketRuntime() {
+#ifdef _WIN32
+        WSADATA data{};
+        if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
+            throw std::runtime_error("failed to initialize loopback sockets");
+        }
+#endif
+    }
+
+    ~SocketRuntime() {
+#ifdef _WIN32
+        WSACleanup();
+#endif
+    }
+};
+
+void close_socket(SocketHandle socket) {
+#ifdef _WIN32
+    closesocket(socket);
+#else
+    close(socket);
+#endif
+}
+
+int wait_for_socket(SocketHandle socket, std::chrono::milliseconds timeout) {
+    fd_set readable;
+    FD_ZERO(&readable);
+    FD_SET(socket, &readable);
+    timeval interval{};
+    interval.tv_sec = static_cast<long>(timeout.count() / 1000);
+    interval.tv_usec = static_cast<long>((timeout.count() % 1000) * 1000);
+#ifdef _WIN32
+    return select(0, &readable, nullptr, nullptr, &interval);
+#else
+    return select(socket + 1, &readable, nullptr, nullptr, &interval);
+#endif
+}
+
+SocketHandle create_loopback_listener(std::uint16_t& port) {
+    const auto listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener == kInvalidSocket) {
+        throw std::runtime_error("failed to create loopback listener");
+    }
+
+    const int enabled = 1;
+#ifdef _WIN32
+    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char*>(&enabled), sizeof(enabled));
+#else
+    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
+#endif
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(0);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(listener, reinterpret_cast<const sockaddr*>(&address),
+             sizeof(address)) != 0 ||
+        listen(listener, 2) != 0) {
+        close_socket(listener);
+        throw std::runtime_error("failed to bind loopback listener");
+    }
+
+#ifdef _WIN32
+    int address_size = sizeof(address);
+#else
+    socklen_t address_size = sizeof(address);
+#endif
+    if (getsockname(listener, reinterpret_cast<sockaddr*>(&address),
+                    &address_size) != 0) {
+        close_socket(listener);
+        throw std::runtime_error("failed to inspect loopback listener");
+    }
+    port = ntohs(address.sin_port);
+    return listener;
+}
+
+std::string receive_http_request(SocketHandle connection) {
+    std::string request;
+    std::size_t expected_size = std::string::npos;
+    char buffer[4096];
+    while (request.size() < expected_size) {
+        const int received = recv(connection, buffer, sizeof(buffer), 0);
+        if (received <= 0) {
+            break;
+        }
+        request.append(buffer, static_cast<std::size_t>(received));
+        const auto header_end = request.find("\r\n\r\n");
+        if (header_end == std::string::npos) {
+            continue;
+        }
+        if (expected_size == std::string::npos) {
+            auto lower_headers = request.substr(0, header_end);
+            std::transform(lower_headers.begin(), lower_headers.end(),
+                           lower_headers.begin(), [](unsigned char character) {
+                               return static_cast<char>(std::tolower(character));
+                           });
+            const std::string prefix = "content-length:";
+            const auto length_position = lower_headers.find(prefix);
+            std::size_t content_length = 0;
+            if (length_position != std::string::npos) {
+                const auto value_start = length_position + prefix.size();
+                const auto value_end = lower_headers.find("\r\n", value_start);
+                content_length = static_cast<std::size_t>(std::stoull(
+                    lower_headers.substr(value_start, value_end - value_start)));
+            }
+            expected_size = header_end + 4 + content_length;
+        }
+    }
+    return request;
+}
+
+bool send_all(SocketHandle connection, const std::string& response) {
+    std::size_t sent_total = 0;
+    while (sent_total < response.size()) {
+        const int sent =
+            send(connection, response.data() + sent_total,
+                 static_cast<int>(response.size() - sent_total), 0);
+        if (sent <= 0) {
+            return false;
+        }
+        sent_total += static_cast<std::size_t>(sent);
+    }
+    return true;
+}
 
 class FakeHttpTransport final : public agent::HttpTransport {
 public:
@@ -111,6 +266,77 @@ agent::HttpResponse anthropic_tool_response() {
 
 }  // namespace fixtures
 
+TEST_CASE(cpr_transport_returns_redirect_without_contacting_redirect_target) {
+    test::SocketRuntime sockets;
+    std::uint16_t port = 0;
+    const auto listener = test::create_loopback_listener(port);
+    std::string server_error;
+    std::string initial_request;
+    bool redirect_target_received = false;
+
+    std::thread server([&] {
+        try {
+            if (test::wait_for_socket(listener, std::chrono::seconds(3)) != 1) {
+                server_error = "initial loopback request was not received";
+                test::close_socket(listener);
+                return;
+            }
+            const auto initial = accept(listener, nullptr, nullptr);
+            if (initial == test::kInvalidSocket) {
+                server_error = "initial loopback request could not be accepted";
+                test::close_socket(listener);
+                return;
+            }
+            initial_request = test::receive_http_request(initial);
+            const std::string redirect =
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:" +
+                std::to_string(port) +
+                "/redirect-target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            if (!test::send_all(initial, redirect)) {
+                server_error = "redirect response could not be sent";
+            }
+            test::close_socket(initial);
+
+            if (test::wait_for_socket(listener, std::chrono::milliseconds(750)) ==
+                1) {
+                redirect_target_received = true;
+                const auto redirected = accept(listener, nullptr, nullptr);
+                if (redirected != test::kInvalidSocket) {
+                    static_cast<void>(test::receive_http_request(redirected));
+                    static_cast<void>(test::send_all(
+                        redirected,
+                        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n"
+                        "Connection: close\r\n\r\n"));
+                    test::close_socket(redirected);
+                }
+            }
+            test::close_socket(listener);
+        } catch (const std::exception& error) {
+            server_error = error.what();
+            test::close_socket(listener);
+        } catch (...) {
+            server_error = "loopback redirect fixture failed";
+            test::close_socket(listener);
+        }
+    });
+
+    agent::CprHttpTransport transport;
+    const auto response = transport.post(
+        {"http://127.0.0.1:" + std::to_string(port) + "/initial",
+         {{"content-type", "application/json"},
+          {"x-api-key", "REDIRECT_TEST_SECRET"}},
+         "{\"secret_body\":\"REDIRECT_TEST_BODY\"}", 3'000});
+    server.join();
+
+    REQUIRE(server_error.empty());
+    REQUIRE(initial_request.find("POST /initial ") != std::string::npos);
+    REQUIRE(initial_request.find("REDIRECT_TEST_SECRET") != std::string::npos);
+    REQUIRE(initial_request.find("REDIRECT_TEST_BODY") != std::string::npos);
+    REQUIRE(!redirect_target_received);
+    REQUIRE(response.has_value());
+    REQUIRE(response.value().status == 302);
+}
+
 TEST_CASE(anthropic_adapter_maps_ordered_tool_request_and_response) {
     test::FakeHttpTransport http(fixtures::anthropic_tool_response());
     agent::AnthropicMessagesClient client(fixtures::config(), http);
@@ -193,6 +419,51 @@ TEST_CASE(anthropic_adapter_rejects_tool_results_in_provider_responses) {
         REQUIRE(result.error().message.find(block_contents) == std::string::npos);
         REQUIRE(result.error().message.find(credential) == std::string::npos);
     }
+}
+
+TEST_CASE(anthropic_adapter_rejects_invalid_or_duplicate_tool_use_payloads) {
+    const std::vector<std::string> invalid = {
+        "[{\"type\":\"tool_use\",\"id\":\"\",\"name\":\"read_file\","
+        "\"input\":{}}]",
+        "[{\"type\":\"tool_use\",\"id\":\"call-1\",\"name\":\"\","
+        "\"input\":{}}]",
+        "[{\"type\":\"tool_use\",\"id\":\"call-1\","
+        "\"name\":\"read_file\",\"input\":7}]",
+        "[{\"type\":\"tool_use\",\"id\":\"call-1\","
+        "\"name\":\"read_file\",\"input\":{}},"
+        "{\"type\":\"tool_use\",\"id\":\"call-1\","
+        "\"name\":\"compile\",\"input\":{}}]",
+    };
+
+    for (const auto& content : invalid) {
+        test::FakeHttpTransport http(
+            fixtures::response(content, "tool_use"));
+        agent::AnthropicMessagesClient client(fixtures::config(), http);
+
+        const auto result = client.complete(fixtures::simple_model_request());
+
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == agent::ErrorCode::ProtocolFailure);
+    }
+}
+
+TEST_CASE(anthropic_adapter_preserves_ordered_unique_tool_use_payloads) {
+    test::FakeHttpTransport http(fixtures::response(
+        "[{\"type\":\"tool_use\",\"id\":\"call-1\","
+        "\"name\":\"read_file\",\"input\":{}},"
+        "{\"type\":\"tool_use\",\"id\":\"call-2\","
+        "\"name\":\"compile\",\"input\":{}}]",
+        "tool_use"));
+    agent::AnthropicMessagesClient client(fixtures::config(), http);
+
+    const auto result = client.complete(fixtures::simple_model_request());
+
+    REQUIRE(result.has_value());
+    REQUIRE(result.value().content.size() == 2);
+    REQUIRE(std::get<agent::ToolUseBlock>(result.value().content.at(0)).call.id ==
+            "call-1");
+    REQUIRE(std::get<agent::ToolUseBlock>(result.value().content.at(1)).call.id ==
+            "call-2");
 }
 
 TEST_CASE(anthropic_adapter_uses_exactly_one_bearer_authentication_scheme) {

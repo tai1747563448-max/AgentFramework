@@ -75,6 +75,23 @@ struct ModelRequest {
 
 enum class StopReason { EndTurn, ToolUse, MaxTokens, StopSequence, Unknown };
 
+inline bool is_known_stop_reason_pair(StopReason stop_reason,
+                                      const std::string& raw_stop_reason) {
+    switch (stop_reason) {
+    case StopReason::EndTurn:
+        return raw_stop_reason == "end_turn";
+    case StopReason::ToolUse:
+        return raw_stop_reason == "tool_use";
+    case StopReason::MaxTokens:
+        return raw_stop_reason == "max_tokens";
+    case StopReason::StopSequence:
+        return raw_stop_reason == "stop_sequence";
+    case StopReason::Unknown:
+        return false;
+    }
+    return false;
+}
+
 struct ModelResponse {
     std::vector<ContentBlock> content;
     StopReason stop_reason{StopReason::Unknown};
@@ -83,6 +100,27 @@ struct ModelResponse {
     std::size_t output_tokens{0};
     std::string provider_request_id;
 };
+
+inline bool response_tool_uses_are_valid(const ModelResponse& response) {
+    std::vector<std::string> tool_call_ids;
+    for (const auto& block : response.content) {
+        const auto* tool_use = std::get_if<ToolUseBlock>(&block);
+        if (tool_use == nullptr) {
+            continue;
+        }
+        const auto& call = tool_use->call;
+        if (call.id.empty() || call.name.empty() || !call.arguments.is_object()) {
+            return false;
+        }
+        for (const auto& accepted_id : tool_call_ids) {
+            if (accepted_id == call.id) {
+                return false;
+            }
+        }
+        tool_call_ids.push_back(call.id);
+    }
+    return true;
+}
 
 inline bool operator==(const TextBlock& left, const TextBlock& right) {
     return left.text == right.text;

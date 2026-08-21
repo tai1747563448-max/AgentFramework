@@ -240,6 +240,11 @@ Result<ModelResponse> decode_response(const HttpResponse& response) {
             }
         }
 
+        if (!response_tool_uses_are_valid(decoded)) {
+            return failure<ModelResponse>(ErrorCode::ProtocolFailure,
+                                          "provider tool-use block is invalid");
+        }
+
         switch (decoded.stop_reason) {
         case StopReason::EndTurn:
         case StopReason::StopSequence:

@@ -679,6 +679,48 @@ TEST_CASE(engine_executes_multiple_tools_in_response_order) {
     REQUIRE(fixture.events.kinds() == expected_kinds);
 }
 
+TEST_CASE(engine_rejects_invalid_or_duplicate_response_tool_calls) {
+    const auto object_arguments =
+        agent::Value::object({{"path", agent::Value("src/main.cpp")}});
+    const std::vector<std::vector<agent::ContentBlock>> invalid = {
+        {agent::ToolUseBlock{{"", "read_file", object_arguments}}},
+        {agent::ToolUseBlock{{"call-1", "", object_arguments}}},
+        {agent::ToolUseBlock{
+            {"call-1", "read_file", agent::Value(std::int64_t{7})}}},
+        {agent::ToolUseBlock{{"call-1", "read_file", object_arguments}},
+         agent::ToolUseBlock{{"call-1", "compile", object_arguments}}},
+    };
+
+    for (const auto& content : invalid) {
+        std::vector<agent::ToolResult> results;
+        for (const auto& block : content) {
+            const auto& call = std::get<agent::ToolUseBlock>(block).call;
+            results.push_back({call.id, "result", false});
+        }
+        test::EngineFixture fixture(
+            test::FakeModel({fixtures::stopped_response(
+                                 content, agent::StopReason::ToolUse,
+                                 "tool_use"),
+                             fixtures::text_response("done")}),
+            test::FakeTools(std::move(results)),
+            test::FakeKnowledge(agent::EvidencePack{}));
+
+        const auto result = fixture.run(
+            fixtures::run_request("validate tool calls"));
+
+        REQUIRE(result.state.has_value());
+        REQUIRE(!result.fatal_error.has_value());
+        REQUIRE(result.state->status == agent::TaskStatus::Failed);
+        REQUIRE(result.state->terminal_error.has_value());
+        REQUIRE(result.state->terminal_error->code ==
+                agent::ErrorCode::ProtocolFailure);
+        REQUIRE(fixture.events.count(agent::EventKind::ModelCallFailed) == 1);
+        REQUIRE(fixture.events.count(agent::EventKind::ModelCallSucceeded) == 0);
+        REQUIRE(fixture.events.count(agent::EventKind::ToolCallStarted) == 0);
+        REQUIRE(fixture.tools.executed_calls.empty());
+    }
+}
+
 TEST_CASE(tool_error_result_is_not_gateway_failure) {
     test::EngineFixture fixture(
         test::FakeModel({
@@ -949,7 +991,7 @@ TEST_CASE(tool_success_persistence_failure_prevents_the_next_tool) {
     REQUIRE(fixture.events.kinds().back() == agent::EventKind::ToolCallStarted);
 }
 
-TEST_CASE(illegal_successful_tool_result_is_not_appended_or_applied) {
+TEST_CASE(mismatched_successful_tool_result_becomes_direct_tool_failure) {
     test::EngineFixture fixture(
         test::FakeModel({fixtures::tool_response(
             {fixtures::call("call-1", "read")})}),
@@ -958,17 +1000,27 @@ TEST_CASE(illegal_successful_tool_result_is_not_appended_or_applied) {
         test::FakeKnowledge(agent::EvidencePack{}));
 
     const auto result = fixture.run(fixtures::run_request("inspect code"));
+    const agent::RuntimeError expected{
+        agent::ErrorCode::ProtocolFailure,
+        "tool result ID does not match active tool call", false};
 
     REQUIRE(result.state.has_value());
-    REQUIRE(result.fatal_error.has_value());
-    REQUIRE(result.fatal_error->code == agent::ErrorCode::InvalidTransition);
-    REQUIRE(result.state->status == agent::TaskStatus::AwaitingTool);
-    REQUIRE(result.state->last_sequence == 6);
-    REQUIRE(result.state->active_tool_call_id ==
-            std::optional<std::string>{"call-1"});
+    REQUIRE(!result.fatal_error.has_value());
+    REQUIRE(result.state->status == agent::TaskStatus::Failed);
+    REQUIRE(result.state->last_sequence == 7);
+    REQUIRE(!result.state->active_tool_call_id.has_value());
     REQUIRE(result.state->pending_tool_results.empty());
+    REQUIRE(result.state->terminal_error ==
+            std::optional<agent::RuntimeError>{expected});
+    REQUIRE(fixture.events.count(agent::EventKind::ToolCallFailed) == 1);
     REQUIRE(fixture.events.count(agent::EventKind::ToolCallSucceeded) == 0);
-    REQUIRE(fixture.events.kinds().back() == agent::EventKind::ToolCallStarted);
+    REQUIRE(fixture.events.count(agent::EventKind::TaskFailed) == 0);
+    REQUIRE(fixture.events.kinds().back() == agent::EventKind::ToolCallFailed);
+    const auto* failed = std::get_if<agent::ToolCallFailedPayload>(
+        &fixture.events.events.back().payload);
+    REQUIRE(failed != nullptr);
+    REQUIRE(failed->tool_call_id == "call-1");
+    REQUIRE(failed->error == expected);
 }
 
 TEST_CASE(post_tool_context_persistence_failure_prevents_later_external_calls) {
@@ -1036,6 +1088,45 @@ TEST_CASE(end_turn_and_stop_sequence_are_the_only_text_completion_stops) {
                 std::optional<std::string>{"final"});
         REQUIRE(fixture.events.count(agent::EventKind::ModelCallSucceeded) == 1);
         REQUIRE(fixture.events.count(agent::EventKind::TaskCompleted) == 1);
+    }
+}
+
+TEST_CASE(engine_rejects_mismatched_canonical_and_raw_stop_reasons) {
+    struct InvalidCase {
+        agent::StopReason stop_reason;
+        const char* raw_stop_reason;
+        std::vector<agent::ContentBlock> content;
+    };
+    const std::vector<InvalidCase> invalid = {
+        {agent::StopReason::MaxTokens, "end_turn", {}},
+        {agent::StopReason::EndTurn, "tool_use",
+         {agent::TextBlock{"done"}}},
+        {agent::StopReason::ToolUse, "stop_sequence",
+         {agent::ToolUseBlock{fixtures::call("call-1", "read")}}},
+        {agent::StopReason::StopSequence, "max_tokens",
+         {agent::TextBlock{"done"}}},
+    };
+
+    for (const auto& item : invalid) {
+        test::EngineFixture fixture(
+            test::FakeModel({fixtures::stopped_response(
+                item.content, item.stop_reason, item.raw_stop_reason)}),
+            test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
+
+        const auto result = fixture.run(fixtures::run_request("forged stop"));
+
+        REQUIRE(result.state.has_value());
+        REQUIRE(!result.fatal_error.has_value());
+        REQUIRE(result.state->status == agent::TaskStatus::Failed);
+        REQUIRE(result.state->terminal_error.has_value());
+        REQUIRE(result.state->terminal_error->code ==
+                agent::ErrorCode::ProtocolFailure);
+        REQUIRE(fixture.events.count(agent::EventKind::ModelCallFailed) == 1);
+        REQUIRE(fixture.events.count(agent::EventKind::ModelCallSucceeded) == 0);
+        REQUIRE(fixture.events.count(agent::EventKind::TaskCompleted) == 0);
+        REQUIRE(fixture.events.count(agent::EventKind::TaskBudgetExceeded) == 0);
+        REQUIRE(fixture.events.count(agent::EventKind::ToolCallStarted) == 0);
+        REQUIRE(fixture.tools.executed_calls.empty());
     }
 }
 

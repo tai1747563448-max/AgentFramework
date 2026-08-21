@@ -15,6 +15,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <limits>
 #include <optional>
@@ -384,6 +385,79 @@ TEST_CASE(jsonl_rejects_mixed_task_ids_and_illegal_transitions) {
     }
 }
 
+TEST_CASE(jsonl_rejects_forged_max_tokens_with_end_turn_raw_stop_reason) {
+    test::ScopedTempDir temp("jsonl-stop-pair-forgery");
+    const auto task = fixtures::valid_task_id("stop-pair-forgery");
+    const agent::RuntimeError budget_error{
+        agent::ErrorCode::BudgetExceeded,
+        "model output token budget exceeded", false};
+    const std::vector<agent::RuntimeEvent> forged = {
+        fixtures::task_started(task, 1, "issue"),
+        fixtures::event(task, 2, agent::ContextPreparationStartedPayload{}),
+        fixtures::event(task, 3,
+                        agent::ContextPreparedPayload{fixtures::evidence()}),
+        fixtures::event(task, 4,
+                        agent::ModelCallStartedPayload{fixtures::request()}),
+        fixtures::event(
+            task, 5,
+            agent::ModelCallSucceededPayload{
+                {{agent::TextBlock{"partial"}}, agent::StopReason::MaxTokens,
+                 "end_turn", 120, 12, "forged-provider-request"}}),
+        fixtures::event(
+            task, 6,
+            agent::TaskBudgetExceededPayload{"max_tokens", budget_error}),
+    };
+    const auto file =
+        temp.write_text("events.jsonl", fixtures::as_jsonl(forged));
+    agent::JsonlEventStore store(temp.path());
+
+    const auto loaded = store.read_file(file);
+
+    REQUIRE(!loaded.has_value());
+    REQUIRE(loaded.error().code == agent::ErrorCode::PersistenceFailure);
+}
+
+TEST_CASE(jsonl_rejects_invalid_or_duplicate_response_tool_calls) {
+    const auto object_arguments =
+        agent::Value::object({{"path", agent::Value("src/main.cpp")}});
+    const std::vector<std::vector<agent::ContentBlock>> invalid = {
+        {agent::ToolUseBlock{{"", "read_file", object_arguments}}},
+        {agent::ToolUseBlock{{"call-1", "", object_arguments}}},
+        {agent::ToolUseBlock{
+            {"call-1", "read_file", agent::Value(std::int64_t{7})}}},
+        {agent::ToolUseBlock{{"call-1", "read_file", object_arguments}},
+         agent::ToolUseBlock{{"call-1", "compile", object_arguments}}},
+    };
+
+    for (std::size_t index = 0; index < invalid.size(); ++index) {
+        test::ScopedTempDir temp("jsonl-tool-call-validation");
+        const auto task = fixtures::valid_task_id(
+            "tool-call-" + std::to_string(index));
+        const std::vector<agent::RuntimeEvent> forged = {
+            fixtures::task_started(task, 1, "issue"),
+            fixtures::event(task, 2,
+                            agent::ContextPreparationStartedPayload{}),
+            fixtures::event(task, 3,
+                            agent::ContextPreparedPayload{fixtures::evidence()}),
+            fixtures::event(task, 4,
+                            agent::ModelCallStartedPayload{fixtures::request()}),
+            fixtures::event(
+                task, 5,
+                agent::ModelCallSucceededPayload{
+                    {invalid.at(index), agent::StopReason::ToolUse, "tool_use",
+                     120, 12, "forged-provider-request"}}),
+        };
+        const auto file =
+            temp.write_text("events.jsonl", fixtures::as_jsonl(forged));
+        agent::JsonlEventStore store(temp.path());
+
+        const auto loaded = store.read_file(file);
+
+        REQUIRE(!loaded.has_value());
+        REQUIRE(loaded.error().code == agent::ErrorCode::PersistenceFailure);
+    }
+}
+
 TEST_CASE(jsonl_append_reports_unwritable_runtime_root) {
     test::ScopedTempDir temp("jsonl-unwritable-root");
     const auto root_file = temp.write_text("not-a-directory", "occupied");
@@ -394,6 +468,59 @@ TEST_CASE(jsonl_append_reports_unwritable_runtime_root) {
     REQUIRE(!result.has_value());
     REQUIRE(result.error().code == agent::ErrorCode::PersistenceFailure);
     REQUIRE(fixtures::read_all(root_file) == "occupied");
+}
+
+TEST_CASE(jsonl_append_never_follows_an_existing_leaf_symlink) {
+    test::ScopedTempDir temp("jsonl-leaf-symlink");
+    const auto task = fixtures::valid_task_id("leaf-symlink");
+    const auto runtime_root = temp.path() / "runtime";
+    const auto task_directory = runtime_root / "tasks" / task;
+    std::filesystem::create_directories(task_directory);
+    const auto external =
+        temp.write_text("outside/external-events.jsonl", "EXTERNAL_SENTINEL\n");
+    const auto leaf = task_directory / "events.jsonl";
+    std::error_code link_error;
+    std::filesystem::create_symlink(external, leaf, link_error);
+    if (link_error) {
+        std::cout << "SKIP leaf symlink regression: environment cannot create "
+                     "a file symlink ("
+                  << link_error.message() << ")\n";
+        return;
+    }
+    const auto original_external_bytes = fixtures::read_all(external);
+    agent::JsonlEventStore store(runtime_root);
+
+    const auto appended =
+        store.append(fixtures::task_started(task, 1, "issue"));
+
+    REQUIRE(!appended.has_value());
+    REQUIRE(appended.error().code == agent::ErrorCode::PersistenceFailure);
+    REQUIRE(fixtures::read_all(external) == original_external_bytes);
+    REQUIRE(std::filesystem::is_symlink(
+        std::filesystem::symlink_status(leaf)));
+}
+
+TEST_CASE(jsonl_append_rejects_a_leaf_hard_link_without_modifying_its_target) {
+    test::ScopedTempDir temp("jsonl-leaf-hard-link");
+    const auto task = fixtures::valid_task_id("leaf-hard-link");
+    const auto runtime_root = temp.path() / "runtime";
+    const auto task_directory = runtime_root / "tasks" / task;
+    std::filesystem::create_directories(task_directory);
+    const auto external =
+        temp.write_text("outside/external-events.jsonl", "EXTERNAL_SENTINEL\n");
+    const auto leaf = task_directory / "events.jsonl";
+    std::error_code link_error;
+    std::filesystem::create_hard_link(external, leaf, link_error);
+    REQUIRE(!link_error);
+    const auto original_external_bytes = fixtures::read_all(external);
+    agent::JsonlEventStore store(runtime_root);
+
+    const auto appended =
+        store.append(fixtures::task_started(task, 1, "issue"));
+
+    REQUIRE(!appended.has_value());
+    REQUIRE(appended.error().code == agent::ErrorCode::PersistenceFailure);
+    REQUIRE(fixtures::read_all(external) == original_external_bytes);
 }
 
 TEST_CASE(event_json_rejects_extra_keys_in_every_schema_owned_object_family) {

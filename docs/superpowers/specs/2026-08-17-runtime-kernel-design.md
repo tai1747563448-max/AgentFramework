@@ -101,7 +101,7 @@ Domain 保存不依赖基础设施的核心类型：
 
 #### ModelClient
 
-接受统一的 `ModelRequest`，返回统一的 `ModelResponse`。内部响应必须表达最终文本、工具调用、停止原因、用量和 Provider 请求标识。`ToolResultBlock` 只属于请求侧的用户工具结果消息，不得出现在 `ModelResponse`；响应只接受与停止原因匹配的 `TextBlock`/`ToolUseBlock` 形状。Provider 的原始 JSON 不进入 Domain。
+接受统一的 `ModelRequest`，返回统一的 `ModelResponse`。内部响应必须表达最终文本、工具调用、停止原因、用量和 Provider 请求标识。`ToolResultBlock` 只属于请求侧的用户工具结果消息，不得出现在 `ModelResponse`；响应只接受与停止原因匹配的 `TextBlock`/`ToolUseBlock` 形状。每个响应侧 `ToolUseBlock` 的调用 ID 和名称必须非空、arguments 必须是 object；单个 `ModelResponse` 内重复调用 ID 一律拒绝，以保持 V1 顺序执行和结果关联无歧义。Provider 的原始 JSON 不进入 Domain。
 
 `ModelRequest` 中的结构化 Evidence 由具体 Provider Adapter 显式映射；RuntimeEngine 只复制持久状态中的 `EvidencePack`，不规定 Provider 文本格式。
 
@@ -244,6 +244,8 @@ runtime_data/tasks/<task_id>/events.jsonl
 
 `runtime_data/` 已被 `.gitignore` 排除。事件可能包含 Issue、代码上下文、工具结果和模型文本，因此不得进入 Git。
 
+JSONL 追加必须通过同一个已打开的 leaf handle 验证并写入：Windows 以 no-follow reparse 方式打开后验证非 reparse regular file、单链接和最终 handle 路径；POSIX 以稳定目录 handle 逐层 `openat(..., O_NOFOLLOW)`，对 leaf `fstat` 验证 regular file 与单链接。既有 symlink/reparse、非 regular leaf 或多链接 leaf 都返回固定 `PersistenceFailure`，不得改写外部目标；完整 JSON 行与换行经该 handle 写入并执行 durable flush 后才报告成功。目录 containment 也由已打开的父目录/最终 handle 路径验证，不能把检查与另一次按路径打开之间的窗口当作安全边界。
+
 ## 8. 运行数据流
 
 1. CLI 接收 Issue、workspace 与预算。
@@ -256,7 +258,7 @@ runtime_data/tasks/<task_id>/events.jsonl
 8. 工具调用按模型响应中的原始顺序逐个执行，每个调用独立产生 started 和 succeeded/failed 事件。
 9. 全部工具结果组成一个 Messages 协议用户消息，然后持久化下一轮 `ContextPreparationStarted`，进入上下文准备和下一轮模型请求。
 
-第一阶段不并发执行多个工具。工具命令返回非零退出码、编译失败等业务结果仍通过成功返回的结构化 `ToolResult{is_error=true}` 表达，并记录 `ToolCallSucceeded`；只有 ToolGateway 未能返回任何可信结果时才记录 `ToolCallFailed`，由该事件直接进入 `Failed`。
+第一阶段不并发执行多个工具。工具命令返回非零退出码、编译失败等业务结果仍通过成功返回的结构化 `ToolResult{is_error=true}` 表达，并记录 `ToolCallSucceeded`；只有 ToolGateway 未能返回任何可信结果时才记录 `ToolCallFailed`，由该事件直接进入 `Failed`。若 ToolGateway 返回成功结构但 `tool_call_id` 与当前 active call 不同，Engine 不得尝试持久化非法成功事件，而是只为 active call 写入固定 `{ProtocolFailure, "tool result ID does not match active tool call", false}` 的 `ToolCallFailed`，直接进入 `Failed`，不再追加通用 `TaskFailed`。
 
 ## 9. 预算与停止
 
@@ -269,7 +271,7 @@ runtime_data/tasks/<task_id>/events.jsonl
 
 每次知识、模型或工具外部调用前检查相应预算。达到预算后写入 `TaskBudgetExceeded`，不再发起调用。用户取消写入 `TaskCancelled`。终态写入后 Engine 必须立即停止。
 
-停止原因与内容严格绑定：`ToolResultBlock` 在所有模型响应中都非法；`ToolUse` 至少包含一个 `ToolUseBlock`，其余块只能是有序 `TextBlock`；`EndTurn`/`StopSequence` 只能包含一个或多个 `TextBlock`，拼接文本必须非空，并且 `TaskCompleted.final_text` 必须精确等于该响应文本；`MaxTokens` 可以是零个内容块，也可以只包含有序 `TextBlock`（包括空 `text`），但不得包含 `ToolUseBlock` 或 `ToolResultBlock`，合法响应先接受成功事件再以固定、非秘密的 `BudgetExceeded` 错误终止，不得完成。未知或内容不一致的停止原因直接记录 `ModelCallFailed` 协议失败。
+停止原因的 canonical/raw 字段严格绑定，V1 只接受 `EndTurn/end_turn`、`ToolUse/tool_use`、`MaxTokens/max_tokens`、`StopSequence/stop_sequence` 四对；`Unknown` 或任意错配在 Engine 和 Reducer 响应边界都拒绝。内容同时严格绑定：`ToolResultBlock` 在所有模型响应中都非法；`ToolUse` 至少包含一个合法且调用 ID 不重复的 `ToolUseBlock`，其余块只能是有序 `TextBlock`；`EndTurn`/`StopSequence` 只能包含一个或多个 `TextBlock`，拼接文本必须非空，并且 `TaskCompleted.final_text` 必须精确等于该响应文本；`MaxTokens` 可以是零个内容块，也可以只包含有序 `TextBlock`（包括空 `text`），但不得包含 `ToolUseBlock` 或 `ToolResultBlock`，合法响应先接受成功事件再以固定、非秘密的 `BudgetExceeded` 错误终止，不得完成。未知或内容不一致的停止原因直接记录 `ModelCallFailed` 协议失败。
 
 `max_tokens` 的 `TaskBudgetExceeded` 仅可紧接在已接受的 `MaxTokens ModelCallSucceeded` 之后回放，且必须携带精确、固定的 `max_tokens` payload。`EndTurn` 和 `StopSequence` 只接受 `TaskCompleted`，不接受预算终态。
 
@@ -281,7 +283,7 @@ runtime_data/tasks/<task_id>/events.jsonl
 
 配置从环境变量或被 Git 忽略的 `.env` 读取。配置项包含 Provider Base URL、Model ID、API Key、超时和预算。API Key 不允许作为普通 CLI 参数，避免出现在进程列表和终端历史中。
 
-日志、异常、CLI 输出和事件 payload 必须对认证头和密钥进行脱敏。发送到自定义 Base URL 时只发送为该 URL 显式配置的凭证，不继承其他服务的认证值。
+日志、异常、CLI 输出和事件 payload 必须对认证头和密钥进行脱敏。发送到自定义 Base URL 时只发送为该 URL 显式配置的凭证，不继承其他服务的认证值。具体 HTTP transport 必须显式禁止重定向；3xx 原样返回 Adapter 并转成固定 `HttpFailure`，认证头与 POST body 不得被自动转发到 redirect target。
 
 ## 11. 错误处理
 
@@ -365,6 +367,8 @@ task_id=<validated> sequence=<n> event=<fixed-name> status=<fixed-name>
 - sequence 连续；
 - 完整日志读取和重放；
 - 非法 JSON、缺行、重复 sequence、未知 schema 和非法转移；
+- stop canonical/raw 错配、非法/重复 tool call ID 的 wire 重放拒绝；
+- 既有 leaf symlink/reparse 与 hard-link alias 不被跟随或改写；
 - Windows Unicode 路径；
 - 日志中不存在测试密钥。
 

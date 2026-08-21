@@ -18,7 +18,8 @@ Result<HttpResponse> CprHttpTransport::post(const HttpRequest& request) {
 
         const auto response = cpr::Post(
             cpr::Url{request.url}, std::move(headers), cpr::Body{request.body},
-            cpr::Timeout{std::chrono::milliseconds(request.timeout_ms)});
+            cpr::Timeout{std::chrono::milliseconds(request.timeout_ms)},
+            cpr::Redirect{false});
 
         if (response.error.code != cpr::ErrorCode::OK) {
             if (response.error.code == cpr::ErrorCode::OPERATION_TIMEDOUT) {
