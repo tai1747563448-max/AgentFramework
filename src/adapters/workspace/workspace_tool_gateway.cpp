@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -177,6 +178,9 @@ bool bounded_json_value(const Value& value,
         return add_encoded_bytes(encoded,
                                  std::to_string(value.as_integer()).size());
     } else if (value.is_double()) {
+        if (!std::isfinite(value.as_double())) {
+            return false;
+        }
         return add_encoded_bytes(encoded, value_to_json(value).dump().size());
     } else {
         return false;
@@ -261,8 +265,10 @@ nlohmann::json bounded_list_json(const std::string& path,
     while (encoded.dump().size() > kMaxResultBytes &&
            !output.entries.empty()) {
         output.entries.pop_back();
-        output.truncated = true;
-        output.truncation_reason = "output_bytes";
+        if (!output.truncated) {
+            output.truncated = true;
+            output.truncation_reason = "output_bytes";
+        }
         encoded = list_json(path, output);
     }
     return encoded;
@@ -337,8 +343,10 @@ nlohmann::json bounded_search_json(const std::string& path,
     while (encoded.dump().size() > kMaxResultBytes &&
            !output.matches.empty()) {
         output.matches.pop_back();
-        output.truncated = true;
-        output.truncation_reason = "output_bytes";
+        if (!output.truncated) {
+            output.truncated = true;
+            output.truncation_reason = "output_bytes";
+        }
         encoded = search_json(path, output);
     }
     return encoded;

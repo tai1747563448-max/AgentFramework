@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -205,6 +206,18 @@ TEST_CASE(workspace_gateway_returns_bounded_errors_for_unknown_or_bad_arguments)
     REQUIRE(invalid_key.has_value());
     REQUIRE(fixtures::error_code(invalid_key) == "invalid_arguments");
 
+    for (const auto non_finite : {
+             std::numeric_limits<double>::quiet_NaN(),
+             std::numeric_limits<double>::infinity(),
+             -std::numeric_limits<double>::infinity()}) {
+        const auto invalid_double = gateway.execute(
+            {"call-non-finite", "list_files",
+             agent::Value::object({{"path", non_finite}})},
+            context);
+        REQUIRE(invalid_double.has_value());
+        REQUIRE(fixtures::error_code(invalid_double) == "invalid_arguments");
+    }
+
     constexpr std::size_t kArgumentLimit = 2U * 1024U * 1024U;
     const auto exact_budget = gateway.execute(
         {"call-exact-budget", "unknown",
@@ -218,6 +231,38 @@ TEST_CASE(workspace_gateway_returns_bounded_errors_for_unknown_or_bad_arguments)
              {{"blob", std::string(kArgumentLimit - 10, 'x')}})},
         context);
     REQUIRE(fixtures::error_message(over_budget) == "invalid tool arguments");
+
+    const auto nested_value = [](std::size_t array_depth) {
+        agent::Value value("leaf");
+        for (std::size_t depth = 0; depth < array_depth; ++depth) {
+            value = agent::Value::array({std::move(value)});
+        }
+        return value;
+    };
+    const auto exact_depth = gateway.execute(
+        {"call-exact-depth", "unknown",
+         agent::Value::object({{"nested", nested_value(62)}})},
+        context);
+    REQUIRE(fixtures::error_message(exact_depth) == "unknown workspace tool");
+    const auto over_depth = gateway.execute(
+        {"call-over-depth", "unknown",
+         agent::Value::object({{"nested", nested_value(63)}})},
+        context);
+    REQUIRE(fixtures::error_message(over_depth) == "invalid tool arguments");
+
+    const auto node_array = [](std::size_t size) {
+        return agent::Value::array(agent::Value::Array(size));
+    };
+    const auto exact_nodes = gateway.execute(
+        {"call-exact-nodes", "unknown",
+         agent::Value::object({{"nodes", node_array(9'998)}})},
+        context);
+    REQUIRE(fixtures::error_message(exact_nodes) == "unknown workspace tool");
+    const auto over_nodes = gateway.execute(
+        {"call-over-nodes", "unknown",
+         agent::Value::object({{"nodes", node_array(9'999)}})},
+        context);
+    REQUIRE(fixtures::error_message(over_nodes) == "invalid tool arguments");
     REQUIRE(unknown.value().content.size() < 256);
 }
 
@@ -349,7 +394,7 @@ TEST_CASE(workspace_list_truncates_before_the_serialized_result_limit) {
         }
         return value;
     }();
-    for (std::size_t index = 0; index < 200; ++index) {
+    for (std::size_t index = 0; index < 199; ++index) {
         temp.write_text(
             std::filesystem::u8path(directory + "/" + filename_prefix +
                                     std::to_string(index) + ".txt"),
@@ -584,6 +629,16 @@ TEST_CASE(workspace_search_stops_before_the_serialized_result_limit) {
     REQUIRE(json.at("matches").size() < 200);
     REQUIRE(json.at("truncated") == true);
     REQUIRE(json.at("truncation_reason") == "output_bytes");
+
+    temp.write_text("zz-extra.txt", long_line);
+    const auto combined = gateway.execute(
+        fixtures::search_call("call-combined-budget", ".", "needle", true, 200),
+        context);
+    const auto combined_json = fixtures::content_json(combined);
+    REQUIRE(combined.value().content.size() <= 65536);
+    REQUIRE(combined_json.at("matches").size() < 200);
+    REQUIRE(combined_json.at("truncated") == true);
+    REQUIRE(combined_json.at("truncation_reason") == "max_results");
 }
 
 TEST_CASE(workspace_replace_is_versioned_non_overlapping_and_atomic) {

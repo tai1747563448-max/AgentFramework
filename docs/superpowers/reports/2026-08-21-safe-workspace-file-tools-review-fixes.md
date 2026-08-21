@@ -1,7 +1,9 @@
 # Safe workspace file tools: review-fix report
 
-Date: 2026-08-21  
-Branch: `feat/safe-workspace-tools`  
+Date: 2026-08-21
+
+Branch: `feat/safe-workspace-tools`
+
 Reviewed milestone base: `810df98e94506e578672801766f4dbcabb7dbc5c`
 
 ## Accepted findings and fixes
@@ -62,3 +64,21 @@ The current Windows account cannot create file or directory symlinks, so the
 three link-creation regression branches report explicit skips. Ordinary path,
 hard-link, canonical-path, protected-root, integration, and replay tests pass;
 this report does not claim executed symlink coverage on this host.
+
+## Re-review fix round 1
+
+The scoped re-review of `63e6643c` found one remaining Important input case:
+non-finite `double` values still reached JSON conversion and escaped as an
+outer Runtime failure. A focused regression produced a genuine RED at
+`invalid_double.has_value()`. The gateway now rejects `NaN`, positive infinity,
+and negative infinity before conversion; all return a model-visible
+`invalid_arguments` tool result.
+
+All re-review Minors were also closed:
+
+- list/search result shrinking retains an existing scan/result truncation
+  reason and uses `output_bytes` only when no earlier reason exists;
+- a combined `max_results` plus output-size regression locks that precedence;
+- 64/65-level and 10,000/10,001-node argument boundaries are tested exactly;
+- report trailing whitespace was removed and the commit-range diff check is
+  rerun during final verification.
