@@ -128,6 +128,8 @@ add_agent_test(composite_tool_gateway_tests tests/adapters/composite_tool_gatewa
 target_link_libraries(composite_tool_gateway_tests PRIVATE agent_runtime)
 add_agent_test(cmake_tool_gateway_tests tests/adapters/cmake_tool_gateway_test.cpp)
 target_link_libraries(cmake_tool_gateway_tests PRIVATE agent_runtime)
+add_agent_test(build_tool_integration_tests tests/integration/build_tool_integration_test.cpp)
+target_link_libraries(build_tool_integration_tests PRIVATE agent_runtime)
 add_test(
     NAME verify_log_process_credential_free
     COMMAND ${CMAKE_COMMAND}
