@@ -930,7 +930,8 @@ TEST_CASE(empty_adapters_expose_no_tools_and_no_evidence) {
     REQUIRE(evidence.has_value());
     REQUIRE(evidence.value().items.empty());
     const auto execution = tools.execute(
-        {"unexpected", "missing", agent::Value::object({})});
+        {"unexpected", "missing", agent::Value::object({})},
+        {u8"E:/工作区"});
     REQUIRE(!execution.has_value());
     REQUIRE(execution.error().code == agent::ErrorCode::DependencyUnavailable);
 }

@@ -6,7 +6,9 @@ std::vector<ToolDefinition> EmptyToolGateway::definitions() const {
     return {};
 }
 
-Result<ToolResult> EmptyToolGateway::execute(const ToolCall&) {
+Result<ToolResult> EmptyToolGateway::execute(
+    const ToolCall&,
+    const ToolExecutionContext&) {
     return Result<ToolResult>::failure(
         {ErrorCode::DependencyUnavailable, "no tools are configured", false});
 }

@@ -318,7 +318,8 @@ RuntimeResult RuntimeEngine::run(
                 return transition;
             }
 
-            auto tool_result = tools_.execute(call);
+            auto tool_result = tools_.execute(
+                call, ToolExecutionContext{state->workspace_utf8});
             if (!tool_result.has_value()) {
                 return append_event(
                     state, task_id,

@@ -75,8 +75,10 @@ public:
     }
 
     agent::Result<agent::ToolResult> execute(
-        const agent::ToolCall& call) override {
+        const agent::ToolCall& call,
+        const agent::ToolExecutionContext& context) override {
         executed_calls.push_back(call);
+        executed_contexts.push_back(context);
         if (next_result_ >= results_.size()) {
             return agent::Result<agent::ToolResult>::failure(
                 {agent::ErrorCode::DependencyUnavailable,
@@ -96,6 +98,7 @@ public:
 
     mutable std::size_t definitions_calls{0};
     std::vector<agent::ToolCall> executed_calls;
+    std::vector<agent::ToolExecutionContext> executed_contexts;
 
 private:
     std::vector<agent::ToolDefinition> definitions_;
@@ -647,6 +650,10 @@ TEST_CASE(engine_executes_multiple_tools_in_response_order) {
     REQUIRE(result.state->status == agent::TaskStatus::Completed);
     const std::vector<std::string> expected_ids{"call-1", "call-2"};
     REQUIRE(fixture.tools.executed_ids() == expected_ids);
+    REQUIRE(fixture.tools.executed_contexts.size() == 2);
+    for (const auto& context : fixture.tools.executed_contexts) {
+        REQUIRE(context.workspace_utf8 == u8"E:/工作区/项目");
+    }
     REQUIRE(fixture.model.requests.size() == 2);
     REQUIRE(fixture.knowledge.retrieved_states.size() == 2);
     const auto& second_request = fixture.model.requests.at(1);
