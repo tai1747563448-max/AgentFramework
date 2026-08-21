@@ -60,6 +60,7 @@ add_library(agent_runtime STATIC
     src/adapters/workspace/workspace_file_ops.cpp
     src/adapters/workspace/workspace_tool_gateway.cpp
     src/adapters/process/direct_process_runner.cpp
+    src/adapters/rag/python_rag_knowledge_provider.cpp
     src/adapters/build/cmake_tool_gateway.cpp
     src/adapters/tools/composite_tool_gateway.cpp
     src/adapters/system/system_clock.cpp
@@ -109,6 +110,9 @@ target_link_libraries(anthropic_adapter_tests PRIVATE Threads::Threads)
 if(WIN32)
     target_link_libraries(anthropic_adapter_tests PRIVATE ws2_32)
 endif()
+add_agent_test(python_rag_adapter_tests
+    tests/adapters/python_rag_knowledge_provider_test.cpp)
+target_link_libraries(python_rag_adapter_tests PRIVATE agent_runtime)
 add_agent_test(cli_tests tests/cli/cli_app_test.cpp)
 target_link_libraries(cli_tests PRIVATE agent_runtime)
 add_agent_test(runtime_integration_tests tests/integration/runtime_integration_test.cpp)
