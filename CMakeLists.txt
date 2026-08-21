@@ -58,6 +58,7 @@ add_library(agent_runtime STATIC
     src/adapters/workspace/workspace_file_ops.cpp
     src/adapters/workspace/workspace_tool_gateway.cpp
     src/adapters/process/direct_process_runner.cpp
+    src/adapters/build/cmake_tool_gateway.cpp
     src/adapters/tools/composite_tool_gateway.cpp
     src/adapters/system/system_clock.cpp
     src/adapters/system/random_id_generator.cpp
@@ -125,6 +126,8 @@ target_compile_definitions(direct_process_runner_tests PRIVATE
     _CRT_SECURE_NO_WARNINGS)
 add_agent_test(composite_tool_gateway_tests tests/adapters/composite_tool_gateway_test.cpp)
 target_link_libraries(composite_tool_gateway_tests PRIVATE agent_runtime)
+add_agent_test(cmake_tool_gateway_tests tests/adapters/cmake_tool_gateway_test.cpp)
+target_link_libraries(cmake_tool_gateway_tests PRIVATE agent_runtime)
 add_test(
     NAME verify_log_process_credential_free
     COMMAND ${CMAKE_COMMAND}

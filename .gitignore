@@ -9,6 +9,8 @@
 
 # CMake and compiled output
 build/
+!src/adapters/build/
+!src/adapters/build/**
 out/
 cmake-build-*/
 CMakeFiles/
