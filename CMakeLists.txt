@@ -58,6 +58,7 @@ add_library(agent_runtime STATIC
     src/adapters/workspace/workspace_file_ops.cpp
     src/adapters/workspace/workspace_tool_gateway.cpp
     src/adapters/process/direct_process_runner.cpp
+    src/adapters/tools/composite_tool_gateway.cpp
     src/adapters/system/system_clock.cpp
     src/adapters/system/random_id_generator.cpp
     src/adapters/system/signal_cancellation.cpp
@@ -122,6 +123,8 @@ add_dependencies(direct_process_runner_tests process_fixture)
 target_compile_definitions(direct_process_runner_tests PRIVATE
     AGENT_PROCESS_FIXTURE_PATH="$<TARGET_FILE:process_fixture>"
     _CRT_SECURE_NO_WARNINGS)
+add_agent_test(composite_tool_gateway_tests tests/adapters/composite_tool_gateway_test.cpp)
+target_link_libraries(composite_tool_gateway_tests PRIVATE agent_runtime)
 add_test(
     NAME verify_log_process_credential_free
     COMMAND ${CMAKE_COMMAND}
