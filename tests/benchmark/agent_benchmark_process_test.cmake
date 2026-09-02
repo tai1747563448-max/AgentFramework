@@ -26,6 +26,8 @@ file(READ "${BASELINE}" baseline_json)
 foreach(required
         "\"schema_version\": 1"
         "\"benchmark_kind\": \"controlled_offline_agent_runtime\""
+        "\"batch_size\": 1000"
+        "\"total_operations\": 5000"
         "\"text_completion_runtime\""
         "\"tool_round_trip_runtime\""
         "\"event_log_evaluation\""
@@ -87,4 +89,22 @@ endif()
 string(FIND "${invalid_error}" "invalid benchmark arguments" invalid_message)
 if(invalid_message EQUAL -1)
     message(FATAL_ERROR "invalid benchmark did not use its fixed error message")
+endif()
+
+execute_process(
+    COMMAND "${AGENT_BENCHMARK_EXE}"
+        --warmup 1
+        --iterations 5
+        --batch-size 0
+        --output "${TEST_ROOT}/invalid-batch.json"
+    RESULT_VARIABLE invalid_batch_result
+    OUTPUT_VARIABLE invalid_batch_output
+    ERROR_VARIABLE invalid_batch_error)
+if(NOT invalid_batch_result EQUAL 2 OR NOT invalid_batch_output STREQUAL "")
+    message(FATAL_ERROR "zero batch size was not rejected")
+endif()
+string(FIND "${invalid_batch_error}" "invalid benchmark arguments"
+    invalid_batch_message)
+if(invalid_batch_message EQUAL -1)
+    message(FATAL_ERROR "invalid batch size did not use its fixed error message")
 endif()

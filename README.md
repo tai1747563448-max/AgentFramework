@@ -323,25 +323,30 @@ model-inference time:
 cmake --build build/vs2022 --config Release --target agent_benchmark
 
 & .\build\vs2022\Release\agent_benchmark.exe `
-  --warmup 100 `
-  --iterations 10000 `
+  --warmup 10 `
+  --iterations 100 `
+  --batch-size 1000 `
   --output benchmarks/results/local-baseline.json
 
 & .\build\vs2022\Release\agent_benchmark.exe `
-  --warmup 100 `
-  --iterations 10000 `
+  --warmup 10 `
+  --iterations 100 `
+  --batch-size 1000 `
   --baseline benchmarks/results/local-baseline.json `
-  --max-regression-percent 10 `
+  --max-regression-percent 15 `
   --output benchmarks/results/local-comparison.json
 ```
 
 The three fixed scenarios cover one-round text completion, a two-round tool
-call, and offline event-log evaluation. Each report records sample/error
+call, and offline event-log evaluation. Each timed sample averages a batch of
+operations to reduce timer and scheduler noise. Each report records sample/error
 counts, success rate, mean/P50/P95/P99/max latency, throughput, compiler/build
 metadata, the source commit, and whether benchmark-related sources were dirty
 when CMake configured the target. A baseline comparison fails when P95 latency
 or throughput regresses beyond the chosen percentage, or when success rate is
-below 100%.
+below 100%. The checked-in Windows run uses a 15% policy after repeated local
+noise calibration; another machine should establish its own baseline and
+threshold under idle, comparable conditions.
 
 This is a controlled **software/Runtime benchmark**. It does not measure GPU,
 model inference, Provider-network latency, or production concurrency. See

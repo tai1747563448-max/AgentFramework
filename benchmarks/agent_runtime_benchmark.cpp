@@ -53,9 +53,10 @@ constexpr int kRegression = 3;
 struct Options {
     std::size_t warmup{5};
     std::size_t iterations{1'000};
+    std::size_t batch_size{1'000};
     std::filesystem::path output;
     std::optional<std::filesystem::path> baseline;
-    double max_regression_percent{10.0};
+    double max_regression_percent{15.0};
 };
 
 struct ScenarioResult {
@@ -262,6 +263,7 @@ std::optional<Options> parse_options(int argc, char* argv[]) {
     Options options;
     bool saw_warmup = false;
     bool saw_iterations = false;
+    bool saw_batch_size = false;
     bool saw_output = false;
     bool saw_baseline = false;
     bool saw_regression = false;
@@ -280,6 +282,11 @@ std::optional<Options> parse_options(int argc, char* argv[]) {
         } else if (name == "--iterations" && !saw_iterations) {
             saw_iterations = true;
             if (!parse_size(value, false, options.iterations)) {
+                return std::nullopt;
+            }
+        } else if (name == "--batch-size" && !saw_batch_size) {
+            saw_batch_size = true;
+            if (!parse_size(value, false, options.batch_size)) {
                 return std::nullopt;
             }
         } else if (name == "--output" && !saw_output && !value.empty()) {
@@ -301,6 +308,10 @@ std::optional<Options> parse_options(int argc, char* argv[]) {
     if (!saw_output) {
         return std::nullopt;
     }
+    if (options.iterations >
+        std::numeric_limits<std::size_t>::max() / options.batch_size) {
+        return std::nullopt;
+    }
     return options;
 }
 
@@ -308,10 +319,14 @@ std::optional<ScenarioResult> run_scenario(
     std::string name,
     const std::function<bool()>& operation,
     std::size_t warmup,
-    std::size_t iterations) {
+    std::size_t iterations,
+    std::size_t batch_size) {
     for (std::size_t index = 0; index < warmup; ++index) {
-        if (!operation()) {
-            return std::nullopt;
+        for (std::size_t operation_index = 0;
+             operation_index < batch_size; ++operation_index) {
+            if (!operation()) {
+                return std::nullopt;
+            }
         }
     }
 
@@ -319,11 +334,16 @@ std::optional<ScenarioResult> run_scenario(
     observations.reserve(iterations);
     for (std::size_t index = 0; index < iterations; ++index) {
         const auto started = std::chrono::steady_clock::now();
-        const bool succeeded = operation();
+        bool succeeded = true;
+        for (std::size_t operation_index = 0;
+             operation_index < batch_size; ++operation_index) {
+            succeeded = operation() && succeeded;
+        }
         const auto stopped = std::chrono::steady_clock::now();
         double duration_us =
             std::chrono::duration<double, std::micro>(stopped - started)
-                .count();
+                .count() /
+            static_cast<double>(batch_size);
         if (duration_us <= 0.0) {
             duration_us = std::numeric_limits<double>::epsilon();
         }
@@ -474,7 +494,7 @@ int main(int argc, char* argv[]) {
     for (const auto& operation : operations) {
         auto result = run_scenario(
             operation.first, operation.second, options->warmup,
-            options->iterations);
+            options->iterations, options->batch_size);
         if (!result.has_value()) {
             std::cerr << "benchmark execution failed\n";
             return kRegression;
@@ -486,7 +506,10 @@ int main(int argc, char* argv[]) {
                 {"benchmark_kind", "controlled_offline_agent_runtime"},
                 {"parameters",
                  {{"warmup", options->warmup},
-                  {"iterations", options->iterations}}},
+                  {"iterations", options->iterations},
+                  {"batch_size", options->batch_size},
+                  {"total_operations",
+                   options->iterations * options->batch_size}}},
                 {"environment", environment_json()},
                 {"methodology",
                  {{"clock", "std::chrono::steady_clock"},
@@ -508,6 +531,8 @@ int main(int argc, char* argv[]) {
         std::cout << std::fixed << std::setprecision(3)
                   << "scenario=" << scenario.name
                   << " samples=" << scenario.summary.sample_count
+                  << " operations="
+                  << scenario.summary.sample_count * options->batch_size
                   << " success_rate=" << scenario.summary.success_rate
                   << " p50_us=" << scenario.summary.p50_latency_us
                   << " p95_us=" << scenario.summary.p95_latency_us

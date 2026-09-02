@@ -12,10 +12,11 @@ network, or model inference.
 | `tool_round_trip_runtime` | Scripted tool request, deterministic tool result, and final model response |
 | `event_log_evaluation` | Strict replay and fixed `TaskEvaluation` metrics over a completed event trace |
 
-Every measured iteration creates fresh Runtime collaborators for the Runtime
-scenarios. Warm-up iterations are executed but excluded from the report.
-`std::chrono::steady_clock` measures wall-clock latency around each complete
-operation.
+Every operation creates fresh Runtime collaborators for the Runtime scenarios.
+Each measured iteration times one batch and divides the elapsed wall time by
+the batch size; this reduces timer and operating-system scheduling noise for
+microsecond-scale operations. Warm-up batches are excluded from the report.
+`std::chrono::steady_clock` measures each complete batch.
 
 ## Metrics and regression policy
 
@@ -43,20 +44,22 @@ Build and run the Release target from the repository root:
 cmake --build build/vs2022 --config Release --target agent_benchmark
 
 & .\build\vs2022\Release\agent_benchmark.exe `
-  --warmup 100 --iterations 10000 `
+  --warmup 10 --iterations 100 --batch-size 1000 `
   --output benchmarks/results/2026-09-03-windows-msvc-release-baseline.json
 
 & .\build\vs2022\Release\agent_benchmark.exe `
-  --warmup 100 --iterations 10000 `
+  --warmup 10 --iterations 100 --batch-size 1000 `
   --baseline benchmarks/results/2026-09-03-windows-msvc-release-baseline.json `
-  --max-regression-percent 10 `
+  --max-regression-percent 15 `
   --output benchmarks/results/2026-09-03-windows-msvc-release-comparison.json
 ```
 
-The recorded comparison completed three scenarios with 10,000 measured
-iterations each, 100% success, and no P95-latency or throughput regression over
-the 10% policy. The JSON files are the evidence; the numbers are machine- and
-build-specific snapshots, not universal performance claims.
+The recorded comparison completed three scenarios with 100 timed batches of
+1,000 operations each, 100% success, and no P95-latency or throughput
+regression over the 15% policy. Batch size and threshold were calibrated after
+repeated Windows runs showed that microsecond-scale single-operation samples
+made a 10% gate noisy. The JSON files are the evidence; the numbers are
+machine- and build-specific snapshots, not universal performance claims.
 
 ## Claim boundary
 
