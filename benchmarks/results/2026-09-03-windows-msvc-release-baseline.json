@@ -1,0 +1,81 @@
+{
+  "benchmark_kind": "controlled_offline_agent_runtime",
+  "comparison": {
+    "requested": false
+  },
+  "environment": {
+    "build_config": "Release",
+    "compiler": "msvc-1937",
+    "git_commit": "bfde2017e75a",
+    "operating_system": "windows",
+    "working_tree_dirty": false
+  },
+  "limitations": [
+    "Measures deterministic Agent Runtime overhead, not model inference.",
+    "Does not measure GPU, provider-network, or production concurrency.",
+    "Compare reports only under the same build and machine conditions."
+  ],
+  "methodology": {
+    "clock": "std::chrono::steady_clock",
+    "external_network": false,
+    "scripted_provider": true
+  },
+  "parameters": {
+    "iterations": 10000,
+    "warmup": 100
+  },
+  "scenarios": [
+    {
+      "name": "text_completion_runtime",
+      "summary": {
+        "error_count": 0,
+        "max_latency_us": 155.9,
+        "mean_latency_us": 8.351649999999841,
+        "min_latency_us": 7.4,
+        "p50_latency_us": 8.0,
+        "p95_latency_us": 9.1,
+        "p99_latency_us": 12.4,
+        "sample_count": 10000,
+        "success_count": 10000,
+        "success_rate": 1.0,
+        "throughput_ops_per_second": 119736.81847299862,
+        "total_duration_us": 83516.49999999841
+      }
+    },
+    {
+      "name": "tool_round_trip_runtime",
+      "summary": {
+        "error_count": 0,
+        "max_latency_us": 174.3,
+        "mean_latency_us": 25.012220000000017,
+        "min_latency_us": 22.0,
+        "p50_latency_us": 24.1,
+        "p95_latency_us": 29.5,
+        "p99_latency_us": 47.3,
+        "sample_count": 10000,
+        "success_count": 10000,
+        "success_rate": 1.0,
+        "throughput_ops_per_second": 39980.45755234839,
+        "total_duration_us": 250122.20000000016
+      }
+    },
+    {
+      "name": "event_log_evaluation",
+      "summary": {
+        "error_count": 0,
+        "max_latency_us": 45.5,
+        "mean_latency_us": 2.3571400000000318,
+        "min_latency_us": 2.1,
+        "p50_latency_us": 2.3,
+        "p95_latency_us": 2.5,
+        "p99_latency_us": 3.2,
+        "sample_count": 10000,
+        "success_count": 10000,
+        "success_rate": 1.0,
+        "throughput_ops_per_second": 424242.93847628334,
+        "total_duration_us": 23571.400000000318
+      }
+    }
+  ],
+  "schema_version": 1
+}

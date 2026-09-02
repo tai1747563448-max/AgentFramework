@@ -1,0 +1,116 @@
+{
+  "benchmark_kind": "controlled_offline_agent_runtime",
+  "comparison": {
+    "passed": true,
+    "policy": {
+      "max_p95_latency_regression_percent": 10.0,
+      "max_throughput_regression_percent": 10.0,
+      "minimum_success_rate": 1.0
+    },
+    "requested": true,
+    "scenarios": [
+      {
+        "latency_regressed": false,
+        "name": "text_completion_runtime",
+        "p95_latency_change_percent": -2.19780219780219,
+        "passed": true,
+        "success_rate_below_minimum": false,
+        "throughput_drop_percent": -0.9570286056885714,
+        "throughput_regressed": false
+      },
+      {
+        "latency_regressed": false,
+        "name": "tool_round_trip_runtime",
+        "p95_latency_change_percent": -0.6610169491527842,
+        "passed": true,
+        "success_rate_below_minimum": false,
+        "throughput_drop_percent": -0.6323868318056478,
+        "throughput_regressed": false
+      },
+      {
+        "latency_regressed": false,
+        "name": "event_log_evaluation",
+        "p95_latency_change_percent": 0.0,
+        "passed": true,
+        "success_rate_below_minimum": false,
+        "throughput_drop_percent": 3.3982770915463694,
+        "throughput_regressed": false
+      }
+    ]
+  },
+  "environment": {
+    "build_config": "Release",
+    "compiler": "msvc-1937",
+    "git_commit": "bfde2017e75a",
+    "operating_system": "windows",
+    "working_tree_dirty": false
+  },
+  "limitations": [
+    "Measures deterministic Agent Runtime overhead, not model inference.",
+    "Does not measure GPU, provider-network, or production concurrency.",
+    "Compare reports only under the same build and machine conditions."
+  ],
+  "methodology": {
+    "clock": "std::chrono::steady_clock",
+    "external_network": false,
+    "scripted_provider": true
+  },
+  "parameters": {
+    "iterations": 10000,
+    "warmup": 100
+  },
+  "scenarios": [
+    {
+      "name": "text_completion_runtime",
+      "summary": {
+        "error_count": 0,
+        "max_latency_us": 117.0,
+        "mean_latency_us": 8.272479999999975,
+        "min_latency_us": 7.4,
+        "p50_latency_us": 8.0,
+        "p95_latency_us": 8.9,
+        "p99_latency_us": 11.7,
+        "sample_count": 10000,
+        "success_count": 10000,
+        "success_rate": 1.0,
+        "throughput_ops_per_second": 120882.73407732662,
+        "total_duration_us": 82724.79999999976
+      }
+    },
+    {
+      "name": "tool_round_trip_runtime",
+      "summary": {
+        "error_count": 0,
+        "max_latency_us": 159.9,
+        "mean_latency_us": 24.85503999999999,
+        "min_latency_us": 21.9,
+        "p50_latency_us": 23.7,
+        "p95_latency_us": 29.30499999999993,
+        "p99_latency_us": 50.70100000000002,
+        "sample_count": 10000,
+        "success_count": 10000,
+        "success_rate": 1.0,
+        "throughput_ops_per_second": 40233.288701205085,
+        "total_duration_us": 248550.39999999988
+      }
+    },
+    {
+      "name": "event_log_evaluation",
+      "summary": {
+        "error_count": 0,
+        "max_latency_us": 57.4,
+        "mean_latency_us": 2.440060000000019,
+        "min_latency_us": 2.1,
+        "p50_latency_us": 2.4,
+        "p95_latency_us": 2.5,
+        "p99_latency_us": 3.4,
+        "sample_count": 10000,
+        "success_count": 10000,
+        "success_rate": 1.0,
+        "throughput_ops_per_second": 409825.98788554064,
+        "total_duration_us": 24400.600000000188
+      }
+    }
+  ],
+  "schema_version": 1
+}
