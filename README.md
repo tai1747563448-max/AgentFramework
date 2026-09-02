@@ -312,6 +312,42 @@ but user or model content is not a general-purpose secret scrubber. Protect
 the runtime directory with appropriate local access controls and do not add it
 to Git.
 
+## Benchmark the controlled Runtime paths
+
+`agent_benchmark` is a credential-free Release target for repeatable software
+benchmarking. It uses an in-process scripted Provider and an in-memory event
+store so the result measures the Agent Runtime paths rather than network or
+model-inference time:
+
+```powershell
+cmake --build build/vs2022 --config Release --target agent_benchmark
+
+& .\build\vs2022\Release\agent_benchmark.exe `
+  --warmup 100 `
+  --iterations 10000 `
+  --output benchmarks/results/local-baseline.json
+
+& .\build\vs2022\Release\agent_benchmark.exe `
+  --warmup 100 `
+  --iterations 10000 `
+  --baseline benchmarks/results/local-baseline.json `
+  --max-regression-percent 10 `
+  --output benchmarks/results/local-comparison.json
+```
+
+The three fixed scenarios cover one-round text completion, a two-round tool
+call, and offline event-log evaluation. Each report records sample/error
+counts, success rate, mean/P50/P95/P99/max latency, throughput, compiler/build
+metadata, the source commit, and whether benchmark-related sources were dirty
+when CMake configured the target. A baseline comparison fails when P95 latency
+or throughput regresses beyond the chosen percentage, or when success rate is
+below 100%.
+
+This is a controlled **software/Runtime benchmark**. It does not measure GPU,
+model inference, Provider-network latency, or production concurrency. See
+[`benchmarks/README.md`](benchmarks/README.md) for methodology, interpretation,
+and the checked-in sample reports.
+
 ## Opt-in live provider smoke
 
 The normal build does not create or register a live test. A credentialed smoke

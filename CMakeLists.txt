@@ -42,6 +42,7 @@ add_library(agent_kernel STATIC
     src/application/state_reducer.cpp
     src/application/runtime_engine.cpp
     src/application/task_evaluator.cpp
+    src/application/benchmark_statistics.cpp
     src/adapters/json/value_json.cpp
     src/adapters/anthropic/cpr_http_transport.cpp
     src/adapters/anthropic/anthropic_messages_client.cpp
@@ -90,6 +91,50 @@ if(MSVC)
     target_compile_options(agent PRIVATE /W4 /permissive- /utf-8)
 endif()
 
+execute_process(
+    COMMAND git rev-parse --short=12 HEAD
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    RESULT_VARIABLE AGENT_GIT_RESULT
+    OUTPUT_VARIABLE AGENT_GIT_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+if(NOT AGENT_GIT_RESULT EQUAL 0 OR AGENT_GIT_COMMIT STREQUAL "")
+    set(AGENT_GIT_COMMIT "unknown")
+endif()
+execute_process(
+    COMMAND git status --porcelain --
+        CMakeLists.txt
+        src
+        benchmarks/agent_runtime_benchmark.cpp
+        tests/application/benchmark_statistics_test.cpp
+        tests/benchmark/agent_benchmark_process_test.cmake
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    RESULT_VARIABLE AGENT_GIT_STATUS_RESULT
+    OUTPUT_VARIABLE AGENT_GIT_STATUS
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+if(AGENT_GIT_STATUS_RESULT EQUAL 0 AND AGENT_GIT_STATUS STREQUAL "")
+    set(AGENT_GIT_DIRTY 0)
+else()
+    set(AGENT_GIT_DIRTY 1)
+endif()
+add_executable(agent_benchmark benchmarks/agent_runtime_benchmark.cpp)
+target_link_libraries(agent_benchmark PRIVATE agent_runtime)
+target_compile_definitions(agent_benchmark PRIVATE
+    AGENT_BUILD_CONFIG="$<CONFIG>"
+    AGENT_GIT_COMMIT="${AGENT_GIT_COMMIT}"
+    AGENT_GIT_DIRTY=${AGENT_GIT_DIRTY})
+if(WIN32)
+    add_custom_command(TARGET agent_benchmark POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_RUNTIME_DLLS:agent_benchmark>
+            $<TARGET_FILE_DIR:agent_benchmark>
+        COMMAND_EXPAND_LISTS)
+endif()
+if(MSVC)
+    target_compile_options(agent_benchmark PRIVATE /W4 /permissive- /utf-8)
+endif()
+
 enable_testing()
 function(add_agent_test target source)
     add_executable(${target} tests/test_main.cpp ${source})
@@ -106,6 +151,8 @@ add_agent_test(runtime_event_tests tests/domain/runtime_event_test.cpp)
 add_agent_test(state_reducer_tests tests/application/state_reducer_test.cpp)
 add_agent_test(runtime_engine_tests tests/application/runtime_engine_test.cpp)
 add_agent_test(task_evaluator_tests tests/application/task_evaluator_test.cpp)
+add_agent_test(benchmark_statistics_tests
+    tests/application/benchmark_statistics_test.cpp)
 add_agent_test(jsonl_event_store_tests tests/adapters/jsonl_event_store_test.cpp)
 add_agent_test(anthropic_adapter_tests tests/adapters/anthropic_messages_client_test.cpp)
 target_link_libraries(anthropic_adapter_tests PRIVATE Threads::Threads)
@@ -155,6 +202,12 @@ add_test(
         "-DEVENT_LOG=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/valid-completed-events.jsonl"
         "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/resume-process"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/resume_process_test.cmake")
+add_test(
+    NAME agent_benchmark_process
+    COMMAND ${CMAKE_COMMAND}
+        "-DAGENT_BENCHMARK_EXE=${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/agent_benchmark${CMAKE_EXECUTABLE_SUFFIX}"
+        "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/agent-benchmark-process"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark/agent_benchmark_process_test.cmake")
 if(Python3_Interpreter_FOUND)
     add_agent_test(rag_integration_tests
         tests/integration/rag_integration_test.cpp)
