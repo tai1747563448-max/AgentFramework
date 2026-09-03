@@ -2,10 +2,10 @@
   "benchmark_kind": "controlled_offline_agent_runtime",
   "comparison": {
     "baseline": {
-      "git_commit": "40a4d8c23924",
+      "git_commit": "771d5b676902",
       "path": "benchmarks/results/2026-09-03-windows-msvc-release-baseline.json",
       "schema_version": 2,
-      "sha256": "fabe668855b13620760ea60491b656892891b55d3293ff1a9505e49a528b03b6",
+      "sha256": "6bc16591333a794b9752abcd34ea1b1d8ea346d54c7adf80a6bd421d56c66802",
       "working_tree_dirty": false
     },
     "compatibility_validated": true,
@@ -20,28 +20,28 @@
       {
         "latency_regressed": false,
         "name": "text_completion_runtime",
-        "p95_latency_change_percent": 3.477969903155863,
+        "p95_latency_change_percent": 3.953378009062535,
         "passed": true,
         "success_rate_below_minimum": false,
-        "throughput_drop_percent": 4.203409432094929,
+        "throughput_drop_percent": 1.814909700186672,
         "throughput_regressed": false
       },
       {
         "latency_regressed": false,
         "name": "tool_round_trip_runtime",
-        "p95_latency_change_percent": 0.5764072744306954,
+        "p95_latency_change_percent": 1.0646005408961188,
         "passed": true,
         "success_rate_below_minimum": false,
-        "throughput_drop_percent": -0.13994070225716684,
+        "throughput_drop_percent": 1.9238873760113133,
         "throughput_regressed": false
       },
       {
         "latency_regressed": false,
         "name": "event_log_evaluation",
-        "p95_latency_change_percent": -0.6227656517964363,
+        "p95_latency_change_percent": -4.604155382875172,
         "passed": true,
         "success_rate_below_minimum": false,
-        "throughput_drop_percent": -2.1036949600270987,
+        "throughput_drop_percent": -2.3342101108921955,
         "throughput_regressed": false
       }
     ]
@@ -49,7 +49,7 @@
   "environment": {
     "build_config": "Release",
     "compiler": "msvc-1937",
-    "git_commit": "40a4d8c23924",
+    "git_commit": "771d5b676902",
     "operating_system": "windows",
     "working_tree_dirty": false
   },
@@ -74,54 +74,54 @@
       "name": "text_completion_runtime",
       "summary": {
         "error_count": 0,
-        "max_latency_us": 9.5967,
-        "mean_latency_us": 8.722919000000001,
-        "min_latency_us": 8.2843,
+        "max_latency_us": 9.6098,
+        "mean_latency_us": 8.481578999999998,
+        "min_latency_us": 8.0775,
         "operation_count": 100000,
-        "p50_latency_us": 8.6976,
-        "p95_latency_us": 9.10736,
-        "p99_latency_us": 9.392562,
+        "p50_latency_us": 8.46295,
+        "p95_latency_us": 8.94826,
+        "p99_latency_us": 9.002633000000003,
         "sample_count": 100,
         "success_count": 100000,
         "success_rate": 1.0,
-        "throughput_ops_per_second": 114640.52343028749,
-        "total_duration_us": 872291.9
+        "throughput_ops_per_second": 117902.57450882673,
+        "total_duration_us": 848157.8999999999
       }
     },
     {
       "name": "tool_round_trip_runtime",
       "summary": {
         "error_count": 0,
-        "max_latency_us": 25.7976,
-        "mean_latency_us": 24.35674500000001,
-        "min_latency_us": 23.6568,
+        "max_latency_us": 26.1866,
+        "mean_latency_us": 25.292124999999995,
+        "min_latency_us": 24.3029,
         "operation_count": 100000,
-        "p50_latency_us": 24.31525,
-        "p95_latency_us": 25.249350000000003,
-        "p99_latency_us": 25.404867000000003,
+        "p50_latency_us": 25.25925,
+        "p95_latency_us": 25.924964999999997,
+        "p99_latency_us": 26.144228,
         "sample_count": 100,
         "success_count": 100000,
         "success_rate": 1.0,
-        "throughput_ops_per_second": 41056.3891028953,
-        "total_duration_us": 2435674.500000001
+        "throughput_ops_per_second": 39537.99848767157,
+        "total_duration_us": 2529212.4999999995
       }
     },
     {
       "name": "event_log_evaluation",
       "summary": {
         "error_count": 0,
-        "max_latency_us": 2.8168,
-        "mean_latency_us": 2.3788620000000007,
-        "min_latency_us": 2.2484,
+        "max_latency_us": 2.8592,
+        "mean_latency_us": 2.4388550000000007,
+        "min_latency_us": 2.264,
         "operation_count": 100000,
-        "p50_latency_us": 2.3600000000000003,
-        "p95_latency_us": 2.5699400000000003,
-        "p99_latency_us": 2.642065000000001,
+        "p50_latency_us": 2.41995,
+        "p95_latency_us": 2.58911,
+        "p99_latency_us": 2.839697,
         "sample_count": 100,
         "success_count": 100000,
         "success_rate": 1.0,
-        "throughput_ops_per_second": 420369.06722626183,
-        "total_duration_us": 237886.20000000007
+        "throughput_ops_per_second": 410028.47647769126,
+        "total_duration_us": 243885.50000000006
       }
     }
   ],
