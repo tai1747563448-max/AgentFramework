@@ -13,19 +13,28 @@ network, or model inference.
 | `event_log_evaluation` | Strict replay and fixed `TaskEvaluation` metrics over a completed event trace |
 
 Every operation creates fresh Runtime collaborators for the Runtime scenarios.
-Each measured iteration times one batch and divides the elapsed wall time by
-the batch size; this reduces timer and operating-system scheduling noise for
-microsecond-scale operations. Warm-up batches are excluded from the report.
+Each measured iteration times one complete batch. Per-operation latency for
+that sample is the batch wall time divided by its operation count; this reduces
+timer and operating-system scheduling noise for microsecond-scale operations.
+Warm-up batches are excluded. `total_duration_us` retains the actual sum of
+timed batch wall time rather than the divided per-operation samples.
 `std::chrono::steady_clock` measures each complete batch.
 
 ## Metrics and regression policy
 
-The JSON report contains sample, success, and error counts; total, minimum,
-mean, P50, P95, P99, and maximum latency in microseconds; operations per second;
-and success rate. Percentiles use linear interpolation over sorted samples.
+Schema-v2 JSON distinguishes the batch `sample_count` from operation-level
+`operation_count`, `success_count`, and `error_count`. It also contains actual
+total measured duration; per-operation minimum, mean, P50, P95, P99, and
+maximum latency in microseconds; operations per second; and operation success
+rate. Percentiles use linear interpolation over sorted batch-average samples.
 
-When `--baseline` is supplied, scenarios are matched by exact name. Comparison
-passes only when:
+When `--baseline` is supplied, it must have the supported schema and the same
+warm-up, iteration, batch-size, clock, scripted/network method, operating
+system, compiler, build configuration, and exact unique scenario set. Its
+summary fields must also be internally consistent. An incompatible baseline is
+rejected with exit code `2`. The comparison report records the baseline path
+and SHA-256 so the comparison input can be audited. After validation, scenarios
+are matched by exact name and comparison passes only when:
 
 - current P95 latency does not exceed the baseline by more than
   `--max-regression-percent`;

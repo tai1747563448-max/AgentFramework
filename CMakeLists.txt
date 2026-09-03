@@ -91,39 +91,26 @@ if(MSVC)
     target_compile_options(agent PRIVATE /W4 /permissive- /utf-8)
 endif()
 
-execute_process(
-    COMMAND git rev-parse --short=12 HEAD
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-    RESULT_VARIABLE AGENT_GIT_RESULT
-    OUTPUT_VARIABLE AGENT_GIT_COMMIT
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET)
-if(NOT AGENT_GIT_RESULT EQUAL 0 OR AGENT_GIT_COMMIT STREQUAL "")
-    set(AGENT_GIT_COMMIT "unknown")
-endif()
-execute_process(
-    COMMAND git status --porcelain --
-        CMakeLists.txt
-        src
-        benchmarks/agent_runtime_benchmark.cpp
-        tests/application/benchmark_statistics_test.cpp
-        tests/benchmark/agent_benchmark_process_test.cmake
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-    RESULT_VARIABLE AGENT_GIT_STATUS_RESULT
-    OUTPUT_VARIABLE AGENT_GIT_STATUS
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET)
-if(AGENT_GIT_STATUS_RESULT EQUAL 0 AND AGENT_GIT_STATUS STREQUAL "")
-    set(AGENT_GIT_DIRTY 0)
-else()
-    set(AGENT_GIT_DIRTY 1)
-endif()
-add_executable(agent_benchmark benchmarks/agent_runtime_benchmark.cpp)
+set(AGENT_BENCHMARK_PROVENANCE_HEADER
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/benchmark_provenance.h")
+add_custom_target(agent_benchmark_provenance
+    COMMAND ${CMAKE_COMMAND}
+        "-DAGENT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+        "-DAGENT_OUTPUT_FILE=${AGENT_BENCHMARK_PROVENANCE_HEADER}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/write_benchmark_provenance.cmake"
+    BYPRODUCTS "${AGENT_BENCHMARK_PROVENANCE_HEADER}"
+    VERBATIM)
+set_source_files_properties(
+    "${AGENT_BENCHMARK_PROVENANCE_HEADER}" PROPERTIES GENERATED TRUE)
+add_executable(agent_benchmark
+    benchmarks/agent_runtime_benchmark.cpp
+    "${AGENT_BENCHMARK_PROVENANCE_HEADER}")
+add_dependencies(agent_benchmark agent_benchmark_provenance)
 target_link_libraries(agent_benchmark PRIVATE agent_runtime)
+target_include_directories(agent_benchmark PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_compile_definitions(agent_benchmark PRIVATE
-    AGENT_BUILD_CONFIG="$<CONFIG>"
-    AGENT_GIT_COMMIT="${AGENT_GIT_COMMIT}"
-    AGENT_GIT_DIRTY=${AGENT_GIT_DIRTY})
+    AGENT_BUILD_CONFIG="$<CONFIG>")
 if(WIN32)
     add_custom_command(TARGET agent_benchmark POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -208,6 +195,12 @@ add_test(
         "-DAGENT_BENCHMARK_EXE=${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/agent_benchmark${CMAKE_EXECUTABLE_SUFFIX}"
         "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/agent-benchmark-process"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark/agent_benchmark_process_test.cmake")
+add_test(
+    NAME benchmark_provenance
+    COMMAND ${CMAKE_COMMAND}
+        "-DPROVENANCE_SCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/cmake/write_benchmark_provenance.cmake"
+        "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/benchmark-provenance"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark/benchmark_provenance_test.cmake")
 if(Python3_Interpreter_FOUND)
     add_agent_test(rag_integration_tests
         tests/integration/rag_integration_test.cpp)

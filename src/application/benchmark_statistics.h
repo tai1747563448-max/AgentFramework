@@ -9,11 +9,13 @@ namespace agent {
 
 struct BenchmarkObservation {
     double duration_us{0.0};
-    bool succeeded{false};
+    std::size_t operation_count{0};
+    std::size_t success_count{0};
 };
 
 struct BenchmarkSummary {
     std::size_t sample_count{0};
+    std::size_t operation_count{0};
     std::size_t success_count{0};
     std::size_t error_count{0};
     double total_duration_us{0.0};

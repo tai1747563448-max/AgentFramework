@@ -339,14 +339,18 @@ cmake --build build/vs2022 --config Release --target agent_benchmark
 
 The three fixed scenarios cover one-round text completion, a two-round tool
 call, and offline event-log evaluation. Each timed sample averages a batch of
-operations to reduce timer and scheduler noise. Each report records sample/error
-counts, success rate, mean/P50/P95/P99/max latency, throughput, compiler/build
-metadata, the source commit, and whether benchmark-related sources were dirty
-when CMake configured the target. A baseline comparison fails when P95 latency
-or throughput regresses beyond the chosen percentage, or when success rate is
-below 100%. The checked-in Windows run uses a 15% policy after repeated local
-noise calibration; another machine should establish its own baseline and
-threshold under idle, comparable conditions.
+operations to reduce timer and scheduler noise. Each schema-v2 report records
+the batch-sample count, operation/success/error counts, actual measured wall
+time, per-operation mean/P50/P95/P99/max latency, throughput, and success rate.
+The benchmark target refreshes source commit and benchmark-source dirty state at
+build time. A baseline is accepted only when its schema, workload parameters,
+method, platform/compiler/build configuration, scenario set, and metric
+relationships are compatible; the comparison report records the baseline path
+and SHA-256. Comparison fails when P95 latency or throughput regresses beyond
+the chosen percentage, or when success rate is below 100%. The checked-in
+Windows run uses a 15% policy after repeated local noise calibration; another
+machine should establish its own baseline and threshold under idle, comparable
+conditions.
 
 This is a controlled **software/Runtime benchmark**. It does not measure GPU,
 model inference, Provider-network latency, or production concurrency. See

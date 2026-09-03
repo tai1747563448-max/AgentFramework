@@ -1,6 +1,7 @@
 #include "application/benchmark_statistics.h"
 #include "application/runtime_engine.h"
 #include "application/task_evaluator.h"
+#include "adapters/workspace/workspace_text.h"
 #include "domain/model_types.h"
 #include "domain/runtime_error.h"
 #include "ports/cancellation.h"
@@ -10,6 +11,7 @@
 #include "ports/knowledge_provider.h"
 #include "ports/model_client.h"
 #include "ports/tool_gateway.h"
+#include "benchmark_provenance.h"
 
 #include <nlohmann/json.hpp>
 
@@ -17,13 +19,16 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
+#include <map>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -34,14 +39,6 @@
 #define AGENT_BUILD_CONFIG "unknown"
 #endif
 
-#ifndef AGENT_GIT_COMMIT
-#define AGENT_GIT_COMMIT "unknown"
-#endif
-
-#ifndef AGENT_GIT_DIRTY
-#define AGENT_GIT_DIRTY 0
-#endif
-
 namespace {
 
 using Json = nlohmann::json;
@@ -49,6 +46,7 @@ using Json = nlohmann::json;
 constexpr int kSuccess = 0;
 constexpr int kInvalidInput = 2;
 constexpr int kRegression = 3;
+constexpr int kReportSchemaVersion = 2;
 
 struct Options {
     std::size_t warmup{5};
@@ -63,6 +61,35 @@ struct ScenarioResult {
     std::string name;
     agent::BenchmarkSummary summary;
 };
+
+struct LoadedReport {
+    Json json;
+    std::string sha256;
+};
+
+std::optional<std::size_t> json_size(const Json& value) {
+    if (!value.is_number_integer()) {
+        return std::nullopt;
+    }
+    try {
+        if (value.is_number_unsigned()) {
+            const auto parsed = value.get<std::uint64_t>();
+            if (parsed > std::numeric_limits<std::size_t>::max()) {
+                return std::nullopt;
+            }
+            return static_cast<std::size_t>(parsed);
+        }
+        const auto parsed = value.get<std::int64_t>();
+        if (parsed < 0 ||
+            static_cast<std::uint64_t>(parsed) >
+                std::numeric_limits<std::size_t>::max()) {
+            return std::nullopt;
+        }
+        return static_cast<std::size_t>(parsed);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
 
 class ScriptedModel final : public agent::ModelClient {
 public:
@@ -334,20 +361,21 @@ std::optional<ScenarioResult> run_scenario(
     observations.reserve(iterations);
     for (std::size_t index = 0; index < iterations; ++index) {
         const auto started = std::chrono::steady_clock::now();
-        bool succeeded = true;
+        std::size_t success_count = 0;
         for (std::size_t operation_index = 0;
              operation_index < batch_size; ++operation_index) {
-            succeeded = operation() && succeeded;
+            if (operation()) {
+                ++success_count;
+            }
         }
         const auto stopped = std::chrono::steady_clock::now();
         double duration_us =
             std::chrono::duration<double, std::micro>(stopped - started)
-                .count() /
-            static_cast<double>(batch_size);
+                .count();
         if (duration_us <= 0.0) {
             duration_us = std::numeric_limits<double>::epsilon();
         }
-        observations.push_back({duration_us, succeeded});
+        observations.push_back({duration_us, batch_size, success_count});
     }
 
     auto summary = agent::summarize_benchmark(observations);
@@ -359,6 +387,7 @@ std::optional<ScenarioResult> run_scenario(
 
 Json summary_json(const agent::BenchmarkSummary& summary) {
     return Json{{"sample_count", summary.sample_count},
+                {"operation_count", summary.operation_count},
                 {"success_count", summary.success_count},
                 {"error_count", summary.error_count},
                 {"total_duration_us", summary.total_duration_us},
@@ -378,46 +407,188 @@ std::optional<agent::BenchmarkSummary> summary_from_json(const Json& value) {
         return std::nullopt;
     }
     try {
+        const auto sample_count = json_size(value.at("sample_count"));
+        const auto operation_count = json_size(value.at("operation_count"));
+        const auto success_count = json_size(value.at("success_count"));
+        const auto error_count = json_size(value.at("error_count"));
+        if (!sample_count.has_value() || !operation_count.has_value() ||
+            !success_count.has_value() || !error_count.has_value()) {
+            return std::nullopt;
+        }
         agent::BenchmarkSummary summary;
+        summary.sample_count = *sample_count;
+        summary.operation_count = *operation_count;
+        summary.success_count = *success_count;
+        summary.error_count = *error_count;
+        summary.total_duration_us =
+            value.at("total_duration_us").get<double>();
+        summary.min_latency_us = value.at("min_latency_us").get<double>();
+        summary.mean_latency_us = value.at("mean_latency_us").get<double>();
+        summary.p50_latency_us = value.at("p50_latency_us").get<double>();
         summary.p95_latency_us = value.at("p95_latency_us").get<double>();
+        summary.p99_latency_us = value.at("p99_latency_us").get<double>();
+        summary.max_latency_us = value.at("max_latency_us").get<double>();
         summary.throughput_ops_per_second =
             value.at("throughput_ops_per_second").get<double>();
         summary.success_rate = value.at("success_rate").get<double>();
+
+        const auto finite_positive = [](double number) {
+            return std::isfinite(number) && number > 0.0;
+        };
+        const auto nearly_equal = [](double left, double right) {
+            const double scale =
+                std::max({1.0, std::abs(left), std::abs(right)});
+            return std::abs(left - right) <= scale * 1e-9;
+        };
+        if (summary.sample_count == 0 || summary.operation_count == 0 ||
+            summary.success_count > summary.operation_count ||
+            summary.error_count !=
+                summary.operation_count - summary.success_count ||
+            !finite_positive(summary.total_duration_us) ||
+            !finite_positive(summary.min_latency_us) ||
+            !finite_positive(summary.mean_latency_us) ||
+            !finite_positive(summary.p50_latency_us) ||
+            !finite_positive(summary.p95_latency_us) ||
+            !finite_positive(summary.p99_latency_us) ||
+            !finite_positive(summary.max_latency_us) ||
+            !finite_positive(summary.throughput_ops_per_second) ||
+            !std::isfinite(summary.success_rate) ||
+            summary.success_rate < 0.0 || summary.success_rate > 1.0 ||
+            summary.min_latency_us > summary.mean_latency_us ||
+            summary.mean_latency_us > summary.max_latency_us ||
+            summary.min_latency_us > summary.p50_latency_us ||
+            summary.p50_latency_us > summary.p95_latency_us ||
+            summary.p95_latency_us > summary.p99_latency_us ||
+            summary.p99_latency_us > summary.max_latency_us) {
+            return std::nullopt;
+        }
+        const double expected_mean =
+            summary.total_duration_us /
+            static_cast<double>(summary.operation_count);
+        const double expected_throughput =
+            static_cast<double>(summary.operation_count) * 1'000'000.0 /
+            summary.total_duration_us;
+        const double expected_success_rate =
+            static_cast<double>(summary.success_count) /
+            static_cast<double>(summary.operation_count);
+        if (!nearly_equal(summary.mean_latency_us, expected_mean) ||
+            !nearly_equal(summary.throughput_ops_per_second,
+                          expected_throughput) ||
+            !nearly_equal(summary.success_rate, expected_success_rate)) {
+            return std::nullopt;
+        }
         return summary;
     } catch (...) {
         return std::nullopt;
     }
 }
 
-std::optional<Json> read_json(const std::filesystem::path& path) {
+std::optional<LoadedReport> read_report(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
     if (!input) {
         return std::nullopt;
     }
-    Json parsed = Json::parse(input, nullptr, false);
+    std::string bytes;
+    bytes.assign(
+        std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    if (input.bad()) {
+        return std::nullopt;
+    }
+    Json parsed = Json::parse(bytes, nullptr, false);
     if (parsed.is_discarded()) {
         return std::nullopt;
     }
-    return parsed;
+    return LoadedReport{
+        std::move(parsed), agent::workspace::sha256_hex(bytes)};
 }
 
-std::optional<agent::BenchmarkSummary> find_baseline_summary(
+std::optional<std::map<std::string, agent::BenchmarkSummary>>
+validate_baseline_report(
     const Json& report,
-    const std::string& scenario_name) {
-    if (!report.is_object() ||
-        report.value("benchmark_kind", "") !=
-            "controlled_offline_agent_runtime" ||
-        !report.contains("scenarios") || !report["scenarios"].is_array()) {
+    const Options& options,
+    const Json& current_environment,
+    const std::vector<ScenarioResult>& current_scenarios) {
+    if (!report.is_object()) {
         return std::nullopt;
     }
-    for (const auto& scenario : report["scenarios"]) {
-        if (scenario.is_object() &&
-            scenario.value("name", "") == scenario_name &&
-            scenario.contains("summary")) {
-            return summary_from_json(scenario["summary"]);
+    try {
+        if (!report.at("schema_version").is_number_integer() ||
+            report.at("schema_version").get<int>() != kReportSchemaVersion ||
+            !report.at("benchmark_kind").is_string() ||
+            report.at("benchmark_kind").get<std::string>() !=
+                "controlled_offline_agent_runtime") {
+            return std::nullopt;
         }
+
+        const auto& parameters = report.at("parameters");
+        if (!parameters.is_object()) {
+            return std::nullopt;
+        }
+        const auto warmup = json_size(parameters.at("warmup"));
+        const auto iterations = json_size(parameters.at("iterations"));
+        const auto batch_size = json_size(parameters.at("batch_size"));
+        const auto total_operations =
+            json_size(parameters.at("total_operations"));
+        if (!warmup.has_value() || !iterations.has_value() ||
+            !batch_size.has_value() || !total_operations.has_value() ||
+            *warmup != options.warmup || *iterations != options.iterations ||
+            *batch_size != options.batch_size ||
+            *total_operations != options.iterations * options.batch_size) {
+            return std::nullopt;
+        }
+
+        const auto& methodology = report.at("methodology");
+        if (!methodology.is_object() ||
+            methodology.at("clock").get<std::string>() !=
+                "std::chrono::steady_clock" ||
+            !methodology.at("scripted_provider").get<bool>() ||
+            methodology.at("external_network").get<bool>()) {
+            return std::nullopt;
+        }
+
+        const auto& environment = report.at("environment");
+        for (const char* key :
+             {"operating_system", "compiler", "build_config"}) {
+            if (!environment.at(key).is_string() ||
+                environment.at(key) != current_environment.at(key)) {
+                return std::nullopt;
+            }
+        }
+        if (!environment.at("git_commit").is_string() ||
+            environment.at("git_commit").get<std::string>().empty() ||
+            !environment.at("working_tree_dirty").is_boolean()) {
+            return std::nullopt;
+        }
+
+        const auto& scenarios = report.at("scenarios");
+        if (!scenarios.is_array() ||
+            scenarios.size() != current_scenarios.size()) {
+            return std::nullopt;
+        }
+        std::map<std::string, agent::BenchmarkSummary> summaries;
+        for (const auto& scenario : scenarios) {
+            if (!scenario.is_object() || !scenario.at("name").is_string()) {
+                return std::nullopt;
+            }
+            const auto summary = summary_from_json(scenario.at("summary"));
+            if (!summary.has_value()) {
+                return std::nullopt;
+            }
+            const auto inserted = summaries.emplace(
+                scenario.at("name").get<std::string>(), *summary);
+            if (!inserted.second) {
+                return std::nullopt;
+            }
+        }
+        for (const auto& scenario : current_scenarios) {
+            if (summaries.find(scenario.name) == summaries.end()) {
+                return std::nullopt;
+            }
+        }
+        return summaries;
+    } catch (...) {
+        return std::nullopt;
     }
-    return std::nullopt;
 }
 
 bool write_report(const std::filesystem::path& path, const Json& report) {
@@ -502,7 +673,11 @@ int main(int argc, char* argv[]) {
         scenarios.push_back(std::move(*result));
     }
 
-    Json report{{"schema_version", 1},
+    const Json environment = environment_json();
+    const Json methodology{{"clock", "std::chrono::steady_clock"},
+                           {"scripted_provider", true},
+                           {"external_network", false}};
+    Json report{{"schema_version", kReportSchemaVersion},
                 {"benchmark_kind", "controlled_offline_agent_runtime"},
                 {"parameters",
                  {{"warmup", options->warmup},
@@ -510,11 +685,8 @@ int main(int argc, char* argv[]) {
                   {"batch_size", options->batch_size},
                   {"total_operations",
                    options->iterations * options->batch_size}}},
-                {"environment", environment_json()},
-                {"methodology",
-                 {{"clock", "std::chrono::steady_clock"},
-                  {"scripted_provider", true},
-                  {"external_network", false}}},
+                {"environment", environment},
+                {"methodology", methodology},
                 {"limitations",
                  Json::array({
                      "Measures deterministic Agent Runtime overhead, not model inference.",
@@ -527,12 +699,12 @@ int main(int argc, char* argv[]) {
         report["scenarios"].push_back(
             {{"name", scenario.name}, {"summary", summary_json(scenario.summary)}});
         all_operations_succeeded =
-            all_operations_succeeded && scenario.summary.success_rate == 1.0;
+            all_operations_succeeded &&
+            scenario.summary.success_count == scenario.summary.operation_count;
         std::cout << std::fixed << std::setprecision(3)
                   << "scenario=" << scenario.name
                   << " samples=" << scenario.summary.sample_count
-                  << " operations="
-                  << scenario.summary.sample_count * options->batch_size
+                  << " operations=" << scenario.summary.operation_count
                   << " success_rate=" << scenario.summary.success_rate
                   << " p50_us=" << scenario.summary.p50_latency_us
                   << " p95_us=" << scenario.summary.p95_latency_us
@@ -544,25 +716,37 @@ int main(int argc, char* argv[]) {
     bool comparison_passed = true;
     Json comparison{{"requested", options->baseline.has_value()}};
     if (options->baseline.has_value()) {
-        const auto baseline_report = read_json(*options->baseline);
+        const auto baseline_report = read_report(*options->baseline);
         if (!baseline_report.has_value()) {
             std::cerr << "benchmark baseline is invalid\n";
             return kInvalidInput;
         }
+        const auto baseline_summaries = validate_baseline_report(
+            baseline_report->json, *options, environment, scenarios);
+        if (!baseline_summaries.has_value()) {
+            std::cerr << "benchmark baseline is invalid\n";
+            return kInvalidInput;
+        }
+        comparison["compatibility_validated"] = true;
+        comparison["baseline"] =
+            {{"path", options->baseline->generic_u8string()},
+             {"sha256", baseline_report->sha256},
+             {"schema_version",
+              baseline_report->json.at("schema_version")},
+             {"git_commit",
+              baseline_report->json.at("environment").at("git_commit")},
+             {"working_tree_dirty",
+              baseline_report->json.at("environment")
+                  .at("working_tree_dirty")}};
         comparison["scenarios"] = Json::array();
         const agent::BenchmarkRegressionPolicy policy{
             options->max_regression_percent,
             options->max_regression_percent,
             1.0};
         for (const auto& scenario : scenarios) {
-            const auto baseline =
-                find_baseline_summary(*baseline_report, scenario.name);
-            if (!baseline.has_value()) {
-                std::cerr << "benchmark baseline is invalid\n";
-                return kInvalidInput;
-            }
+            const auto& baseline = baseline_summaries->at(scenario.name);
             const auto compared =
-                agent::compare_benchmark(*baseline, scenario.summary, policy);
+                agent::compare_benchmark(baseline, scenario.summary, policy);
             if (!compared.has_value()) {
                 std::cerr << "benchmark baseline is invalid\n";
                 return kInvalidInput;

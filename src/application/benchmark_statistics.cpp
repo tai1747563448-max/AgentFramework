@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <numeric>
 
 namespace agent {
@@ -45,41 +46,52 @@ Result<BenchmarkSummary> summarize_benchmark(
 
     std::vector<double> latencies;
     latencies.reserve(observations.size());
+    std::size_t operation_count = 0;
     std::size_t success_count = 0;
     double total_duration_us = 0.0;
     for (const auto& observation : observations) {
-        if (!finite_positive(observation.duration_us)) {
+        if (!finite_positive(observation.duration_us) ||
+            observation.operation_count == 0 ||
+            observation.success_count > observation.operation_count ||
+            observation.operation_count >
+                std::numeric_limits<std::size_t>::max() - operation_count) {
             return invalid_summary();
         }
-        latencies.push_back(observation.duration_us);
+        const double latency_us =
+            observation.duration_us /
+            static_cast<double>(observation.operation_count);
+        if (!finite_positive(latency_us)) {
+            return invalid_summary();
+        }
+        latencies.push_back(latency_us);
         total_duration_us += observation.duration_us;
         if (!std::isfinite(total_duration_us)) {
             return invalid_summary();
         }
-        if (observation.succeeded) {
-            ++success_count;
-        }
+        operation_count += observation.operation_count;
+        success_count += observation.success_count;
     }
 
     std::sort(latencies.begin(), latencies.end());
     BenchmarkSummary summary;
     summary.sample_count = observations.size();
+    summary.operation_count = operation_count;
     summary.success_count = success_count;
-    summary.error_count = observations.size() - success_count;
+    summary.error_count = operation_count - success_count;
     summary.total_duration_us = total_duration_us;
     summary.min_latency_us = latencies.front();
     summary.mean_latency_us =
-        total_duration_us / static_cast<double>(observations.size());
+        total_duration_us / static_cast<double>(operation_count);
     summary.p50_latency_us = percentile(latencies, 0.50);
     summary.p95_latency_us = percentile(latencies, 0.95);
     summary.p99_latency_us = percentile(latencies, 0.99);
     summary.max_latency_us = latencies.back();
     summary.throughput_ops_per_second =
-        static_cast<double>(observations.size()) * 1'000'000.0 /
+        static_cast<double>(operation_count) * 1'000'000.0 /
         total_duration_us;
     summary.success_rate =
         static_cast<double>(success_count) /
-        static_cast<double>(observations.size());
+        static_cast<double>(operation_count);
     return Result<BenchmarkSummary>::success(std::move(summary));
 }
 

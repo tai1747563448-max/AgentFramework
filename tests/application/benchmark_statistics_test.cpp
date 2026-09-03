@@ -15,35 +15,45 @@ bool near(double actual, double expected, double tolerance = 1e-9) {
 
 TEST_CASE(benchmark_summary_reports_hand_checked_latency_and_reliability) {
     const std::vector<agent::BenchmarkObservation> observations{
-        {10.0, true}, {20.0, true}, {30.0, false}, {40.0, true}};
+        {100.0, 10, 10},
+        {250.0, 10, 9},
+        {300.0, 10, 10},
+        {450.0, 10, 8}};
 
     const auto summarized = agent::summarize_benchmark(observations);
 
     REQUIRE(summarized.has_value());
     const auto& summary = summarized.value();
     REQUIRE(summary.sample_count == 4);
-    REQUIRE(summary.success_count == 3);
-    REQUIRE(summary.error_count == 1);
-    REQUIRE(near(summary.total_duration_us, 100.0));
+    REQUIRE(summary.operation_count == 40);
+    REQUIRE(summary.success_count == 37);
+    REQUIRE(summary.error_count == 3);
+    REQUIRE(near(summary.total_duration_us, 1'100.0));
     REQUIRE(near(summary.min_latency_us, 10.0));
-    REQUIRE(near(summary.mean_latency_us, 25.0));
-    REQUIRE(near(summary.p50_latency_us, 25.0));
-    REQUIRE(near(summary.p95_latency_us, 38.5));
-    REQUIRE(near(summary.p99_latency_us, 39.7));
-    REQUIRE(near(summary.max_latency_us, 40.0));
-    REQUIRE(near(summary.throughput_ops_per_second, 40'000.0));
-    REQUIRE(near(summary.success_rate, 0.75));
+    REQUIRE(near(summary.mean_latency_us, 27.5));
+    REQUIRE(near(summary.p50_latency_us, 27.5));
+    REQUIRE(near(summary.p95_latency_us, 42.75));
+    REQUIRE(near(summary.p99_latency_us, 44.55));
+    REQUIRE(near(summary.max_latency_us, 45.0));
+    REQUIRE(near(summary.throughput_ops_per_second, 40'000'000.0 / 1'100.0));
+    REQUIRE(near(summary.success_rate, 0.925));
 }
 
-TEST_CASE(benchmark_summary_rejects_empty_or_nonpositive_nonfinite_latency) {
+TEST_CASE(benchmark_summary_rejects_invalid_duration_or_operation_counts) {
     REQUIRE(!agent::summarize_benchmark({}).has_value());
-    REQUIRE(!agent::summarize_benchmark({{0.0, true}}).has_value());
-    REQUIRE(!agent::summarize_benchmark({{-1.0, true}}).has_value());
+    REQUIRE(!agent::summarize_benchmark({{0.0, 1, 1}}).has_value());
+    REQUIRE(!agent::summarize_benchmark({{-1.0, 1, 1}}).has_value());
     REQUIRE(!agent::summarize_benchmark(
-                 {{std::numeric_limits<double>::infinity(), true}})
+                 {{std::numeric_limits<double>::infinity(), 1, 1}})
                  .has_value());
     REQUIRE(!agent::summarize_benchmark(
-                 {{std::numeric_limits<double>::quiet_NaN(), true}})
+                 {{std::numeric_limits<double>::quiet_NaN(), 1, 1}})
+                 .has_value());
+    REQUIRE(!agent::summarize_benchmark({{10.0, 0, 0}}).has_value());
+    REQUIRE(!agent::summarize_benchmark({{10.0, 1, 2}}).has_value());
+    REQUIRE(!agent::summarize_benchmark(
+                 {{10.0, std::numeric_limits<std::size_t>::max(), 0},
+                  {10.0, 1, 0}})
                  .has_value());
 }
 
