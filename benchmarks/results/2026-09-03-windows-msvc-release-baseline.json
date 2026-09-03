@@ -6,7 +6,7 @@
   "environment": {
     "build_config": "Release",
     "compiler": "msvc-1937",
-    "git_commit": "bfde2017e75a",
+    "git_commit": "37ac5d0ce115",
     "operating_system": "windows",
     "working_tree_dirty": false
   },
@@ -21,59 +21,61 @@
     "scripted_provider": true
   },
   "parameters": {
-    "iterations": 10000,
-    "warmup": 100
+    "batch_size": 1000,
+    "iterations": 100,
+    "total_operations": 100000,
+    "warmup": 10
   },
   "scenarios": [
     {
       "name": "text_completion_runtime",
       "summary": {
         "error_count": 0,
-        "max_latency_us": 155.9,
-        "mean_latency_us": 8.351649999999841,
-        "min_latency_us": 7.4,
-        "p50_latency_us": 8.0,
-        "p95_latency_us": 9.1,
-        "p99_latency_us": 12.4,
-        "sample_count": 10000,
-        "success_count": 10000,
+        "max_latency_us": 9.550600000000001,
+        "mean_latency_us": 8.475966000000003,
+        "min_latency_us": 7.9485,
+        "p50_latency_us": 8.4539,
+        "p95_latency_us": 8.996764999999998,
+        "p99_latency_us": 9.259738000000002,
+        "sample_count": 100,
+        "success_count": 100,
         "success_rate": 1.0,
-        "throughput_ops_per_second": 119736.81847299862,
-        "total_duration_us": 83516.49999999841
+        "throughput_ops_per_second": 117980.65258874324,
+        "total_duration_us": 847.5966000000003
       }
     },
     {
       "name": "tool_round_trip_runtime",
       "summary": {
         "error_count": 0,
-        "max_latency_us": 174.3,
-        "mean_latency_us": 25.012220000000017,
-        "min_latency_us": 22.0,
-        "p50_latency_us": 24.1,
-        "p95_latency_us": 29.5,
-        "p99_latency_us": 47.3,
-        "sample_count": 10000,
-        "success_count": 10000,
+        "max_latency_us": 27.4114,
+        "mean_latency_us": 25.257181,
+        "min_latency_us": 23.3229,
+        "p50_latency_us": 25.3431,
+        "p95_latency_us": 26.53044,
+        "p99_latency_us": 26.941843,
+        "sample_count": 100,
+        "success_count": 100,
         "success_rate": 1.0,
-        "throughput_ops_per_second": 39980.45755234839,
-        "total_duration_us": 250122.20000000016
+        "throughput_ops_per_second": 39592.70038885179,
+        "total_duration_us": 2525.7181
       }
     },
     {
       "name": "event_log_evaluation",
       "summary": {
         "error_count": 0,
-        "max_latency_us": 45.5,
-        "mean_latency_us": 2.3571400000000318,
-        "min_latency_us": 2.1,
-        "p50_latency_us": 2.3,
-        "p95_latency_us": 2.5,
-        "p99_latency_us": 3.2,
-        "sample_count": 10000,
-        "success_count": 10000,
+        "max_latency_us": 2.6885,
+        "mean_latency_us": 2.4358509999999995,
+        "min_latency_us": 2.2489,
+        "p50_latency_us": 2.4551499999999997,
+        "p95_latency_us": 2.557395,
+        "p99_latency_us": 2.665928,
+        "sample_count": 100,
+        "success_count": 100,
         "success_rate": 1.0,
-        "throughput_ops_per_second": 424242.93847628334,
-        "total_duration_us": 23571.400000000318
+        "throughput_ops_per_second": 410534.14186664135,
+        "total_duration_us": 243.58509999999995
       }
     }
   ],

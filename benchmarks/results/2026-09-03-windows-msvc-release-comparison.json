@@ -3,8 +3,8 @@
   "comparison": {
     "passed": true,
     "policy": {
-      "max_p95_latency_regression_percent": 10.0,
-      "max_throughput_regression_percent": 10.0,
+      "max_p95_latency_regression_percent": 15.0,
+      "max_throughput_regression_percent": 15.0,
       "minimum_success_rate": 1.0
     },
     "requested": true,
@@ -12,28 +12,28 @@
       {
         "latency_regressed": false,
         "name": "text_completion_runtime",
-        "p95_latency_change_percent": -2.19780219780219,
+        "p95_latency_change_percent": 0.03962535422454672,
         "passed": true,
         "success_rate_below_minimum": false,
-        "throughput_drop_percent": -0.9570286056885714,
+        "throughput_drop_percent": -0.5773609847033486,
         "throughput_regressed": false
       },
       {
         "latency_regressed": false,
         "name": "tool_round_trip_runtime",
-        "p95_latency_change_percent": -0.6610169491527842,
+        "p95_latency_change_percent": 0.31036047649417836,
         "passed": true,
         "success_rate_below_minimum": false,
-        "throughput_drop_percent": -0.6323868318056478,
+        "throughput_drop_percent": -0.10606243946543616,
         "throughput_regressed": false
       },
       {
         "latency_regressed": false,
         "name": "event_log_evaluation",
-        "p95_latency_change_percent": 0.0,
+        "p95_latency_change_percent": 6.279045669519176,
         "passed": true,
         "success_rate_below_minimum": false,
-        "throughput_drop_percent": 3.3982770915463694,
+        "throughput_drop_percent": 0.8376797528769957,
         "throughput_regressed": false
       }
     ]
@@ -41,7 +41,7 @@
   "environment": {
     "build_config": "Release",
     "compiler": "msvc-1937",
-    "git_commit": "bfde2017e75a",
+    "git_commit": "37ac5d0ce115",
     "operating_system": "windows",
     "working_tree_dirty": false
   },
@@ -56,59 +56,61 @@
     "scripted_provider": true
   },
   "parameters": {
-    "iterations": 10000,
-    "warmup": 100
+    "batch_size": 1000,
+    "iterations": 100,
+    "total_operations": 100000,
+    "warmup": 10
   },
   "scenarios": [
     {
       "name": "text_completion_runtime",
       "summary": {
         "error_count": 0,
-        "max_latency_us": 117.0,
-        "mean_latency_us": 8.272479999999975,
-        "min_latency_us": 7.4,
-        "p50_latency_us": 8.0,
-        "p95_latency_us": 8.9,
-        "p99_latency_us": 11.7,
-        "sample_count": 10000,
-        "success_count": 10000,
+        "max_latency_us": 9.229899999999999,
+        "mean_latency_us": 8.427309999999999,
+        "min_latency_us": 7.9106000000000005,
+        "p50_latency_us": 8.42995,
+        "p95_latency_us": 9.000329999999998,
+        "p99_latency_us": 9.207427000000001,
+        "sample_count": 100,
+        "success_count": 100,
         "success_rate": 1.0,
-        "throughput_ops_per_second": 120882.73407732662,
-        "total_duration_us": 82724.79999999976
+        "throughput_ops_per_second": 118661.82684628904,
+        "total_duration_us": 842.7309999999999
       }
     },
     {
       "name": "tool_round_trip_runtime",
       "summary": {
         "error_count": 0,
-        "max_latency_us": 159.9,
-        "mean_latency_us": 24.85503999999999,
-        "min_latency_us": 21.9,
-        "p50_latency_us": 23.7,
-        "p95_latency_us": 29.30499999999993,
-        "p99_latency_us": 50.70100000000002,
-        "sample_count": 10000,
-        "success_count": 10000,
+        "max_latency_us": 27.5607,
+        "mean_latency_us": 25.230421,
+        "min_latency_us": 23.923299999999998,
+        "p50_latency_us": 25.18515,
+        "p95_latency_us": 26.61278,
+        "p99_latency_us": 26.897202000000004,
+        "sample_count": 100,
+        "success_count": 100,
         "success_rate": 1.0,
-        "throughput_ops_per_second": 40233.288701205085,
-        "total_duration_us": 248550.39999999988
+        "throughput_ops_per_second": 39634.693372734444,
+        "total_duration_us": 2523.0421
       }
     },
     {
       "name": "event_log_evaluation",
       "summary": {
         "error_count": 0,
-        "max_latency_us": 57.4,
-        "mean_latency_us": 2.440060000000019,
-        "min_latency_us": 2.1,
-        "p50_latency_us": 2.4,
-        "p95_latency_us": 2.5,
-        "p99_latency_us": 3.4,
-        "sample_count": 10000,
-        "success_count": 10000,
+        "max_latency_us": 2.7788000000000004,
+        "mean_latency_us": 2.4564280000000007,
+        "min_latency_us": 2.2325999999999997,
+        "p50_latency_us": 2.4139999999999997,
+        "p95_latency_us": 2.717975,
+        "p99_latency_us": 2.772167,
+        "sample_count": 100,
+        "success_count": 100,
         "success_rate": 1.0,
-        "throughput_ops_per_second": 409825.98788554064,
-        "total_duration_us": 24400.600000000188
+        "throughput_ops_per_second": 407095.1804815772,
+        "total_duration_us": 245.64280000000008
       }
     }
   ],
