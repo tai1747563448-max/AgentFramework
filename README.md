@@ -345,7 +345,9 @@ time, per-operation mean/P50/P95/P99/max latency, throughput, and success rate.
 The benchmark target refreshes source commit and benchmark-source dirty state at
 build time. A baseline is accepted only when its schema, workload parameters,
 method, platform/compiler/build configuration, scenario set, and metric
-relationships are compatible; the comparison report records the baseline path
+relationships are compatible, including summary counts that match the declared
+workload. Baseline and output must be distinct filesystem targets so comparison
+cannot overwrite its evidence; the comparison report records the baseline path
 and SHA-256. Comparison fails when P95 latency or throughput regresses beyond
 the chosen percentage, or when success rate is below 100%. The checked-in
 Windows run uses a 15% policy after repeated local noise calibration; another

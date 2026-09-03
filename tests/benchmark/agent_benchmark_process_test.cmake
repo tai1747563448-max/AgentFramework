@@ -175,6 +175,58 @@ if(NOT wrong_batch_result EQUAL 2)
         "incompatible batch returned ${wrong_batch_result}, expected 2")
 endif()
 
+set(wrong_sample_count_json "${baseline_json}")
+string(JSON wrong_sample_count_json SET "${wrong_sample_count_json}"
+    scenarios 0 summary sample_count 4)
+file(WRITE "${TEST_ROOT}/wrong-sample-count.json"
+    "${wrong_sample_count_json}\n")
+execute_process(
+    COMMAND "${AGENT_BENCHMARK_EXE}"
+        --warmup 1 --iterations 5
+        --baseline "${TEST_ROOT}/wrong-sample-count.json"
+        --max-regression-percent 1000000
+        --output "${TEST_ROOT}/wrong-sample-count-current.json"
+    RESULT_VARIABLE wrong_sample_count_result)
+if(NOT wrong_sample_count_result EQUAL 2)
+    message(FATAL_ERROR
+        "baseline sample count mismatch returned ${wrong_sample_count_result}, expected 2")
+endif()
+
+set(wrong_operation_count_json "${baseline_json}")
+string(JSON wrong_operation_count_json SET "${wrong_operation_count_json}"
+    scenarios 0 summary operation_count 4000)
+string(JSON wrong_operation_count_json SET "${wrong_operation_count_json}"
+    scenarios 0 summary success_count 4000)
+string(JSON wrong_operation_count_json SET "${wrong_operation_count_json}"
+    scenarios 0 summary total_duration_us 4000.0)
+string(JSON wrong_operation_count_json SET "${wrong_operation_count_json}"
+    scenarios 0 summary min_latency_us 0.5)
+string(JSON wrong_operation_count_json SET "${wrong_operation_count_json}"
+    scenarios 0 summary mean_latency_us 1.0)
+string(JSON wrong_operation_count_json SET "${wrong_operation_count_json}"
+    scenarios 0 summary p50_latency_us 0.8)
+string(JSON wrong_operation_count_json SET "${wrong_operation_count_json}"
+    scenarios 0 summary p95_latency_us 1.2)
+string(JSON wrong_operation_count_json SET "${wrong_operation_count_json}"
+    scenarios 0 summary p99_latency_us 1.4)
+string(JSON wrong_operation_count_json SET "${wrong_operation_count_json}"
+    scenarios 0 summary max_latency_us 1.5)
+string(JSON wrong_operation_count_json SET "${wrong_operation_count_json}"
+    scenarios 0 summary throughput_ops_per_second 1000000.0)
+file(WRITE "${TEST_ROOT}/wrong-operation-count.json"
+    "${wrong_operation_count_json}\n")
+execute_process(
+    COMMAND "${AGENT_BENCHMARK_EXE}"
+        --warmup 1 --iterations 5
+        --baseline "${TEST_ROOT}/wrong-operation-count.json"
+        --max-regression-percent 1000000
+        --output "${TEST_ROOT}/wrong-operation-count-current.json"
+    RESULT_VARIABLE wrong_operation_count_result)
+if(NOT wrong_operation_count_result EQUAL 2)
+    message(FATAL_ERROR
+        "baseline operation count mismatch returned ${wrong_operation_count_result}, expected 2")
+endif()
+
 string(JSON missing_scenario_json REMOVE "${baseline_json}" scenarios 2)
 file(WRITE "${TEST_ROOT}/missing-scenario.json" "${missing_scenario_json}\n")
 execute_process(
@@ -294,4 +346,40 @@ execute_process(
 if(NOT overflow_result EQUAL 2)
     message(FATAL_ERROR
         "iteration multiplication overflow returned ${overflow_result}, expected 2")
+endif()
+
+set(ALIAS_BASELINE "${TEST_ROOT}/alias-baseline.json")
+set(ALIAS_DIRECTORY "${TEST_ROOT}/alias")
+file(MAKE_DIRECTORY "${ALIAS_DIRECTORY}")
+configure_file("${BASELINE}" "${ALIAS_BASELINE}" COPYONLY)
+file(SHA256 "${ALIAS_BASELINE}" alias_sha256_before)
+execute_process(
+    COMMAND "${AGENT_BENCHMARK_EXE}"
+        --warmup 1 --iterations 5
+        --baseline "${ALIAS_BASELINE}"
+        --max-regression-percent 1000000
+        --output "${ALIAS_DIRECTORY}/../alias-baseline.json"
+    RESULT_VARIABLE alias_path_result)
+file(SHA256 "${ALIAS_BASELINE}" alias_sha256_after)
+if(NOT alias_path_result EQUAL 2 OR
+   NOT alias_sha256_before STREQUAL alias_sha256_after)
+    message(FATAL_ERROR
+        "equivalent baseline/output paths were not rejected without modification")
+endif()
+
+set(SAME_PATH "${TEST_ROOT}/same-path.json")
+configure_file("${BASELINE}" "${SAME_PATH}" COPYONLY)
+file(SHA256 "${SAME_PATH}" same_path_sha256_before)
+execute_process(
+    COMMAND "${AGENT_BENCHMARK_EXE}"
+        --warmup 1 --iterations 5
+        --baseline "${SAME_PATH}"
+        --max-regression-percent 1000000
+        --output "${SAME_PATH}"
+    RESULT_VARIABLE same_path_result)
+file(SHA256 "${SAME_PATH}" same_path_sha256_after)
+if(NOT same_path_result EQUAL 2 OR
+   NOT same_path_sha256_before STREQUAL same_path_sha256_after)
+    message(FATAL_ERROR
+        "identical baseline/output path was not rejected without modification")
 endif()

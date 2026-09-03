@@ -502,6 +502,48 @@ std::optional<LoadedReport> read_report(const std::filesystem::path& path) {
         std::move(parsed), agent::workspace::sha256_hex(bytes)};
 }
 
+std::optional<bool> paths_refer_to_same_file(
+    const std::filesystem::path& left,
+    const std::filesystem::path& right) {
+    std::error_code error;
+    const auto left_absolute = std::filesystem::absolute(left, error);
+    if (error) {
+        return std::nullopt;
+    }
+    const auto left_canonical =
+        std::filesystem::weakly_canonical(left_absolute, error);
+    if (error) {
+        return std::nullopt;
+    }
+    const auto right_absolute = std::filesystem::absolute(right, error);
+    if (error) {
+        return std::nullopt;
+    }
+    const auto right_canonical =
+        std::filesystem::weakly_canonical(right_absolute, error);
+    if (error) {
+        return std::nullopt;
+    }
+    if (left_canonical == right_canonical) {
+        return true;
+    }
+
+    const bool left_exists = std::filesystem::exists(left_canonical, error);
+    if (error) {
+        return std::nullopt;
+    }
+    const bool right_exists = std::filesystem::exists(right_canonical, error);
+    if (error) {
+        return std::nullopt;
+    }
+    if (!left_exists || !right_exists) {
+        return false;
+    }
+    const bool equivalent =
+        std::filesystem::equivalent(left_canonical, right_canonical, error);
+    return error ? std::nullopt : std::optional<bool>(equivalent);
+}
+
 std::optional<std::map<std::string, agent::BenchmarkSummary>>
 validate_baseline_report(
     const Json& report,
@@ -571,7 +613,9 @@ validate_baseline_report(
                 return std::nullopt;
             }
             const auto summary = summary_from_json(scenario.at("summary"));
-            if (!summary.has_value()) {
+            if (!summary.has_value() ||
+                summary->sample_count != *iterations ||
+                summary->operation_count != *total_operations) {
                 return std::nullopt;
             }
             const auto inserted = summaries.emplace(
@@ -645,6 +689,14 @@ int main(int argc, char* argv[]) {
     if (!options.has_value()) {
         std::cerr << "invalid benchmark arguments\n";
         return kInvalidInput;
+    }
+    if (options->baseline.has_value()) {
+        const auto same_path =
+            paths_refer_to_same_file(*options->baseline, options->output);
+        if (!same_path.has_value() || *same_path) {
+            std::cerr << "benchmark baseline and output must differ\n";
+            return kInvalidInput;
+        }
     }
 
     const auto fixture_events = completed_events();

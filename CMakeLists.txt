@@ -192,7 +192,7 @@ add_test(
 add_test(
     NAME agent_benchmark_process
     COMMAND ${CMAKE_COMMAND}
-        "-DAGENT_BENCHMARK_EXE=${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/agent_benchmark${CMAKE_EXECUTABLE_SUFFIX}"
+        "-DAGENT_BENCHMARK_EXE=$<TARGET_FILE:agent_benchmark>"
         "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/agent-benchmark-process"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark/agent_benchmark_process_test.cmake")
 add_test(

@@ -31,10 +31,13 @@ rate. Percentiles use linear interpolation over sorted batch-average samples.
 When `--baseline` is supplied, it must have the supported schema and the same
 warm-up, iteration, batch-size, clock, scripted/network method, operating
 system, compiler, build configuration, and exact unique scenario set. Its
-summary fields must also be internally consistent. An incompatible baseline is
-rejected with exit code `2`. The comparison report records the baseline path
-and SHA-256 so the comparison input can be audited. After validation, scenarios
-are matched by exact name and comparison passes only when:
+summary fields must also be internally consistent and their sample/operation
+counts must match the declared workload. The baseline and output must be
+distinct files, including through equivalent filesystem paths, so a comparison
+cannot overwrite its evidence. An incompatible baseline is rejected with exit
+code `2`. The comparison report records the baseline path and SHA-256 so the
+comparison input can be audited. After validation, scenarios are matched by
+exact name and comparison passes only when:
 
 - current P95 latency does not exceed the baseline by more than
   `--max-regression-percent`;
