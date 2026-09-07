@@ -19,6 +19,10 @@ set(CPR_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(CPR_BUILD_TESTS_SSL OFF CACHE BOOL "" FORCE)
 set(CPR_CURL_USE_LIBPSL OFF CACHE BOOL "" FORCE)
 set(CPR_USE_SYSTEM_CURL OFF CACHE BOOL "" FORCE)
+set(REPROC++ ON CACHE BOOL "" FORCE)
+set(REPROC_TEST OFF CACHE BOOL "" FORCE)
+set(REPROC_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     cpr
     GIT_REPOSITORY https://github.com/libcpr/cpr.git
@@ -29,7 +33,11 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/laserpants/dotenv-cpp.git
     GIT_TAG 9275210b8abf1a551fb81e0ba45866286d764acd
     SOURCE_SUBDIR _header_only)
-FetchContent_MakeAvailable(nlohmann_json cpr dotenv_source)
+FetchContent_Declare(
+    reproc
+    GIT_REPOSITORY https://github.com/DaanDeMeyer/reproc.git
+    GIT_TAG 06034a7fca1ec46eddb4997f7764db89380c5216)
+FetchContent_MakeAvailable(nlohmann_json cpr dotenv_source reproc)
 
 add_library(dotenv_header_only INTERFACE)
 target_include_directories(dotenv_header_only INTERFACE
@@ -62,6 +70,7 @@ add_library(agent_runtime STATIC
     src/adapters/workspace/workspace_file_ops.cpp
     src/adapters/workspace/workspace_tool_gateway.cpp
     src/adapters/process/direct_process_runner.cpp
+    src/adapters/process/reproc_jsonl_process.cpp
     src/adapters/rag/python_rag_knowledge_provider.cpp
     src/adapters/build/cmake_tool_gateway.cpp
     src/adapters/tools/composite_tool_gateway.cpp
@@ -73,7 +82,7 @@ add_library(agent_runtime STATIC
 target_include_directories(agent_runtime PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(agent_runtime
     PUBLIC agent_kernel Threads::Threads
-    PRIVATE dotenv_header_only)
+    PRIVATE dotenv_header_only reproc++)
 if(MSVC)
     target_compile_options(agent_runtime PRIVATE /W4 /permissive- /utf-8)
     target_compile_definitions(agent_runtime PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -169,6 +178,13 @@ add_dependencies(direct_process_runner_tests process_fixture)
 target_compile_definitions(direct_process_runner_tests PRIVATE
     AGENT_PROCESS_FIXTURE_PATH="$<TARGET_FILE:process_fixture>"
     _CRT_SECURE_NO_WARNINGS)
+add_agent_test(reproc_jsonl_process_tests
+    tests/adapters/reproc_jsonl_process_test.cpp)
+target_link_libraries(reproc_jsonl_process_tests PRIVATE
+    agent_runtime reproc++ Threads::Threads)
+target_compile_definitions(reproc_jsonl_process_tests PRIVATE
+    AGENT_JSONL_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
+    AGENT_JSONL_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/rag/tests/jsonl_sidecar_fixture.py")
 add_agent_test(composite_tool_gateway_tests tests/adapters/composite_tool_gateway_test.cpp)
 target_link_libraries(composite_tool_gateway_tests PRIVATE agent_runtime)
 add_agent_test(cmake_tool_gateway_tests tests/adapters/cmake_tool_gateway_test.cpp)
