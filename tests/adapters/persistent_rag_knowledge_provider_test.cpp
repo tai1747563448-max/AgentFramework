@@ -147,6 +147,10 @@ TEST_CASE(persistent_rag_provider_starts_lazily_and_reuses_one_process) {
     REQUIRE(process.start_count == 1);
     REQUIRE(process.exchange_count == 2);
     REQUIRE(process.starts.front().startup_timeout_ms == 120'000);
+    REQUIRE(process.starts.front().arguments.size() >= 2);
+    REQUIRE(process.starts.front().arguments[process.starts.front().arguments.size() - 2] ==
+            "--device");
+    REQUIRE(process.starts.front().arguments.back() == "cpu");
     REQUIRE(process.timeouts == std::vector<std::int64_t>({30'000, 30'000}));
     const auto first_request = nlohmann::json::parse(process.exchanges[0]);
     const auto second_request = nlohmann::json::parse(process.exchanges[1]);

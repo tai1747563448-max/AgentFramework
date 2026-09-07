@@ -4,7 +4,8 @@
 #include "adapters/empty/empty_knowledge_provider.h"
 #include "adapters/persistence/jsonl_event_store.h"
 #include "adapters/process/direct_process_runner.h"
-#include "adapters/rag/python_rag_knowledge_provider.h"
+#include "adapters/process/reproc_jsonl_process.h"
+#include "adapters/rag/persistent_rag_knowledge_provider.h"
 #include "adapters/system/random_id_generator.h"
 #include "adapters/system/signal_cancellation.h"
 #include "adapters/system/system_clock.h"
@@ -90,7 +91,9 @@ int run_agent(std::vector<std::string> args) {
         }
 
         agent::ProcessEnvironment environment;
-        auto config = agent::load_runtime_config(environment);
+        auto config = agent::load_runtime_config(
+            environment,
+            std::filesystem::u8path(startup.value().command_args.front()));
         if (!config.has_value()) {
             std::cerr << config.error().message << '\n';
             return agent::ExitCode::InvalidInputOrConfig;
@@ -109,9 +112,12 @@ int run_agent(std::vector<std::string> args) {
         }
         agent::CompositeToolGateway tools(std::move(gateways));
         std::unique_ptr<agent::KnowledgeProvider> knowledge;
+        std::unique_ptr<agent::JsonlProcess> rag_process;
         if (config.value().rag_enabled) {
-            knowledge = std::make_unique<agent::PythonRagKnowledgeProvider>(
-                process, config.value().rag);
+            rag_process = std::make_unique<agent::ReprocJsonlProcess>();
+            knowledge =
+                std::make_unique<agent::PersistentRagKnowledgeProvider>(
+                    *rag_process, config.value().rag);
         } else {
             knowledge = std::make_unique<agent::EmptyKnowledgeProvider>();
         }

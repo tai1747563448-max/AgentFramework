@@ -32,10 +32,10 @@ class LoadedRuntime:
     ready_payload: dict[str, object]
 
 
-def _load_runtime(pack_root: Path) -> LoadedRuntime:
+def _load_runtime(pack_root: Path, device: str = "auto") -> LoadedRuntime:
     manifest = verify_complete_pack(pack_root)
     model_root = pack_root / "model" / "bge-m3"
-    selected = select_embedding_device("auto")
+    selected = select_embedding_device(device)
     try:
         embedding = BgeM3Embedding(model_root, device=selected)
         encode_normalized(embedding, ["sidecar startup self test"], dimensions=1024)
@@ -186,7 +186,8 @@ def run_sidecar(
     stdout: BinaryIO | TextIO,
     stderr: TextIO,
     *,
-    runtime_factory: Callable[[Path], LoadedRuntime] = _load_runtime,
+    device: str = "auto",
+    runtime_factory: Callable[[Path], LoadedRuntime] | None = None,
 ) -> int:
     root = Path(pack_root)
     if not root.is_absolute():
@@ -194,7 +195,13 @@ def run_sidecar(
         stderr.flush()
         return 2
     try:
-        runtime = runtime_factory(root)
+        if device not in {"auto", "cuda", "cpu"}:
+            raise ValueError("invalid device")
+        runtime = (
+            runtime_factory(root)
+            if runtime_factory is not None
+            else _load_runtime(root, device=device)
+        )
         _write(stdout, _response(SERVER_REQUEST_ID, "ready", runtime.ready_payload))
     except Exception:
         stderr.write("rag sidecar initialization failed\n")

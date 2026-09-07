@@ -154,12 +154,18 @@ def _verify_model(arguments: list[str]) -> int:
 
 
 def _serve(arguments: list[str]) -> int:
-    if len(arguments) != 3 or arguments[1] != "--pack-root":
+    if (
+        len(arguments) not in {3, 5}
+        or arguments[1] != "--pack-root"
+        or (len(arguments) == 5 and arguments[3] != "--device")
+    ):
         raise ValueError("invalid serve arguments")
     from .sidecar import run_sidecar
 
+    device = arguments[4] if len(arguments) == 5 else "auto"
     return run_sidecar(
-        Path(arguments[2]), sys.stdin.buffer, sys.stdout.buffer, sys.stderr
+        Path(arguments[2]), sys.stdin.buffer, sys.stdout.buffer, sys.stderr,
+        device=device,
     )
 
 

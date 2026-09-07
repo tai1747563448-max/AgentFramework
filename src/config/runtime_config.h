@@ -1,7 +1,7 @@
 #pragma once
 
 #include "adapters/anthropic/anthropic_messages_client.h"
-#include "adapters/rag/python_rag_knowledge_provider.h"
+#include "adapters/rag/persistent_rag_knowledge_provider.h"
 #include "domain/result.h"
 #include "domain/task_state.h"
 
@@ -29,11 +29,15 @@ struct RuntimeConfig {
     bool build_tools_enabled{false};
     std::int64_t build_timeout_ms{300'000};
     bool rag_enabled{false};
-    PythonRagConfig rag;
+    RagConfig rag;
     std::string system_prompt;
 };
 
-Result<RuntimeConfig> load_runtime_config(const Environment& environment);
+Result<RuntimeConfig> load_runtime_config(
+    const Environment& environment,
+    const std::filesystem::path& executable_path = {});
 Result<void> load_explicit_env_file(const std::filesystem::path& path);
+Result<std::optional<std::filesystem::path>> discover_rag_pack_root(
+    const std::filesystem::path& executable_path);
 
 }  // namespace agent

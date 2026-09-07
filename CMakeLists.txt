@@ -94,9 +94,11 @@ add_executable(agent src/main.cpp)
 target_link_libraries(agent PRIVATE agent_runtime)
 if(WIN32)
     add_custom_command(TARGET agent POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_RUNTIME_DLLS:agent> $<TARGET_FILE_DIR:agent>
-        COMMAND_EXPAND_LISTS)
+        COMMAND ${CMAKE_COMMAND}
+            "-DDLLS=$<JOIN:$<TARGET_RUNTIME_DLLS:agent>,|>"
+            "-DTARGET_DIR=$<TARGET_FILE_DIR:agent>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_runtime_dlls.cmake"
+        VERBATIM)
 endif()
 if(MSVC)
     target_compile_options(agent PRIVATE /W4 /permissive- /utf-8)
@@ -162,6 +164,8 @@ add_agent_test(python_rag_adapter_tests
 target_link_libraries(python_rag_adapter_tests PRIVATE agent_runtime)
 add_agent_test(cli_tests tests/cli/cli_app_test.cpp)
 target_link_libraries(cli_tests PRIVATE agent_runtime)
+add_agent_test(rag_runtime_config_tests tests/config/rag_runtime_config_test.cpp)
+target_link_libraries(rag_runtime_config_tests PRIVATE agent_runtime)
 add_agent_test(runtime_integration_tests tests/integration/runtime_integration_test.cpp)
 target_link_libraries(runtime_integration_tests PRIVATE agent_runtime)
 add_agent_test(workspace_primitives_tests tests/adapters/workspace_primitives_test.cpp)

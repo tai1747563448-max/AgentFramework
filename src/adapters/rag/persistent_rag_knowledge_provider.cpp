@@ -103,7 +103,8 @@ Result<void> PersistentRagKnowledgeProvider::ensure_ready() {
     request.program = python.generic_u8string();
     request.arguments = {"-E", "-s", "-X", "utf8", script.generic_u8string(),
                          "serve", "--pack-root",
-                         config_.pack_root.generic_u8string()};
+                         config_.pack_root.generic_u8string(), "--device",
+                         config_.device};
     request.working_directory = script.parent_path();
     request.startup_timeout_ms = config_.startup_timeout_ms;
     request.max_stdout_line_bytes = 65'536;
