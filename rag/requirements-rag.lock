@@ -1,0 +1,5 @@
+--extra-index-url https://download.pytorch.org/whl/cu130
+defusedxml==0.7.1
+numpy==2.4.6
+sentence-transformers==6.0.1
+torch==2.11.0+cu130

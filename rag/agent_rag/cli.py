@@ -5,8 +5,12 @@ import json
 from pathlib import Path
 import sys
 
+import numpy as np
+
+from .embedding import BgeM3Embedding, EmbeddingError, encode_normalized
 from .ecfr_document import build_corpus_from_downloads
 from .ecfr_source import DownloadConfig, download_ecfr_snapshot
+from .hybrid_index import build_hybrid_index
 from .indexer import build_index
 from .protocol import parse_query_request, response_json
 from .retriever import query_index
@@ -83,6 +87,92 @@ def _build_corpus(arguments: list[str]) -> int:
     return 0
 
 
+def select_embedding_device(requested: str, *, torch_module: object | None = None) -> str:
+    if requested not in {"auto", "cpu", "cuda"}:
+        raise EmbeddingError("embedding device is invalid")
+    if requested == "cpu":
+        return "cpu"
+    try:
+        if torch_module is None:
+            import torch as loaded_torch
+
+            torch_module = loaded_torch
+        cuda = getattr(torch_module, "cuda")
+        if not cuda.is_available():
+            if requested == "cuda":
+                raise EmbeddingError("CUDA is unavailable")
+            return "cpu"
+        getattr(torch_module, "empty")((1,), device="cuda")
+        return "cuda"
+    except EmbeddingError:
+        raise
+    except Exception as error:
+        if requested == "cuda":
+            raise EmbeddingError("CUDA self-test failed") from error
+        return "cpu"
+
+
+def _load_tested_embedding(
+    model_root: Path, requested_device: str
+) -> tuple[BgeM3Embedding, str]:
+    selected = select_embedding_device(requested_device)
+    try:
+        embedding = BgeM3Embedding(model_root, device=selected)
+        encode_normalized(embedding, ["embedding device self test"], dimensions=1024)
+        return embedding, selected
+    except EmbeddingError:
+        if requested_device != "auto" or selected != "cuda":
+            raise
+        embedding = BgeM3Embedding(model_root, device="cpu")
+        encode_normalized(embedding, ["embedding device self test"], dimensions=1024)
+        return embedding, "cpu"
+
+
+def _build_hybrid(arguments: list[str]) -> int:
+    if (
+        len(arguments) != 7
+        or arguments[1] != "--pack-root"
+        or arguments[3] != "--device"
+        or arguments[5] != "--batch-size"
+    ):
+        raise ValueError("invalid build-index arguments")
+    root = Path(arguments[2])
+    batch_size = int(arguments[6])
+    embedding, device = _load_tested_embedding(root / "model" / "bge-m3", arguments[4])
+    summary = build_hybrid_index(
+        root, embedding, device=device, batch_size=batch_size
+    )
+    result = asdict(summary)
+    result.update(
+        {
+            "database": "index/metadata.sqlite3",
+            "vectors": "index/vectors.f16",
+            "vector_metadata": "index/vectors.json",
+            "device": device,
+        }
+    )
+    sys.stdout.write(json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n")
+    return 0
+
+
+def _verify_model(arguments: list[str]) -> int:
+    if len(arguments) != 3 or arguments[1] != "--model-root":
+        raise ValueError("invalid verify-model arguments")
+    embedding, device = _load_tested_embedding(Path(arguments[2]), "auto")
+    values = encode_normalized(embedding, ["model verification probe"], dimensions=1024)
+    result = {
+        "schema_version": 2,
+        "model": embedding.model,
+        "revision": embedding.revision,
+        "dimensions": embedding.dimensions,
+        "device": device,
+        "finite": bool(np.isfinite(values).all()),
+        "unit_norm": bool(np.allclose(np.linalg.norm(values, axis=1), [1.0], atol=1e-4)),
+    }
+    sys.stdout.write(json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n")
+    return 0
+
+
 def main(arguments: list[str] | None = None) -> int:
     values = list(sys.argv[1:] if arguments is None else arguments)
     command = values[0] if values else ""
@@ -95,6 +185,10 @@ def main(arguments: list[str] | None = None) -> int:
             return _download_ecfr(values)
         if command == "build-corpus":
             return _build_corpus(values)
+        if command == "build-index":
+            return _build_hybrid(values)
+        if command == "verify-model":
+            return _verify_model(values)
         raise ValueError("unknown command")
     except Exception:
         if command == "build":
@@ -105,6 +199,10 @@ def main(arguments: list[str] | None = None) -> int:
             sys.stderr.write("eCFR download failed\n")
         elif command == "build-corpus":
             sys.stderr.write("eCFR corpus build failed\n")
+        elif command == "build-index":
+            sys.stderr.write("hybrid index build failed\n")
+        elif command == "verify-model":
+            sys.stderr.write("embedding model verification failed\n")
         else:
             sys.stderr.write("rag command failed\n")
         return 2

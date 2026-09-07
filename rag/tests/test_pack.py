@@ -89,6 +89,7 @@ def _minimal_pack(
         "dimensions": 1024,
         "model": BGE_M3_MODEL,
         "revision": BGE_M3_REVISION,
+        "tokenizer_sha256": "e" * 64,
         "matrix_sha256": _sha256(root / "index" / "vectors.f16"),
         "database_sha256": _sha256(root / "index" / "metadata.sqlite3"),
     }
@@ -213,4 +214,29 @@ def test_verify_pack_rejects_manifest_markdown_digest_mismatch(tmp_path: Path) -
     )
 
     with pytest.raises(PackError, match="document markdown digest is invalid"):
+        verify_complete_pack(root)
+
+
+def test_verify_pack_rejects_invalid_tokenizer_fingerprint(tmp_path: Path) -> None:
+    root = _minimal_pack(tmp_path / "pack")
+    vectors_path = root / "index" / "vectors.json"
+    vectors = json.loads(vectors_path.read_text("utf-8"))
+    vectors["tokenizer_sha256"] = "not-a-digest"
+    vectors_path.write_text(
+        json.dumps(vectors, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+        newline="",
+    )
+    manifest = json.loads((root / "pack.json").read_text("utf-8"))
+    for record in manifest["files"]:
+        if record["path"] == "index/vectors.json":
+            record["bytes"] = vectors_path.stat().st_size
+            record["sha256"] = _sha256(vectors_path)
+    (root / "pack.json").write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+        newline="",
+    )
+
+    with pytest.raises(PackError, match="vector metadata is invalid"):
         verify_complete_pack(root)

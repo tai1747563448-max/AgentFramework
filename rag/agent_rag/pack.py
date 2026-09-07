@@ -38,6 +38,7 @@ _VECTOR_KEYS = {
     "dimensions",
     "model",
     "revision",
+    "tokenizer_sha256",
     "matrix_sha256",
     "database_sha256",
 }
@@ -458,6 +459,11 @@ def _verify_vectors(root: Path, manifest: PackManifest) -> None:
         or value["revision"] != manifest.embedding_revision
     ):
         raise PackError("pack counts are inconsistent")
+    if (
+        type(value["tokenizer_sha256"]) is not str
+        or _SHA256.fullmatch(value["tokenizer_sha256"]) is None
+    ):
+        raise PackError("vector metadata is invalid")
     vectors = root / "index" / "vectors.f16"
     database = root / "index" / "metadata.sqlite3"
     try:
