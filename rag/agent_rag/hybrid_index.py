@@ -298,8 +298,8 @@ def _write_database(
                     chunk.sha256,
                     chunk.snapshot_date,
                     chunk.official_url,
-                    chunk.previous_id,
-                    chunk.next_id,
+                    None,
+                    None,
                     vector_row,
                 ),
             )
@@ -308,6 +308,13 @@ def _write_database(
                 "INSERT INTO postings VALUES(?, ?, ?)",
                 ((term, chunk.chunk_id, count) for term, count in sorted(counts.items())),
             )
+        connection.executemany(
+            "UPDATE chunks SET previous_id = ?, next_id = ? WHERE chunk_id = ?",
+            (
+                (chunk.previous_id, chunk.next_id, chunk.chunk_id)
+                for chunk in chunks
+            ),
+        )
         connection.commit()
         if connection.execute("PRAGMA foreign_key_check").fetchall():
             raise HybridIndexError("built database has broken references")
