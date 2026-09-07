@@ -43,13 +43,33 @@ def _minimal_pack(
     complete: bool = True,
 ) -> Path:
     root.mkdir(parents=True)
+    document_path = "corpus/title-001/part-1/section-1.1--0123456789ab.md"
+    markdown = b"---\ncitation: 1 CFR 1.1\n---\n\n# 1 CFR 1.1\n\nbody\n"
+    _write(root / document_path, markdown)
     document = {
         "schema_version": 2,
         "document_id": "doc-0123456789abcdef0123456789abcdef",
         "citation": "1 CFR 1.1",
-        "path": "corpus/title-001/part-1/section-1.1--0123456789ab.md",
+        "title_number": 1,
+        "title_name": "General Provisions",
+        "chapter": "I",
+        "chapter_name": "Administrative Committee",
+        "subchapter": "A",
+        "subchapter_name": "General",
+        "part": "1",
+        "part_name": "Definitions",
+        "section": "1.1",
+        "section_title": "Definitions",
+        "snapshot_date": "2026-09-03",
+        "source_xml_url": "https://www.ecfr.gov/api/versioner/v1/full/2026-09-03/title-1.xml",
+        "official_url": "https://www.ecfr.gov/on/2026-09-03/title-1/section-1.1",
+        "source_xml_sha256": "c" * 64,
+        "path": document_path,
         "body_sha256": "a" * 64,
-        "markdown_sha256": "b" * 64,
+        "markdown_sha256": hashlib.sha256(markdown).hexdigest(),
+        "body_bytes": 4,
+        "retrieved_utc": "2026-09-07T00:00:00Z",
+        "legal_status": "Official eCFR snapshot; informational retrieval only; not legal advice.",
     }
     documents = b"".join(
         (
@@ -174,4 +194,23 @@ def test_verify_pack_rejects_unlisted_and_linked_files(tmp_path: Path) -> None:
     except OSError as error:
         pytest.skip(f"hard links unavailable: {error}")
     with pytest.raises(PackError, match="pack inventory is invalid"):
+        verify_complete_pack(root)
+
+
+def test_verify_pack_rejects_manifest_markdown_digest_mismatch(tmp_path: Path) -> None:
+    root = _minimal_pack(tmp_path / "pack")
+    document_path = root / "corpus" / "title-001" / "part-1" / "section-1.1--0123456789ab.md"
+    document_path.write_text("changed but pack digest will be refreshed", encoding="utf-8")
+    manifest = json.loads((root / "pack.json").read_text("utf-8"))
+    for record in manifest["files"]:
+        if record["path"].endswith(".md"):
+            record["bytes"] = document_path.stat().st_size
+            record["sha256"] = _sha256(document_path)
+    (root / "pack.json").write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+        newline="",
+    )
+
+    with pytest.raises(PackError, match="document markdown digest is invalid"):
         verify_complete_pack(root)

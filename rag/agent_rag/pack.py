@@ -52,9 +52,26 @@ _DOCUMENT_KEYS = {
     "schema_version",
     "document_id",
     "citation",
+    "title_number",
+    "title_name",
+    "chapter",
+    "chapter_name",
+    "subchapter",
+    "subchapter_name",
+    "part",
+    "part_name",
+    "section",
+    "section_title",
+    "snapshot_date",
+    "source_xml_url",
+    "official_url",
+    "source_xml_sha256",
     "path",
     "body_sha256",
     "markdown_sha256",
+    "body_bytes",
+    "retrieved_utc",
+    "legal_status",
 }
 _REQUIRED_FILES = {
     "manifest/documents.jsonl",
@@ -328,7 +345,16 @@ def _verify_file_records(root: Path, records: tuple[FileDigest, ...]) -> None:
             raise PackError("pack file digest is invalid")
 
 
-def _count_documents(path: Path) -> int:
+def _canonical_date(value: Any) -> bool:
+    if type(value) is not str:
+        return False
+    try:
+        return _datetime.date.fromisoformat(value).isoformat() == value
+    except ValueError:
+        return False
+
+
+def _count_documents(path: Path, root: Path) -> int:
     data = _read_trusted(path, maximum=512 * 1024 * 1024, label="document manifest")
     count = 0
     seen: set[str] = set()
@@ -347,13 +373,49 @@ def _count_documents(path: Path) -> int:
             or document_id in seen
             or type(value["citation"]) is not str
             or not value["citation"]
+            or type(value["title_number"]) is not int
+            or not 1 <= value["title_number"] <= 50
+            or any(
+                type(value[name]) is not str
+                for name in (
+                    "title_name",
+                    "chapter",
+                    "chapter_name",
+                    "subchapter",
+                    "subchapter_name",
+                    "part",
+                    "part_name",
+                    "section",
+                    "section_title",
+                    "snapshot_date",
+                    "source_xml_url",
+                    "official_url",
+                    "source_xml_sha256",
+                    "retrieved_utc",
+                    "legal_status",
+                )
+            )
+            or not value["title_name"]
+            or not value["section"]
+            or not _canonical_date(value["snapshot_date"])
+            or not value["source_xml_url"].startswith("https://www.ecfr.gov/")
+            or not value["official_url"].startswith("https://www.ecfr.gov/")
+            or _SHA256.fullmatch(value["source_xml_sha256"]) is None
             or _relative_path(value["path"]) != value["path"]
             or type(value["body_sha256"]) is not str
             or _SHA256.fullmatch(value["body_sha256"]) is None
             or type(value["markdown_sha256"]) is not str
             or _SHA256.fullmatch(value["markdown_sha256"]) is None
+            or type(value["body_bytes"]) is not int
+            or value["body_bytes"] <= 0
+            or not value["retrieved_utc"].endswith("Z")
+            or not value["legal_status"]
         ):
             raise PackError("document manifest is invalid")
+        markdown_path = root.joinpath(*PurePosixPath(value["path"]).parts)
+        _require_regular_single_link(markdown_path)
+        if _sha256_file(markdown_path) != value["markdown_sha256"]:
+            raise PackError("document markdown digest is invalid")
         seen.add(document_id)
         count += 1
     return count
@@ -422,7 +484,12 @@ def verify_complete_pack(root: Path) -> PackManifest:
     if not manifest.complete:
         raise PackError("pack is incomplete")
     _verify_file_records(trusted_root, manifest.files)
-    if _count_documents(trusted_root / "manifest" / "documents.jsonl") != manifest.document_count:
+    if (
+        _count_documents(
+            trusted_root / "manifest" / "documents.jsonl", trusted_root
+        )
+        != manifest.document_count
+    ):
         raise PackError("pack counts are inconsistent")
     _verify_model_lock(trusted_root, manifest)
     _verify_vectors(trusted_root, manifest)
