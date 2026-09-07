@@ -53,8 +53,8 @@ class KeywordEmbedding:
             rows.append(
                 [
                     1.0 if "alpha" in lowered else 0.0,
-                    1.0 if "beta" in lowered else 0.0,
-                    1.0 if "gamma" in lowered else 0.0,
+                    1.0 if "beta" in lowered or "1 cfr" in lowered else 0.0,
+                    1.0 if "gamma" in lowered or "1 cfr" in lowered else 0.0,
                 ]
             )
         return np.asarray(rows, dtype=np.float32)
@@ -215,6 +215,33 @@ def test_hybrid_dense_and_lexical_fusion_is_repeatable(tmp_path: Path) -> None:
     assert backend.calls == 2
     assert first[0].lexical_rank is not None
     assert first[0].dense_rank is not None
+
+
+def test_dense_evaluation_mode_and_raw_max_score_are_available(tmp_path: Path) -> None:
+    root, backend, _ = _built(tmp_path)
+    retriever = HybridRetriever(root, embedding=backend)
+
+    items = retriever.query("beta", top_k=3, max_total_bytes=1024, mode="dense")
+
+    assert items[0].dense_rank == 1
+    assert items[0].lexical_rank is None
+    assert retriever.max_dense_score("beta") == pytest.approx(1.0)
+
+
+def test_dense_no_answer_gate_fails_closed_but_exact_citation_bypasses_it(
+    tmp_path: Path,
+) -> None:
+    root, backend, _ = _built(tmp_path)
+    retriever = HybridRetriever(root, embedding=backend, dense_min=0.9)
+
+    assert retriever.query(
+        "alpha gamma", top_k=3, max_total_bytes=1024, mode="hybrid"
+    ) == []
+    cited = retriever.query(
+        "1 CFR § 1.1", top_k=3, max_total_bytes=1024, mode="hybrid"
+    )
+    assert cited
+    assert cited[0].citation == "1 CFR 1.1"
 
 
 @pytest.mark.parametrize(

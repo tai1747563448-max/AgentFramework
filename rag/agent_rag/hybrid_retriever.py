@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import sqlite3
 from typing import Iterable, Sequence
 
@@ -17,6 +18,13 @@ from .retriever import tokenize
 
 class HybridRetrievalError(RuntimeError):
     pass
+
+
+_CFR_CITATION = re.compile(
+    r"\s*(\d{1,2})\s*CFR\s*(?:(?:SECTION|SEC\.?|§)\s*)?"
+    r"([0-9]+(?:\.[0-9A-Za-z_-]+)*)\s*\Z",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -339,7 +347,7 @@ class HybridRetriever:
             scores[str(chunk_id)] += inverse * frequency * (k1 + 1.0) / denominator
         return sorted(scores, key=lambda chunk_id: (-scores[chunk_id], chunk_id))[:100]
 
-    def _dense(self, query: str) -> list[str]:
+    def _dense_scored(self, query: str) -> list[tuple[float, str]]:
         if self._embedding is None:
             raise HybridRetrievalError("hybrid mode requires an embedding backend")
         try:
@@ -367,10 +375,43 @@ class HybridRetriever:
                 indices = np.argpartition(scores, -count)[-count:]
             for index in indices:
                 score = float(scores[index])
-                if score >= self._dense_min:
-                    candidates.append((score, self._row_ids[start + int(index)]))
+                candidates.append((score, self._row_ids[start + int(index)]))
         candidates.sort(key=lambda item: (-item[0], item[1]))
-        return [chunk_id for _, chunk_id in candidates[:100]]
+        return candidates[:100]
+
+    def _dense(self, query: str) -> list[str]:
+        return [
+            chunk_id
+            for score, chunk_id in self._dense_scored(query)
+            if score >= self._dense_min
+        ]
+
+    @staticmethod
+    def _normalized_citation(query: str) -> str | None:
+        matched = _CFR_CITATION.fullmatch(query)
+        if matched is None:
+            return None
+        return f"{int(matched.group(1))} cfr {matched.group(2).casefold()}"
+
+    @staticmethod
+    def _has_exact_citation(
+        connection: sqlite3.Connection, normalized: str | None
+    ) -> bool:
+        if normalized is None:
+            return False
+        rows = connection.execute("SELECT citation FROM documents").fetchall()
+        return any(str(row[0]).strip().casefold() == normalized for row in rows)
+
+    def max_dense_score(self, query: str) -> float:
+        if (
+            type(query) is not str
+            or not query
+            or "\x00" in query
+            or len(query.encode("utf-8")) > 16_384
+        ):
+            raise HybridRetrievalError("query parameters are invalid")
+        scored = self._dense_scored(query)
+        return scored[0][0] if scored else -1.0
 
     @staticmethod
     def _row_to_evidence(row: Sequence[object], hit: FusedHit) -> EvidenceItem:
@@ -445,13 +486,19 @@ class HybridRetriever:
             or not 1 <= top_k <= 20
             or type(max_total_bytes) is not int
             or not 1 <= max_total_bytes <= 32_768
-            or mode not in {"lexical", "hybrid"}
+            or mode not in {"lexical", "dense", "hybrid"}
         ):
             raise HybridRetrievalError("query parameters are invalid")
         connection = _readonly_connection(self._database)
         try:
-            lexical = self._lexical(connection, query)
-            dense = self._dense(query) if mode == "hybrid" else []
+            lexical = self._lexical(connection, query) if mode != "dense" else []
+            dense_scores = self._dense_scored(query) if mode != "lexical" else []
+            if dense_scores and dense_scores[0][0] < self._dense_min:
+                if not self._has_exact_citation(
+                    connection, self._normalized_citation(query)
+                ):
+                    return []
+            dense = [chunk_id for _, chunk_id in dense_scores]
             hits = reciprocal_rank_fusion(lexical, dense, constant=60)
             primary, neighbors = self._evidence(connection, hits)
             return select_evidence(

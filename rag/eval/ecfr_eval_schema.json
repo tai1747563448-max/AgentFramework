@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentframework.local/schema/ecfr-eval-v2.json",
+  "title": "AgentFramework eCFR retrieval evaluation case",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "case_id",
+    "split",
+    "language",
+    "query",
+    "relevant_document_ids",
+    "relevant_chunk_ids",
+    "kind",
+    "rationale"
+  ],
+  "properties": {
+    "case_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+    },
+    "split": {
+      "enum": ["development", "holdout"]
+    },
+    "language": {
+      "enum": ["en", "zh"]
+    },
+    "query": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16384
+    },
+    "relevant_document_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "maxItems": 100,
+      "items": {
+        "type": "string",
+        "pattern": "^doc-[0-9a-f]{32}$"
+      }
+    },
+    "relevant_chunk_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "maxItems": 100,
+      "items": {
+        "type": "string",
+        "pattern": "^doc-[0-9a-f]{32}-chunk-[0-9a-f]{16}$"
+      }
+    },
+    "kind": {
+      "enum": [
+        "citation",
+        "paraphrase_en",
+        "cross_language_zh",
+        "multi_concept",
+        "adjacent_context",
+        "no_answer",
+        "injection_damaged"
+      ]
+    },
+    "rationale": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    }
+  }
+}

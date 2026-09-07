@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -20,6 +21,7 @@ from .indexer import build_index
 from .pack import verify_complete_pack
 from .protocol import parse_query_request, response_json
 from .retriever import query_index
+from .evaluation import evaluate_pack, stable_report_json
 
 
 def _build(arguments: list[str]) -> int:
@@ -170,6 +172,46 @@ def _verify_pack(arguments: list[str]) -> int:
     return 0
 
 
+def _evaluate(arguments: list[str]) -> int:
+    if (
+        len(arguments) != 9
+        or arguments[1] != "--pack-root"
+        or arguments[3] != "--cases"
+        or arguments[5] != "--mode"
+        or arguments[7] != "--output"
+    ):
+        raise ValueError("invalid evaluate arguments")
+    pack_root = Path(arguments[2])
+    cases = Path(arguments[4])
+    mode = arguments[6]
+    output = Path(arguments[8])
+    if (
+        not pack_root.is_absolute()
+        or not cases.is_absolute()
+        or not output.is_absolute()
+        or mode not in {"lexical", "dense", "hybrid"}
+        or not output.parent.is_dir()
+        or output.is_symlink()
+    ):
+        raise ValueError("invalid evaluate arguments")
+    report = evaluate_pack(pack_root, cases, mode=mode)
+    temporary = output.with_name(output.name + f".partial-{os.getpid()}")
+    if temporary.exists() or temporary.is_symlink():
+        raise ValueError("invalid evaluate output")
+    try:
+        with temporary.open("x", encoding="utf-8", newline="") as stream:
+            stream.write(stable_report_json(report))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return 0
+
+
 def _serve(arguments: list[str]) -> int:
     if (
         len(arguments) not in {3, 5}
@@ -204,6 +246,8 @@ def main(arguments: list[str] | None = None) -> int:
             return _verify_model(values)
         if command == "verify-pack":
             return _verify_pack(values)
+        if command == "evaluate":
+            return _evaluate(values)
         if command == "serve":
             return _serve(values)
         raise ValueError("unknown command")
@@ -222,6 +266,8 @@ def main(arguments: list[str] | None = None) -> int:
             sys.stderr.write("embedding model verification failed\n")
         elif command == "verify-pack":
             sys.stderr.write("Knowledge Pack verification failed\n")
+        elif command == "evaluate":
+            sys.stderr.write("retrieval evaluation failed\n")
         elif command == "serve":
             sys.stderr.write("rag sidecar failed\n")
         else:
