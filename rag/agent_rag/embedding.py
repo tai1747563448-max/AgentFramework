@@ -29,6 +29,33 @@ class EmbeddingBackend(Protocol):
     ) -> np.ndarray: ...
 
 
+def select_embedding_device(
+    requested: str, *, torch_module: object | None = None
+) -> str:
+    if requested not in {"auto", "cpu", "cuda"}:
+        raise EmbeddingError("embedding device is invalid")
+    if requested == "cpu":
+        return "cpu"
+    try:
+        if torch_module is None:
+            import torch as loaded_torch
+
+            torch_module = loaded_torch
+        cuda = getattr(torch_module, "cuda")
+        if not cuda.is_available():
+            if requested == "cuda":
+                raise EmbeddingError("CUDA is unavailable")
+            return "cpu"
+        getattr(torch_module, "empty")((1,), device="cuda")
+        return "cuda"
+    except EmbeddingError:
+        raise
+    except Exception as error:
+        if requested == "cuda":
+            raise EmbeddingError("CUDA self-test failed") from error
+        return "cpu"
+
+
 def normalize_rows(values: np.ndarray) -> np.ndarray:
     try:
         matrix = np.asarray(values, dtype=np.float32)

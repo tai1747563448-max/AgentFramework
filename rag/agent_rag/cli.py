@@ -7,7 +7,12 @@ import sys
 
 import numpy as np
 
-from .embedding import BgeM3Embedding, EmbeddingError, encode_normalized
+from .embedding import (
+    BgeM3Embedding,
+    EmbeddingError,
+    encode_normalized,
+    select_embedding_device,
+)
 from .ecfr_document import build_corpus_from_downloads
 from .ecfr_source import DownloadConfig, download_ecfr_snapshot
 from .hybrid_index import build_hybrid_index
@@ -87,31 +92,6 @@ def _build_corpus(arguments: list[str]) -> int:
     return 0
 
 
-def select_embedding_device(requested: str, *, torch_module: object | None = None) -> str:
-    if requested not in {"auto", "cpu", "cuda"}:
-        raise EmbeddingError("embedding device is invalid")
-    if requested == "cpu":
-        return "cpu"
-    try:
-        if torch_module is None:
-            import torch as loaded_torch
-
-            torch_module = loaded_torch
-        cuda = getattr(torch_module, "cuda")
-        if not cuda.is_available():
-            if requested == "cuda":
-                raise EmbeddingError("CUDA is unavailable")
-            return "cpu"
-        getattr(torch_module, "empty")((1,), device="cuda")
-        return "cuda"
-    except EmbeddingError:
-        raise
-    except Exception as error:
-        if requested == "cuda":
-            raise EmbeddingError("CUDA self-test failed") from error
-        return "cpu"
-
-
 def _load_tested_embedding(
     model_root: Path, requested_device: str
 ) -> tuple[BgeM3Embedding, str]:
@@ -173,6 +153,16 @@ def _verify_model(arguments: list[str]) -> int:
     return 0
 
 
+def _serve(arguments: list[str]) -> int:
+    if len(arguments) != 3 or arguments[1] != "--pack-root":
+        raise ValueError("invalid serve arguments")
+    from .sidecar import run_sidecar
+
+    return run_sidecar(
+        Path(arguments[2]), sys.stdin.buffer, sys.stdout.buffer, sys.stderr
+    )
+
+
 def main(arguments: list[str] | None = None) -> int:
     values = list(sys.argv[1:] if arguments is None else arguments)
     command = values[0] if values else ""
@@ -189,6 +179,8 @@ def main(arguments: list[str] | None = None) -> int:
             return _build_hybrid(values)
         if command == "verify-model":
             return _verify_model(values)
+        if command == "serve":
+            return _serve(values)
         raise ValueError("unknown command")
     except Exception:
         if command == "build":
@@ -203,6 +195,8 @@ def main(arguments: list[str] | None = None) -> int:
             sys.stderr.write("hybrid index build failed\n")
         elif command == "verify-model":
             sys.stderr.write("embedding model verification failed\n")
+        elif command == "serve":
+            sys.stderr.write("rag sidecar failed\n")
         else:
             sys.stderr.write("rag command failed\n")
         return 2
