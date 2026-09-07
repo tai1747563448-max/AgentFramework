@@ -34,11 +34,23 @@ struct RuntimeUsage {
     std::size_t tool_calls{0};
 };
 
+struct SessionTaskLink {
+    std::string session_id;
+    std::uint64_t turn_index{0};
+};
+
+inline bool operator==(const SessionTaskLink& left,
+                       const SessionTaskLink& right) {
+    return left.session_id == right.session_id &&
+           left.turn_index == right.turn_index;
+}
+
 struct TaskState {
     std::string task_id;
     TaskStatus status{TaskStatus::Created};
     std::string issue;
     std::string workspace_utf8;
+    std::optional<SessionTaskLink> session_link;
     RuntimeBudgets budgets;
     RuntimeUsage usage;
     std::uint64_t last_sequence{0};
@@ -76,6 +88,22 @@ inline bool is_valid_task_id(std::string_view task_id) noexcept {
     return true;
 }
 
+inline bool is_valid_session_id(std::string_view session_id) noexcept {
+    constexpr std::string_view kPrefix = "session-";
+    constexpr std::size_t kHexCharacters = 32;
+    if (session_id.size() != kPrefix.size() + kHexCharacters ||
+        session_id.substr(0, kPrefix.size()) != kPrefix) {
+        return false;
+    }
+    for (const char character : session_id.substr(kPrefix.size())) {
+        if (!((character >= '0' && character <= '9') ||
+              (character >= 'a' && character <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 inline bool has_positive_runtime_budgets(
     const RuntimeBudgets& budgets) noexcept {
     return budgets.max_model_rounds > 0 && budgets.max_tool_calls > 0 &&
@@ -96,6 +124,7 @@ inline bool operator==(const RuntimeUsage& left, const RuntimeUsage& right) {
 inline bool operator==(const TaskState& left, const TaskState& right) {
     return left.task_id == right.task_id && left.status == right.status &&
            left.issue == right.issue && left.workspace_utf8 == right.workspace_utf8 &&
+           left.session_link == right.session_link &&
            left.budgets == right.budgets && left.usage == right.usage &&
            left.last_sequence == right.last_sequence &&
            left.model_call_in_flight == right.model_call_in_flight &&

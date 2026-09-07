@@ -26,6 +26,9 @@ struct RunRequest {
     std::string workspace_utf8;
     std::string system_prompt;
     RuntimeBudgets budgets;
+    std::vector<Message> initial_messages;
+    std::optional<std::string> requested_task_id;
+    std::optional<SessionTaskLink> session_link;
 };
 
 struct ResumeRequest {

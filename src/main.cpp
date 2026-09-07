@@ -3,6 +3,8 @@
 #include "adapters/build/cmake_tool_gateway.h"
 #include "adapters/empty/empty_knowledge_provider.h"
 #include "adapters/persistence/jsonl_event_store.h"
+#include "adapters/persistence/jsonl_memory_store.h"
+#include "adapters/persistence/jsonl_session_store.h"
 #include "adapters/process/direct_process_runner.h"
 #include "adapters/process/reproc_jsonl_process.h"
 #include "adapters/rag/persistent_rag_knowledge_provider.h"
@@ -12,8 +14,16 @@
 #include "adapters/tools/composite_tool_gateway.h"
 #include "adapters/workspace/workspace_tool_gateway.h"
 #include "application/runtime_engine.h"
+#include "application/memory_engine.h"
+#include "application/memory_policy.h"
+#include "application/memory_retriever.h"
+#include "application/model_context_compactor.h"
+#include "application/model_memory_consolidator.h"
+#include "application/session_engine.h"
 #include "application/state_reducer.h"
 #include "cli/cli_app.h"
+#include "cli/interactive_cli.h"
+#include "cli/terminal_text.h"
 #include "config/runtime_config.h"
 
 #include <exception>
@@ -88,6 +98,29 @@ int run_agent(std::vector<std::string> args) {
                 std::cerr << loaded.error().message << '\n';
                 return agent::ExitCode::InvalidInputOrConfig;
             }
+        } else if (startup.value().command_args.size() == 1) {
+            std::error_code error;
+            const auto cwd = std::filesystem::current_path(error);
+            if (error) {
+                std::cerr << "interactive working directory is unavailable\n";
+                return agent::ExitCode::InvalidInputOrConfig;
+            }
+            const auto discovered = agent::discover_interactive_env_file(
+                std::filesystem::u8path(
+                    startup.value().command_args.front()),
+                cwd);
+            if (!discovered.has_value()) {
+                std::cerr << discovered.error().message << '\n';
+                return agent::ExitCode::InvalidInputOrConfig;
+            }
+            if (discovered.value().has_value()) {
+                const auto loaded = agent::load_explicit_env_file(
+                    *discovered.value());
+                if (!loaded.has_value()) {
+                    std::cerr << loaded.error().message << '\n';
+                    return agent::ExitCode::InvalidInputOrConfig;
+                }
+            }
         }
 
         agent::ProcessEnvironment environment;
@@ -161,6 +194,131 @@ int run_agent(std::vector<std::string> args) {
             }
             return agent::replay_events(loaded.value());
         };
+
+        agent::JsonlSessionStore sessions(config.value().runtime_root);
+        agent::ModelContextCompactor compactor(model,
+            {config.value().session_context.max_summary_bytes,
+             config.value().budgets.model_timeout_ms});
+        agent::ModelMemoryConsolidator consolidator(model,
+            {config.value().budgets.model_timeout_ms});
+        agent::MemoryPolicy memory_policy(config.value().memory_policy);
+        agent::MemoryRetriever memory_retriever;
+        std::unique_ptr<agent::JsonlMemoryStore> memories;
+        std::unique_ptr<agent::MemoryEngine> memory_engine;
+        if (config.value().session_context.memory_enabled) {
+            memories = std::make_unique<agent::JsonlMemoryStore>(config.value().runtime_root);
+            memory_engine = std::make_unique<agent::MemoryEngine>(
+                *memories, sessions, consolidator, memory_retriever,
+                memory_policy, clock, ids);
+        }
+        agent::SessionLoadTask load_task = [&](const std::string& task_id) {
+            const auto path = events.event_path(task_id);
+            if (!path.has_value()) {
+                return agent::Result<std::optional<
+                    std::vector<agent::RuntimeEvent>>>::failure(path.error());
+            }
+            std::error_code error;
+            const bool exists = std::filesystem::exists(path.value(), error);
+            if (error) {
+                return agent::Result<std::optional<
+                    std::vector<agent::RuntimeEvent>>>::failure(
+                        {agent::ErrorCode::PersistenceFailure,
+                         "task event log could not be inspected", false});
+            }
+            if (!exists) {
+                return agent::Result<std::optional<
+                    std::vector<agent::RuntimeEvent>>>::success(std::nullopt);
+            }
+            auto loaded = events.read_task(task_id);
+            if (!loaded.has_value()) {
+                return agent::Result<std::optional<
+                    std::vector<agent::RuntimeEvent>>>::failure(
+                        loaded.error());
+            }
+            return agent::Result<std::optional<
+                std::vector<agent::RuntimeEvent>>>::success(
+                    std::move(loaded.value()));
+        };
+        agent::SessionResumeTask resume_session = [&]
+            (const agent::ResumeRequest& request,
+             const agent::RuntimeProgressObserver& observer) {
+            return engine.resume(request, observer);
+        };
+        agent::SessionRunTask run_session = [&]
+            (const agent::RunRequest& request,
+             const agent::RuntimeProgressObserver& observer) {
+            // SessionEngine has already assembled the summary and memory data.
+            return engine.run(request, observer);
+        };
+        agent::SessionEngine session_engine(
+            sessions, clock, ids, std::move(run_session), std::move(resume_session),
+            std::move(load_task),
+            {config.value().system_prompt, config.value().budgets},
+            &compactor, memory_engine.get(), config.value().session_context,
+            startup.value().command_args.size() == 1
+                ? std::function<void()>{[] {
+                      std::cout << "Compacting context...\n";
+                      std::cout.flush();
+                  }}
+                : std::function<void()>{});
+
+        if (startup.value().command_args.size() == 1) {
+            if (!agent::configure_interactive_terminal_utf8()) {
+                std::cerr << "interactive UTF-8 console setup failed\n";
+                return agent::ExitCode::InvalidInputOrConfig;
+            }
+            agent::InteractiveSessionCommands commands;
+            commands.list = [&] { return session_engine.list_sessions(); };
+            commands.create = [&](const std::string& workspace) {
+                return session_engine.create_session(
+                    workspace, config.value().anthropic.model);
+            };
+            commands.load = [&](const std::string& session_id) {
+                return session_engine.load_session(session_id);
+            };
+            commands.submit = [&]
+                (const std::string& session_id,
+                 const std::string& text,
+                 const agent::RuntimeProgressObserver& observer,
+                 bool use_memory) {
+                return session_engine.submit_turn(
+                    session_id, text, observer, use_memory);
+            };
+            commands.recover = [&]
+                (const std::string& session_id,
+                 const agent::RuntimeProgressObserver& observer,
+                 bool use_memory) {
+                return session_engine.recover_pending_turn(
+                    session_id, observer, use_memory);
+            };
+            if (memory_engine) {
+                commands.memories = [&](const std::string& workspace) {
+                    return memory_engine->list(workspace);
+                };
+                commands.remember = [&](const std::string& session_id, const std::string& text) {
+                    return memory_engine->remember(session_id, text);
+                };
+                commands.forget = [&](const std::string& memory_id) {
+                    return memory_engine->forget(memory_id);
+                };
+                commands.consolidate = [&](const std::string& session_id) {
+                    const auto result = memory_engine->consolidate(session_id);
+                    return result.has_value() ? agent::Result<void>::success() :
+                        agent::Result<void>::failure(result.error());
+                };
+            }
+            std::error_code error;
+            const auto cwd = std::filesystem::current_path(error);
+            if (error) {
+                std::cerr << "interactive working directory is unavailable\n";
+                return agent::ExitCode::InvalidInputOrConfig;
+            }
+            agent::InteractiveCli interactive(
+                std::move(commands), config.value().anthropic.model,
+                cwd.generic_u8string(), std::cin, std::cout, std::cerr,
+                config.value().session_context.memory_enabled);
+            return interactive.run();
+        }
 
         agent::CliApp app(std::move(run), std::move(resume),
                           std::move(verify), std::cout, std::cerr);

@@ -582,8 +582,7 @@ TEST_CASE(anthropic_adapter_maps_all_known_and_unknown_stop_reasons) {
          "\"name\":\"read_file\",\"input\":{}}]"},
         {"max_tokens", agent::StopReason::MaxTokens, "[]"},
         {"stop_sequence", agent::StopReason::StopSequence,
-         "[{\"type\":\"text\",\"text\":\"\"},"
-         "{\"type\":\"text\",\"text\":\"Done\"}]"},
+         "[{\"type\":\"text\",\"text\":\"Done\"}]"},
         {"provider_future_stop", agent::StopReason::Unknown,
          "[{\"type\":\"text\",\"text\":\"Done\"}]"}};
 
@@ -652,6 +651,10 @@ TEST_CASE(anthropic_adapter_rejects_known_stop_content_matrix_mismatches) {
          "\"name\":\"read_file\",\"input\":{}}]"},
         {"tool_use", "[]"},
         {"tool_use", "[{\"type\":\"text\",\"text\":\"working\"}]"},
+        {"tool_use",
+         "[{\"type\":\"text\",\"text\":\"\"},"
+         "{\"type\":\"tool_use\",\"id\":\"call-1\","
+         "\"name\":\"read_file\",\"input\":{}}]"},
         {"max_tokens",
          "[{\"type\":\"tool_use\",\"id\":\"call-1\","
          "\"name\":\"read_file\",\"input\":{}}]"},

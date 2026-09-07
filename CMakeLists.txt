@@ -47,7 +47,17 @@ add_library(agent_kernel STATIC
     src/domain/value.cpp
     src/domain/evidence_validation.cpp
     src/domain/runtime_event.cpp
+    src/domain/session_event.cpp
+    src/domain/memory_event.cpp
     src/application/state_reducer.cpp
+    src/application/session_reducer.cpp
+    src/application/memory_reducer.cpp
+    src/application/memory_policy.cpp
+    src/application/memory_retriever.cpp
+    src/application/memory_engine.cpp
+    src/application/model_context_compactor.cpp
+    src/application/model_memory_consolidator.cpp
+    src/application/session_engine.cpp
     src/application/runtime_engine.cpp
     src/application/task_evaluator.cpp
     src/application/benchmark_statistics.cpp
@@ -55,7 +65,11 @@ add_library(agent_kernel STATIC
     src/adapters/anthropic/cpr_http_transport.cpp
     src/adapters/anthropic/anthropic_messages_client.cpp
     src/adapters/persistence/event_json.cpp
-    src/adapters/persistence/jsonl_event_store.cpp)
+    src/adapters/persistence/session_event_json.cpp
+    src/adapters/persistence/memory_event_json.cpp
+    src/adapters/persistence/jsonl_memory_store.cpp
+    src/adapters/persistence/jsonl_event_store.cpp
+    src/adapters/persistence/jsonl_session_store.cpp)
 target_include_directories(agent_kernel PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(agent_kernel PUBLIC nlohmann_json::nlohmann_json PRIVATE cpr::cpr)
 if(MSVC)
@@ -80,6 +94,8 @@ add_library(agent_runtime STATIC
     src/adapters/system/random_id_generator.cpp
     src/adapters/system/signal_cancellation.cpp
     src/config/runtime_config.cpp
+    src/cli/terminal_text.cpp
+    src/cli/interactive_cli.cpp
     src/cli/cli_app.cpp)
 target_include_directories(agent_runtime PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(agent_runtime
@@ -92,6 +108,7 @@ endif()
 
 add_executable(agent src/main.cpp)
 target_link_libraries(agent PRIVATE agent_runtime)
+set_target_properties(agent PROPERTIES OUTPUT_NAME AgentFramework)
 if(WIN32)
     add_custom_command(TARGET agent POST_BUILD
         COMMAND ${CMAKE_COMMAND}
@@ -149,11 +166,25 @@ add_agent_test(domain_primitives_tests tests/domain/value_result_test.cpp)
 add_agent_test(evidence_validation_tests tests/domain/evidence_validation_test.cpp)
 add_agent_test(runtime_event_tests tests/domain/runtime_event_test.cpp)
 add_agent_test(state_reducer_tests tests/application/state_reducer_test.cpp)
+add_agent_test(session_reducer_tests tests/application/session_reducer_test.cpp)
+add_agent_test(memory_reducer_tests tests/application/memory_reducer_test.cpp)
+add_agent_test(memory_policy_tests tests/application/memory_policy_test.cpp)
+add_agent_test(memory_retriever_tests tests/application/memory_retriever_test.cpp)
+add_agent_test(memory_engine_tests tests/application/memory_engine_test.cpp)
+add_agent_test(model_context_compactor_tests tests/application/model_context_compactor_test.cpp)
+add_agent_test(model_memory_consolidator_tests tests/application/model_memory_consolidator_test.cpp)
+add_agent_test(memory_event_json_tests tests/adapters/memory_event_json_test.cpp)
+add_agent_test(jsonl_memory_store_tests tests/adapters/jsonl_memory_store_test.cpp)
+add_agent_test(session_engine_tests tests/application/session_engine_test.cpp)
 add_agent_test(runtime_engine_tests tests/application/runtime_engine_test.cpp)
 add_agent_test(task_evaluator_tests tests/application/task_evaluator_test.cpp)
 add_agent_test(benchmark_statistics_tests
     tests/application/benchmark_statistics_test.cpp)
 add_agent_test(jsonl_event_store_tests tests/adapters/jsonl_event_store_test.cpp)
+add_agent_test(session_event_json_tests
+    tests/adapters/session_event_json_test.cpp)
+add_agent_test(jsonl_session_store_tests
+    tests/adapters/jsonl_session_store_test.cpp)
 add_agent_test(anthropic_adapter_tests tests/adapters/anthropic_messages_client_test.cpp)
 target_link_libraries(anthropic_adapter_tests PRIVATE Threads::Threads)
 if(WIN32)
@@ -243,8 +274,8 @@ if(Python3_Interpreter_FOUND)
         AGENT_RAG_SCRIPT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/rag/agent_rag_cli.py")
     add_test(
         NAME python_rag_tests
-        COMMAND "${Python3_EXECUTABLE}" -E -s -X utf8 -m unittest
-            discover -s "${CMAKE_CURRENT_SOURCE_DIR}/rag/tests" -v)
+        COMMAND "${Python3_EXECUTABLE}" -E -s -X utf8 -m pytest
+            -q -ra "${CMAKE_CURRENT_SOURCE_DIR}/rag/tests")
     set_tests_properties(python_rag_tests PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()

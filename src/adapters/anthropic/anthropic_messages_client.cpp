@@ -274,6 +274,11 @@ Result<ModelResponse> decode_response(const HttpResponse& response) {
             }
         }
 
+        if (!response_text_blocks_are_valid(decoded)) {
+            return failure<ModelResponse>(
+                ErrorCode::ProtocolFailure,
+                "provider response contains an empty text block");
+        }
         if (!response_tool_uses_are_valid(decoded)) {
             return failure<ModelResponse>(ErrorCode::ProtocolFailure,
                                           "provider tool-use block is invalid");

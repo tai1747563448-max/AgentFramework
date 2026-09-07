@@ -105,6 +105,20 @@ Result<bool> exact_flag(const Environment& environment,
          "flag configuration must be exactly 0 or 1", false});
 }
 
+Result<std::size_t> bounded_size(const Environment& environment,
+                                 const char* name,
+                                 std::uint64_t default_value,
+                                 std::uint64_t maximum) {
+    const auto parsed = positive_integer(environment, name, default_value);
+    if (!parsed.has_value() || parsed.value() > maximum ||
+        parsed.value() > std::numeric_limits<std::size_t>::max()) {
+        return Result<std::size_t>::failure(
+            {ErrorCode::InvalidConfiguration,
+             "memory and compaction numbers must be positive bounded integers", false});
+    }
+    return Result<std::size_t>::success(static_cast<std::size_t>(parsed.value()));
+}
+
 Result<std::string> dotenv_filename(const std::filesystem::path& path) {
 #if defined(_WIN32)
     std::wstring usable_path = path.native();
@@ -436,6 +450,24 @@ Result<RuntimeConfig> load_runtime_config(
         positive_integer(environment, "AGENT_BUILD_TIMEOUT_SECONDS", 300);
     const auto rag_enabled =
         exact_flag(environment, "AGENT_ENABLE_RAG", false);
+    const auto memory_enabled =
+        exact_flag(environment, "AGENT_ENABLE_MEMORY", true);
+    // Check resource caps even when memory is disabled; compaction stays active.
+    constexpr std::uint64_t kMemoryByteLimit = 1024 * 1024;
+    constexpr std::uint64_t kContextByteLimit = 16 * 1024 * 1024;
+    const auto memory_top_k = bounded_size(environment, "AGENT_MEMORY_TOP_K", 5, 20);
+    const auto memory_injected = bounded_size(environment,
+        "AGENT_MEMORY_MAX_INJECTED_BYTES", 4096, kMemoryByteLimit);
+    const auto memory_entry = bounded_size(environment,
+        "AGENT_MEMORY_MAX_ENTRY_BYTES", 1024, kMemoryByteLimit);
+    const auto compaction_threshold = bounded_size(environment,
+        "AGENT_COMPACTION_THRESHOLD_BYTES", 65536, kContextByteLimit);
+    const auto compaction_hard_limit = bounded_size(environment,
+        "AGENT_COMPACTION_HARD_LIMIT_BYTES", 131072, kContextByteLimit);
+    const auto compaction_retain = bounded_size(environment,
+        "AGENT_COMPACTION_RETAIN_TURNS", 6, 10000);
+    const auto compaction_summary = bounded_size(environment,
+        "AGENT_COMPACTION_MAX_SUMMARY_BYTES", 8192, 8192);
     if (!max_tokens.has_value() || !model_rounds.has_value() ||
         !tool_calls.has_value() || !task_seconds.has_value() ||
         !timeout_seconds.has_value() || !build_timeout_seconds.has_value()) {
@@ -447,6 +479,19 @@ Result<RuntimeConfig> load_runtime_config(
     }
     if (!rag_enabled.has_value()) {
         return invalid_config("rag flag must be exactly 0 or 1");
+    }
+    if (!memory_enabled.has_value()) {
+        return invalid_config("memory flag must be exactly 0 or 1");
+    }
+    if (!memory_top_k.has_value() || !memory_injected.has_value() ||
+        !memory_entry.has_value() || !compaction_threshold.has_value() ||
+        !compaction_hard_limit.has_value() || !compaction_retain.has_value() ||
+        !compaction_summary.has_value()) {
+        return invalid_config(
+            "memory and compaction numbers must be positive bounded integers");
+    }
+    if (compaction_hard_limit.value() <= compaction_threshold.value()) {
+        return invalid_config("compaction hard limit must exceed threshold");
     }
     if (build_timeout_seconds.value() > 600) {
         return invalid_config(
@@ -575,6 +620,11 @@ Result<RuntimeConfig> load_runtime_config(
         build_timeout_seconds.value() * 1000);
     config.rag_enabled = rag_enabled.value();
     config.rag = std::move(rag);
+    config.session_context = {true, compaction_threshold.value(),
+        compaction_hard_limit.value(), compaction_retain.value(),
+        compaction_summary.value(), memory_top_k.value(), memory_injected.value(),
+        memory_enabled.value()};
+    config.memory_policy = {memory_entry.value(), {config.anthropic.credential}};
     config.system_prompt =
         system_prompt.has_value() ? *system_prompt : kDefaultSystemPrompt;
     return Result<RuntimeConfig>::success(std::move(config));
@@ -595,6 +645,63 @@ Result<void> load_explicit_env_file(const std::filesystem::path& path) {
     ScopedCoutSilencer silence_library_diagnostics;
     dotenv::init(dotenv::Preserve, filename.value().c_str());
     return Result<void>::success();
+}
+
+Result<std::optional<std::filesystem::path>> discover_interactive_env_file(
+    const std::filesystem::path& executable_path,
+    const std::filesystem::path& current_directory) {
+    try {
+        std::error_code error;
+        const auto absolute_executable = std::filesystem::absolute(
+            executable_path, error).lexically_normal();
+        if (error) {
+            return Result<std::optional<std::filesystem::path>>::failure(
+                {ErrorCode::InvalidConfiguration,
+                 "interactive executable path could not be resolved", false});
+        }
+        const auto absolute_cwd = std::filesystem::absolute(
+            current_directory, error).lexically_normal();
+        if (error) {
+            return Result<std::optional<std::filesystem::path>>::failure(
+                {ErrorCode::InvalidConfiguration,
+                 "interactive working directory could not be resolved", false});
+        }
+        const std::vector<std::filesystem::path> candidates{
+            absolute_executable.parent_path() / ".env",
+            absolute_cwd / ".env"};
+        for (const auto& candidate : candidates) {
+            error.clear();
+            const bool exists = std::filesystem::exists(candidate, error);
+            if (error) {
+                return Result<std::optional<std::filesystem::path>>::failure(
+                    {ErrorCode::InvalidConfiguration,
+                     "interactive environment file could not be inspected",
+                     false});
+            }
+            if (!exists) {
+                continue;
+            }
+            if (std::filesystem::is_regular_file(candidate, error) && !error) {
+                return Result<std::optional<std::filesystem::path>>::success(
+                    candidate);
+            }
+            if (error) {
+                return Result<std::optional<std::filesystem::path>>::failure(
+                    {ErrorCode::InvalidConfiguration,
+                     "interactive environment file could not be inspected",
+                     false});
+            }
+            return Result<std::optional<std::filesystem::path>>::failure(
+                {ErrorCode::InvalidConfiguration,
+                 "interactive environment path is not a regular file", false});
+        }
+        return Result<std::optional<std::filesystem::path>>::success(
+            std::nullopt);
+    } catch (const std::filesystem::filesystem_error&) {
+        return Result<std::optional<std::filesystem::path>>::failure(
+            {ErrorCode::InvalidConfiguration,
+             "interactive environment discovery failed", false});
+    }
 }
 
 Result<std::optional<std::filesystem::path>> discover_rag_pack_root(

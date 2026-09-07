@@ -1665,6 +1665,9 @@ TEST_CASE(inconsistent_stop_and_content_rows_fail_directly_as_model_protocol) {
         fixtures::stopped_response({agent::TextBlock{""}},
                                    agent::StopReason::StopSequence,
                                    "stop_sequence"),
+        fixtures::stopped_response(
+            {agent::TextBlock{""}, agent::ToolUseBlock{call}},
+            agent::StopReason::ToolUse, "tool_use"),
     };
 
     for (const auto& response : invalid_responses) {
@@ -1686,4 +1689,87 @@ TEST_CASE(inconsistent_stop_and_content_rows_fail_directly_as_model_protocol) {
                 agent::EventKind::ModelCallFailed);
         REQUIRE(fixture.tools.executed_calls.empty());
     }
+}
+
+TEST_CASE(session_turn_uses_requested_task_id_and_exact_conversation_prefix) {
+    const auto prior_call = fixtures::call("call-prior", "read_file");
+    const agent::ToolResult prior_result{
+        "call-prior", "prior file contents", false};
+    const std::vector<agent::Message> history{
+        {agent::Role::User, {agent::TextBlock{"first question"}}},
+        {agent::Role::Assistant,
+         {agent::TextBlock{"checking"},
+          agent::ToolUseBlock{prior_call}}},
+        {agent::Role::User,
+         {agent::ToolResultBlock{prior_result}}},
+        {agent::Role::Assistant,
+         {agent::TextBlock{"first answer"}}},
+    };
+    const std::string requested_task_id =
+        "task-22222222222222222222222222222222";
+    test::EngineFixture fixture(
+        test::FakeModel({fixtures::text_response("second answer")}),
+        test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
+    auto request = fixtures::run_request("second question");
+    request.initial_messages = history;
+    request.requested_task_id = requested_task_id;
+    request.session_link = agent::SessionTaskLink{
+        "session-11111111111111111111111111111111", 2};
+
+    const auto result = fixture.run(request);
+
+    REQUIRE(result.state.has_value());
+    REQUIRE(!result.fatal_error.has_value());
+    REQUIRE(result.state->task_id == requested_task_id);
+    REQUIRE(fixture.model.requests.size() == 1);
+    auto expected = history;
+    expected.push_back(
+        {agent::Role::User, {agent::TextBlock{"second question"}}});
+    REQUIRE(fixture.model.requests.front().messages == expected);
+    const auto* started = std::get_if<agent::TaskStartedPayload>(
+        &fixture.events.events.front().payload);
+    REQUIRE(started != nullptr);
+    REQUIRE(started->initial_messages == history);
+    REQUIRE(started->session_link == request.session_link);
+}
+
+TEST_CASE(session_turn_rejects_invalid_history_before_any_external_call) {
+    test::EngineFixture fixture(
+        test::FakeModel({fixtures::text_response("unused")}),
+        test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
+    auto request = fixtures::run_request("next question");
+    request.initial_messages = {
+        {agent::Role::Assistant,
+         {agent::ToolUseBlock{fixtures::call("unmatched", "read_file")}}},
+    };
+    request.requested_task_id =
+        "task-33333333333333333333333333333333";
+
+    const auto result = fixture.run(request);
+
+    REQUIRE(!result.state.has_value());
+    REQUIRE(result.fatal_error.has_value());
+    REQUIRE(result.fatal_error->code == agent::ErrorCode::InvalidInput);
+    REQUIRE(fixture.events.events.empty());
+    REQUIRE(fixture.knowledge.retrieved_states.empty());
+    REQUIRE(fixture.model.requests.empty());
+    REQUIRE(fixture.tools.definitions_calls == 0);
+    REQUIRE(fixture.tools.executed_calls.empty());
+}
+
+TEST_CASE(session_turn_rejects_invalid_requested_task_id_before_persistence) {
+    test::EngineFixture fixture(
+        test::FakeModel({fixtures::text_response("unused")}),
+        test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
+    auto request = fixtures::run_request("question");
+    request.requested_task_id = "task-not-valid";
+
+    const auto result = fixture.run(request);
+
+    REQUIRE(!result.state.has_value());
+    REQUIRE(result.fatal_error.has_value());
+    REQUIRE(result.fatal_error->code == agent::ErrorCode::InvalidInput);
+    REQUIRE(fixture.events.events.empty());
+    REQUIRE(fixture.knowledge.retrieved_states.empty());
+    REQUIRE(fixture.model.requests.empty());
 }
