@@ -20,6 +20,7 @@ from agent_rag.pack import (  # type: ignore[import-not-found]
     atomic_publish,
     verify_complete_pack,
 )
+from agent_rag.cli import main as rag_main  # type: ignore[import-not-found]
 
 
 PACK_ID = "pack-0123456789abcdef0123456789abcdef"
@@ -144,6 +145,24 @@ def test_verify_complete_pack_accepts_consistent_fixture(tmp_path: Path) -> None
     assert manifest.document_count == 1
     assert manifest.chunk_count == 2
     assert manifest.embedding_dimensions == 1024
+
+
+def test_verify_pack_cli_reports_only_stable_manifest_metadata(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _minimal_pack(tmp_path / "pack")
+
+    assert rag_main(["verify-pack", "--pack-root", str(root)]) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert result == {
+        "chunk_count": 2,
+        "document_count": 1,
+        "embedding_dimensions": 1024,
+        "pack_id": PACK_ID,
+        "schema_version": 2,
+        "snapshot_date": "2026-09-03",
+    }
 
 
 def test_verify_pack_rejects_chunk_vector_count_mismatch(tmp_path: Path) -> None:

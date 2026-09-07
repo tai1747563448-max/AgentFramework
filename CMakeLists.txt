@@ -22,7 +22,8 @@ set(CPR_USE_SYSTEM_CURL OFF CACHE BOOL "" FORCE)
 set(REPROC++ ON CACHE BOOL "" FORCE)
 set(REPROC_TEST OFF CACHE BOOL "" FORCE)
 set(REPROC_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(REPROC_OBJECT_LIBRARIES ON CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     cpr
     GIT_REPOSITORY https://github.com/libcpr/cpr.git
@@ -121,6 +122,20 @@ if(MSVC)
     target_compile_options(agent PRIVATE /W4 /permissive- /utf-8)
 endif()
 
+if(WIN32)
+    set(AGENT_READY_ENV_FILE "${CMAKE_CURRENT_SOURCE_DIR}/.env" CACHE FILEPATH
+        "Existing local environment file to copy into the explicitly requested Ready package")
+    add_custom_target(agent_ready_package
+        COMMAND ${CMAKE_COMMAND}
+            "-DAGENT_READY_EXE=$<TARGET_FILE:agent>"
+            "-DAGENT_READY_DLLS=$<JOIN:$<TARGET_RUNTIME_DLLS:agent>,|>"
+            "-DAGENT_READY_CONFIG=$<CONFIG>"
+            "-DAGENT_READY_ENV_FILE=${AGENT_READY_ENV_FILE}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/stage_ready_package.cmake"
+        DEPENDS agent
+        VERBATIM)
+endif()
+
 set(AGENT_BENCHMARK_PROVENANCE_HEADER
     "${CMAKE_CURRENT_BINARY_DIR}/generated/benchmark_provenance.h")
 add_custom_target(agent_benchmark_provenance
@@ -197,6 +212,39 @@ add_agent_test(cli_tests tests/cli/cli_app_test.cpp)
 target_link_libraries(cli_tests PRIVATE agent_runtime)
 add_agent_test(rag_runtime_config_tests tests/config/rag_runtime_config_test.cpp)
 target_link_libraries(rag_runtime_config_tests PRIVATE agent_runtime)
+add_agent_test(interactive_cli_tests tests/cli/interactive_cli_test.cpp)
+target_link_libraries(interactive_cli_tests PRIVATE agent_runtime)
+add_agent_test(runtime_config_tests tests/config/runtime_config_test.cpp)
+target_link_libraries(runtime_config_tests PRIVATE agent_runtime)
+add_agent_test(interactive_process_tests
+    tests/cli/interactive_process_test.cpp)
+target_link_libraries(interactive_process_tests PRIVATE
+    agent_runtime Threads::Threads)
+add_dependencies(interactive_process_tests agent)
+target_compile_definitions(interactive_process_tests PRIVATE
+    AGENT_INTERACTIVE_EXE_PATH="$<TARGET_FILE:agent>"
+    _CRT_SECURE_NO_WARNINGS)
+if(WIN32)
+    target_link_libraries(interactive_process_tests PRIVATE ws2_32)
+    add_test(NAME ready_package_contract CONFIGURATIONS Release
+        COMMAND ${CMAKE_COMMAND}
+            "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+            "-DBINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+            "-DAGENT_EXE=$<TARGET_FILE:agent>"
+            "-DRUNTIME_DLLS=$<JOIN:$<TARGET_RUNTIME_DLLS:agent>,|>"
+            "-DPROCESS_TEST_EXE=$<TARGET_FILE:interactive_process_tests>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/ready_package_contract_test.cmake")
+    add_custom_target(agent_ready_package_verify
+        COMMAND ${CMAKE_COMMAND}
+            "-DAGENT_READY_EXE=$<TARGET_FILE:agent>"
+            "-DAGENT_READY_DLLS=$<JOIN:$<TARGET_RUNTIME_DLLS:agent>,|>"
+            "-DAGENT_READY_CONFIG=$<CONFIG>"
+            "-DAGENT_READY_DIR=${CMAKE_CURRENT_SOURCE_DIR}/out/AgentFramework-Ready"
+            "-DAGENT_PROCESS_TEST_EXE=$<TARGET_FILE:interactive_process_tests>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_ready_package.cmake"
+        DEPENDS agent_ready_package interactive_process_tests
+        VERBATIM)
+endif()
 add_agent_test(runtime_integration_tests tests/integration/runtime_integration_test.cpp)
 target_link_libraries(runtime_integration_tests PRIVATE agent_runtime)
 add_agent_test(workspace_primitives_tests tests/adapters/workspace_primitives_test.cpp)
@@ -247,6 +295,21 @@ add_test(
         "-DEVENT_LOG=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/valid-completed-events.jsonl"
         "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/resume-process"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/resume_process_test.cmake")
+add_test(
+    NAME interactive_startup_process
+    COMMAND ${CMAKE_COMMAND}
+        "-DAGENT_EXE=$<TARGET_FILE:agent>"
+        "-DRUNTIME_DLLS=$<JOIN:$<TARGET_RUNTIME_DLLS:agent>,|>"
+        "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/interactive-startup-process"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/interactive_startup_process_test.cmake")
+if(WIN32)
+    add_test(
+        NAME knowledge_pack_build_script_contract
+        COMMAND ${CMAKE_COMMAND}
+            "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+            "-DPOWERSHELL_EXE=powershell"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/rag/knowledge_pack_build_script_contract_test.cmake")
+endif()
 add_test(
     NAME agent_benchmark_process
     COMMAND ${CMAKE_COMMAND}

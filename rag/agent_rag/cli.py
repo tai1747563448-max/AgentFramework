@@ -17,6 +17,7 @@ from .ecfr_document import build_corpus_from_downloads
 from .ecfr_source import DownloadConfig, download_ecfr_snapshot
 from .hybrid_index import build_hybrid_index
 from .indexer import build_index
+from .pack import verify_complete_pack
 from .protocol import parse_query_request, response_json
 from .retriever import query_index
 
@@ -153,6 +154,22 @@ def _verify_model(arguments: list[str]) -> int:
     return 0
 
 
+def _verify_pack(arguments: list[str]) -> int:
+    if len(arguments) != 3 or arguments[1] != "--pack-root":
+        raise ValueError("invalid verify-pack arguments")
+    manifest = verify_complete_pack(Path(arguments[2]))
+    result = {
+        "schema_version": manifest.schema_version,
+        "pack_id": manifest.pack_id,
+        "snapshot_date": manifest.snapshot_date,
+        "document_count": manifest.document_count,
+        "chunk_count": manifest.chunk_count,
+        "embedding_dimensions": manifest.embedding_dimensions,
+    }
+    sys.stdout.write(json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n")
+    return 0
+
+
 def _serve(arguments: list[str]) -> int:
     if (
         len(arguments) not in {3, 5}
@@ -185,6 +202,8 @@ def main(arguments: list[str] | None = None) -> int:
             return _build_hybrid(values)
         if command == "verify-model":
             return _verify_model(values)
+        if command == "verify-pack":
+            return _verify_pack(values)
         if command == "serve":
             return _serve(values)
         raise ValueError("unknown command")
@@ -201,6 +220,8 @@ def main(arguments: list[str] | None = None) -> int:
             sys.stderr.write("hybrid index build failed\n")
         elif command == "verify-model":
             sys.stderr.write("embedding model verification failed\n")
+        elif command == "verify-pack":
+            sys.stderr.write("Knowledge Pack verification failed\n")
         elif command == "serve":
             sys.stderr.write("rag sidecar failed\n")
         else:
