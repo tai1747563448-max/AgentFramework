@@ -36,7 +36,8 @@ RuntimeError fixed_process_error(const RuntimeError& error, bool startup) {
 
 bool valid_config(const RagConfig& config) {
     return config.pack_root.is_absolute() &&
-           (config.mode == "hybrid" || config.mode == "lexical") &&
+           (config.mode == "hybrid" || config.mode == "dense" ||
+            config.mode == "lexical") &&
            config.top_k >= 1 && config.top_k <= 20 &&
            config.max_total_bytes >= 1 && config.max_total_bytes <= 32'768 &&
            config.startup_timeout_ms >= 1 && config.startup_timeout_ms <= 600'000 &&
@@ -78,8 +79,9 @@ bool should_skip(const std::string& issue) {
 }  // namespace
 
 PersistentRagKnowledgeProvider::PersistentRagKnowledgeProvider(
-    JsonlProcess& process, RagConfig config)
-    : process_(process), config_(std::move(config)) {}
+    JsonlProcess& process, RagPackVerifier& pack_verifier, RagConfig config)
+    : process_(process), pack_verifier_(pack_verifier),
+      config_(std::move(config)) {}
 
 PersistentRagKnowledgeProvider::~PersistentRagKnowledgeProvider() {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -97,11 +99,16 @@ Result<void> PersistentRagKnowledgeProvider::ensure_ready() {
         process_.stop(1'000);
     }
     state_ = State::Starting;
+    auto verified = pack_verifier_.verify_executable_payload(config_.pack_root);
+    if (!verified.has_value()) {
+        state_ = State::Broken;
+        return verified;
+    }
     const auto python = config_.pack_root / "runtime" / "python.exe";
     const auto script = config_.pack_root / "sidecar" / "agent_rag_cli.py";
     JsonlProcessRequest request;
     request.program = python.generic_u8string();
-    request.arguments = {"-E", "-s", "-X", "utf8", script.generic_u8string(),
+    request.arguments = {"-B", "-E", "-s", "-X", "utf8", script.generic_u8string(),
                          "serve", "--pack-root",
                          config_.pack_root.generic_u8string(), "--device",
                          config_.device};
@@ -119,6 +126,7 @@ Result<void> PersistentRagKnowledgeProvider::ensure_ready() {
         break_process();
         return Result<void>::failure(ready.error());
     }
+    retrieval_revision_ = ready.value().retrieval_revision;
     state_ = State::Ready;
     return Result<void>::success();
 }
@@ -133,6 +141,7 @@ std::string PersistentRagKnowledgeProvider::next_request_id() {
 
 void PersistentRagKnowledgeProvider::break_process() noexcept {
     state_ = State::Broken;
+    retrieval_revision_.clear();
     process_.stop(1'000);
 }
 
@@ -172,7 +181,7 @@ Result<EvidencePack> PersistentRagKnowledgeProvider::retrieve(
             return Result<EvidencePack>::failure(error);
         }
         auto decoded = rag::decode_query_result(
-            response.value(), request_id, config_.top_k,
+            response.value(), request_id, retrieval_revision_, config_.top_k,
             config_.max_total_bytes);
         if (!decoded.has_value()) {
             break_process();

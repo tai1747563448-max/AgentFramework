@@ -313,14 +313,33 @@ Json evidence_pack_to_json(const EvidencePack& evidence) {
                          {"content", item.content},
                          {"metadata", value_to_json(item.metadata)}});
     }
-    return {{"items", std::move(items)}};
+    return {{"items", std::move(items)},
+            {"authoritative_no_match", evidence.authoritative_no_match},
+            {"tool_use_forbidden", evidence.tool_use_forbidden}};
 }
 
 EvidencePack evidence_pack_from_json(const Json& json) {
-    require_exact_keys(json, {"items"});
+    const bool has_outcome = json.contains("authoritative_no_match");
+    const bool has_tool_policy = json.contains("tool_use_forbidden");
+    if (has_outcome && has_tool_policy) {
+        require_exact_keys(
+            json, {"items", "authoritative_no_match", "tool_use_forbidden"});
+    } else if (has_outcome) {
+        // Logs written after explicit no-match and before the tool policy bit
+        // remain replayable with their historical behavior.
+        require_exact_keys(json, {"items", "authoritative_no_match"});
+    } else {
+        // Schema-v1 logs written before the explicit no-match outcome remain
+        // replayable. Their evidence semantics were items-only.
+        require_exact_keys(json, {"items"});
+    }
     const auto& items_json = json.at("items");
     require_array(items_json);
     EvidencePack pack;
+    pack.authoritative_no_match =
+        has_outcome && required_bool(json, "authoritative_no_match");
+    pack.tool_use_forbidden =
+        has_tool_policy && required_bool(json, "tool_use_forbidden");
     pack.items.reserve(items_json.size());
     for (const auto& item : items_json) {
         require_exact_keys(item, {"source_id", "content", "metadata"});
@@ -420,6 +439,7 @@ const char* event_kind_name(EventKind kind) {
     case EventKind::TaskStarted: return "task_started";
     case EventKind::ContextPreparationStarted: return "context_preparation_started";
     case EventKind::ContextPrepared: return "context_prepared";
+    case EventKind::KnowledgeNoMatch: return "knowledge_no_match";
     case EventKind::ContextPreparationFailed: return "context_preparation_failed";
     case EventKind::ModelCallStarted: return "model_call_started";
     case EventKind::ModelCallSucceeded: return "model_call_succeeded";
@@ -458,6 +478,8 @@ Json payload_to_json(const EventPayload& payload) {
                 return Json::object();
             } else if constexpr (std::is_same_v<Payload, ContextPreparedPayload>) {
                 return {{"evidence", evidence_pack_to_json(typed.evidence)}};
+            } else if constexpr (std::is_same_v<Payload, KnowledgeNoMatchPayload>) {
+                return {{"final_text", typed.final_text}};
             } else if constexpr (
                 std::is_same_v<Payload, ContextPreparationFailedPayload> ||
                 std::is_same_v<Payload, ModelCallFailedPayload> ||
@@ -531,6 +553,10 @@ EventPayload payload_from_json(const std::string& type, const Json& json) {
     if (type == "context_prepared") {
         require_exact_keys(json, {"evidence"});
         return ContextPreparedPayload{evidence_pack_from_json(json.at("evidence"))};
+    }
+    if (type == "knowledge_no_match") {
+        require_exact_keys(json, {"final_text"});
+        return KnowledgeNoMatchPayload{required_string(json, "final_text")};
     }
     if (type == "context_preparation_failed") {
         require_exact_keys(json, {"error"});

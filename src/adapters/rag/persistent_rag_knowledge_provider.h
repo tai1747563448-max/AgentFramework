@@ -2,6 +2,7 @@
 
 #include "ports/jsonl_process.h"
 #include "ports/knowledge_provider.h"
+#include "ports/rag_pack_verifier.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -24,7 +25,9 @@ struct RagConfig {
 
 class PersistentRagKnowledgeProvider final : public KnowledgeProvider {
 public:
-    PersistentRagKnowledgeProvider(JsonlProcess& process, RagConfig config);
+    PersistentRagKnowledgeProvider(JsonlProcess& process,
+                                   RagPackVerifier& pack_verifier,
+                                   RagConfig config);
     ~PersistentRagKnowledgeProvider() override;
 
     PersistentRagKnowledgeProvider(const PersistentRagKnowledgeProvider&) = delete;
@@ -41,9 +44,11 @@ private:
     void break_process() noexcept;
 
     JsonlProcess& process_;
+    RagPackVerifier& pack_verifier_;
     RagConfig config_;
     std::mutex mutex_;
     State state_{State::Stopped};
+    std::string retrieval_revision_;
     std::uint64_t request_sequence_{0};
 };
 

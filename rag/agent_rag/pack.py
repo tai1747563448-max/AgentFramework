@@ -9,7 +9,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 
 BGE_M3_MODEL = "BAAI/bge-m3"
@@ -80,6 +80,17 @@ _REQUIRED_FILES = {
     "index/vectors.f16",
     "index/vectors.json",
     "model.lock.json",
+}
+_RUNTIME_REQUIRED_FILES = _REQUIRED_FILES | {
+    "runtime/python.exe",
+    "runtime.lock.json",
+    "sidecar/agent_rag_cli.py",
+}
+_RUNTIME_HASHED_CONTROL_FILES = {
+    "index/vectors.json",
+    "model.lock.json",
+    "runtime.lock.json",
+    "sidecar/agent_rag_cli.py",
 }
 _PACK_ID = re.compile(r"pack-[0-9a-f]{32}\Z")
 _DOCUMENT_ID = re.compile(r"doc-[0-9a-f]{32}\Z")
@@ -330,12 +341,18 @@ def _expected_directories(files: Iterable[str]) -> set[str]:
     return expected
 
 
-def _verify_file_records(root: Path, records: tuple[FileDigest, ...]) -> None:
+def _verify_file_records(
+    root: Path,
+    records: tuple[FileDigest, ...],
+    progress: Callable[..., None] | None = None,
+) -> None:
+    if progress is not None:
+        progress("verify-pack-files", 0, len(records))
     expected_files = {"pack.json", *(record.path for record in records)}
     files, directories = _inventory(root)
     if files != expected_files or directories != _expected_directories(expected_files):
         raise PackError("pack inventory is invalid")
-    for record in records:
+    for completed, record in enumerate(records, start=1):
         path = root.joinpath(*PurePosixPath(record.path).parts)
         _require_regular_single_link(path)
         try:
@@ -344,6 +361,8 @@ def _verify_file_records(root: Path, records: tuple[FileDigest, ...]) -> None:
             raise PackError("pack file is unavailable") from error
         if size != record.bytes or _sha256_file(path) != record.sha256:
             raise PackError("pack file digest is invalid")
+        if progress is not None:
+            progress("verify-pack-files", completed, len(records))
 
 
 def _canonical_date(value: Any) -> bool:
@@ -355,10 +374,18 @@ def _canonical_date(value: Any) -> bool:
         return False
 
 
-def _count_documents(path: Path, root: Path) -> int:
+def _count_documents(
+    path: Path,
+    root: Path,
+    *,
+    expected_count: int,
+    progress: Callable[..., None] | None = None,
+) -> int:
     data = _read_trusted(path, maximum=512 * 1024 * 1024, label="document manifest")
     count = 0
     seen: set[str] = set()
+    if progress is not None:
+        progress("verify-pack-documents", 0, expected_count)
     for raw_line in data.splitlines():
         if not raw_line:
             raise PackError("document manifest is invalid")
@@ -419,6 +446,8 @@ def _count_documents(path: Path, root: Path) -> int:
             raise PackError("document markdown digest is invalid")
         seen.add(document_id)
         count += 1
+        if progress is not None:
+            progress("verify-pack-documents", count, expected_count)
     return count
 
 
@@ -440,7 +469,11 @@ def _verify_model_lock(root: Path, manifest: PackManifest) -> None:
         raise PackError("model lock is invalid")
 
 
-def _verify_vectors(root: Path, manifest: PackManifest) -> None:
+def _verify_vectors(
+    root: Path,
+    manifest: PackManifest,
+    progress: Callable[..., None] | None = None,
+) -> None:
     value = _parse_json_bytes(
         _read_trusted(root / "index" / "vectors.json", maximum=64 * 1024, label="vector metadata"),
         maximum=64 * 1024,
@@ -466,19 +499,147 @@ def _verify_vectors(root: Path, manifest: PackManifest) -> None:
         raise PackError("vector metadata is invalid")
     vectors = root / "index" / "vectors.f16"
     database = root / "index" / "metadata.sqlite3"
+    if progress is not None:
+        progress("verify-pack-vectors", 0, 2)
     try:
         vector_size = vectors.stat().st_size
     except OSError as error:
         raise PackError("vector matrix is unavailable") from error
+    matrix_sha256 = _sha256_file(vectors)
+    if progress is not None:
+        progress("verify-pack-vectors", 1, 2)
+    database_sha256 = _sha256_file(database)
+    if progress is not None:
+        progress("verify-pack-vectors", 2, 2)
     if (
         vector_size != manifest.chunk_count * manifest.embedding_dimensions * 2
-        or value["matrix_sha256"] != _sha256_file(vectors)
-        or value["database_sha256"] != _sha256_file(database)
+        or value["matrix_sha256"] != matrix_sha256
+        or value["database_sha256"] != database_sha256
     ):
         raise PackError("pack counts are inconsistent")
 
 
-def verify_complete_pack(root: Path) -> PackManifest:
+def verify_runtime_pack(
+    root: Path, *, progress: Callable[..., None] | None = None
+) -> PackManifest:
+    """Validate the bounded startup surface of a previously published pack.
+
+    Full inventory and digest validation remains mandatory in
+    ``verify_complete_pack`` and ``atomic_publish``. Startup validates the
+    manifest contract, every directly consumed root asset's identity and size,
+    and hashes the small control files. Large model and index payloads are
+    subsequently opened and structurally checked by their owning adapters.
+    """
+    trusted_root = require_trusted_directory(Path(root))
+    value = _parse_json_bytes(
+        _read_trusted(
+            trusted_root / "pack.json",
+            maximum=64 * 1024 * 1024,
+            label="pack manifest",
+        ),
+        maximum=64 * 1024 * 1024,
+        label="pack manifest",
+    )
+    manifest = _parse_pack_manifest(value)
+    if not manifest.complete:
+        raise PackError("pack is incomplete")
+    records = {record.path: record for record in manifest.files}
+    if not _RUNTIME_REQUIRED_FILES.issubset(records):
+        raise PackError("pack manifest is invalid")
+    ordered = sorted(_RUNTIME_REQUIRED_FILES)
+    if progress is not None:
+        progress("runtime-pack-assets", 0, len(ordered))
+    for completed, name in enumerate(ordered, start=1):
+        record = records[name]
+        path = trusted_root.joinpath(*PurePosixPath(name).parts)
+        _require_regular_single_link(path)
+        try:
+            actual_size = path.stat().st_size
+        except OSError as error:
+            raise PackError("pack file is unavailable") from error
+        if actual_size != record.bytes:
+            raise PackError("pack file digest is invalid")
+        if name in _RUNTIME_HASHED_CONTROL_FILES and _sha256_file(path) != record.sha256:
+            raise PackError("pack file digest is invalid")
+        if progress is not None:
+            progress("runtime-pack-assets", completed, len(ordered))
+
+    _verify_model_lock(trusted_root, manifest)
+    vector_value = _parse_json_bytes(
+        _read_trusted(
+            trusted_root / "index" / "vectors.json",
+            maximum=64 * 1024,
+            label="vector metadata",
+        ),
+        maximum=64 * 1024,
+        label="vector metadata",
+    )
+    if type(vector_value) is not dict or set(vector_value) != _VECTOR_KEYS:
+        raise PackError("vector metadata is invalid")
+    vectors = records["index/vectors.f16"]
+    database = records["index/metadata.sqlite3"]
+    if (
+        vector_value["schema_version"] != PACK_SCHEMA_VERSION
+        or vector_value["dtype"] != "<f2"
+        or vector_value["rows"] != manifest.chunk_count
+        or vector_value["dimensions"] != manifest.embedding_dimensions
+        or vector_value["model"] != manifest.embedding_model
+        or vector_value["revision"] != manifest.embedding_revision
+        or vector_value["matrix_sha256"] != vectors.sha256
+        or vector_value["database_sha256"] != database.sha256
+        or vectors.bytes
+        != manifest.chunk_count * manifest.embedding_dimensions * 2
+        or database.bytes <= 0
+        or type(vector_value["tokenizer_sha256"]) is not str
+        or _SHA256.fullmatch(vector_value["tokenizer_sha256"]) is None
+    ):
+        raise PackError("pack counts are inconsistent")
+    return manifest
+
+
+def retrieval_revision(manifest: PackManifest) -> str:
+    """Return the immutable retrieval/runtime policy identity for a pack.
+
+    ``pack_id`` deliberately identifies knowledge content.  This separate
+    revision binds the executable runtime, sidecar build, fitted relevance
+    policy, and frozen evaluation inputs/results used with that content.
+    """
+    records = {record.path: record for record in manifest.files}
+    required = (
+        "build.intent.json",
+        "runtime.lock.json",
+        "eval/ecfr-cases.jsonl",
+        "reports/retrieval-eval.json",
+    )
+    if any(name not in records for name in required):
+        raise PackError("retrieval revision inputs are unavailable")
+    seed = {
+        "schema_version": PACK_SCHEMA_VERSION,
+        "pack_id": manifest.pack_id,
+        "relevance_dense_min": manifest.relevance_dense_min,
+        "build_intent_sha256": records["build.intent.json"].sha256,
+        "runtime_lock_sha256": records["runtime.lock.json"].sha256,
+        "evaluation_cases_sha256": records["eval/ecfr-cases.jsonl"].sha256,
+        "evaluation_report_sha256": records[
+            "reports/retrieval-eval.json"
+        ].sha256,
+    }
+    try:
+        encoded = json.dumps(
+            seed,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("ascii")
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise PackError("retrieval revision inputs are invalid") from error
+    return "retrieval-" + hashlib.sha256(encoded).hexdigest()
+
+
+def verify_complete_pack(
+    root: Path, *, progress: Callable[..., None] | None = None
+) -> PackManifest:
     trusted_root = require_trusted_directory(Path(root))
     manifest_path = trusted_root / "pack.json"
     value = _parse_json_bytes(
@@ -489,26 +650,42 @@ def verify_complete_pack(root: Path) -> PackManifest:
     manifest = _parse_pack_manifest(value)
     if not manifest.complete:
         raise PackError("pack is incomplete")
-    _verify_file_records(trusted_root, manifest.files)
+    _verify_file_records(trusted_root, manifest.files, progress)
     if (
         _count_documents(
-            trusted_root / "manifest" / "documents.jsonl", trusted_root
+            trusted_root / "manifest" / "documents.jsonl",
+            trusted_root,
+            expected_count=manifest.document_count,
+            progress=progress,
         )
         != manifest.document_count
     ):
         raise PackError("pack counts are inconsistent")
     _verify_model_lock(trusted_root, manifest)
-    _verify_vectors(trusted_root, manifest)
+    _verify_vectors(trusted_root, manifest, progress)
     return manifest
 
 
-def atomic_publish(staging: Path, destination: Path) -> None:
+def atomic_publish(
+    staging: Path,
+    destination: Path,
+    *,
+    progress: Callable[..., None] | None = None,
+) -> None:
     staging_root = require_trusted_directory(Path(staging))
-    verify_complete_pack(staging_root)
+    verify_complete_pack(staging_root, progress=progress)
     destination_path = Path(destination)
     if not destination_path.is_absolute():
         raise PackError("publish destination must be absolute")
-    if staging_root.parent != destination_path.parent.resolve(strict=True):
+    _require_unlinked_components(destination_path.parent)
+    destination_parent = destination_path.parent.resolve(strict=True)
+    staging_parent = staging_root.parent
+    direct_sibling = staging_parent == destination_parent
+    hidden_staging_child = (
+        staging_parent.name.casefold() == ".staging"
+        and staging_parent.parent == destination_parent
+    )
+    if not (direct_sibling or hidden_staging_child):
         raise PackError("publish paths must share one parent")
     if destination_path.exists() or destination_path.is_symlink():
         raise PackError("publish destination already exists")

@@ -103,7 +103,7 @@ def parse_v2_message(line: str | bytes) -> ClientMessage:
             or type(maximum) is not int
             or not 1 <= maximum <= 32_768
             or type(mode) is not str
-            or mode not in {"hybrid", "lexical"}
+            or mode not in {"hybrid", "dense", "lexical"}
         ):
             raise ProtocolError("query payload is invalid")
     return ClientMessage(request_id, op, payload)

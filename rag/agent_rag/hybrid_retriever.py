@@ -8,7 +8,7 @@ import math
 from pathlib import Path
 import re
 import sqlite3
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 import numpy as np
 
@@ -21,8 +21,9 @@ class HybridRetrievalError(RuntimeError):
 
 
 _CFR_CITATION = re.compile(
-    r"\s*(\d{1,2})\s*CFR\s*(?:(?:SECTION|SEC\.?|§)\s*)?"
-    r"([0-9]+(?:\.[0-9A-Za-z_-]+)*)\s*\Z",
+    r"(?<![0-9A-Za-z])(\d{1,2})\s*CFR\s*"
+    r"(?:(?:SECTION|SEC\.?|§)\s*)?"
+    r"([0-9]+(?:\.[0-9A-Za-z_-]+)*)(?![0-9A-Za-z_-])",
     re.IGNORECASE,
 )
 
@@ -55,10 +56,26 @@ class EvidenceItem:
     neighbor_of: str | None
 
 
+@dataclass(frozen=True)
+class RetrievalResult:
+    items: list[EvidenceItem]
+    outcome: str
+
+
 def reciprocal_rank_fusion(
-    lexical: Sequence[str], dense: Sequence[str], *, constant: int = 60
+    lexical: Sequence[str],
+    dense: Sequence[str],
+    *,
+    constant: int = 60,
+    dense_weight: float = 1.0,
 ) -> list[FusedHit]:
-    if type(constant) is not int or constant <= 0:
+    if (
+        type(constant) is not int
+        or constant <= 0
+        or type(dense_weight) not in {int, float}
+        or not math.isfinite(float(dense_weight))
+        or not 0.0 < float(dense_weight) <= 100.0
+    ):
         raise HybridRetrievalError("RRF constant is invalid")
     lexical_ranks: dict[str, int] = {}
     dense_ranks: dict[str, int] = {}
@@ -79,7 +96,7 @@ def reciprocal_rank_fusion(
         if lexical_rank is not None:
             score += 1.0 / (constant + lexical_rank)
         if dense_rank is not None:
-            score += 1.0 / (constant + dense_rank)
+            score += float(dense_weight) / (constant + dense_rank)
         hits.append(FusedHit(chunk_id, lexical_rank, dense_rank, score))
     return sorted(
         hits,
@@ -105,12 +122,15 @@ def select_evidence(
     *,
     top_k: int,
     max_total_bytes: int,
+    required_document_ids: Sequence[str] = (),
 ) -> list[EvidenceItem]:
     if (
         type(top_k) is not int
         or top_k <= 0
         or type(max_total_bytes) is not int
         or max_total_bytes <= 0
+        or any(type(item) is not str or not item for item in required_document_ids)
+        or len(set(required_document_ids)) != len(required_document_ids)
     ):
         raise HybridRetrievalError("evidence limits are invalid")
     eligible: list[EvidenceItem] = []
@@ -132,28 +152,36 @@ def select_evidence(
     selected: list[EvidenceItem] = []
     retained_bytes = 0
     selected_sha: set[str] = set()
+    selected_chunk_ids: set[str] = set()
 
     def add(item: EvidenceItem) -> bool:
         nonlocal retained_bytes
         if (
             len(selected) >= top_k
+            or item.chunk_id in selected_chunk_ids
             or item.content_sha256 in selected_sha
             or retained_bytes + _content_bytes(item) > max_total_bytes
         ):
             return False
         selected.append(item)
+        selected_chunk_ids.add(item.chunk_id)
         selected_sha.add(item.content_sha256)
         retained_bytes += _content_bytes(item)
         return True
 
-    add(eligible[0])
+    for document_id in required_document_ids:
+        required = next(
+            (item for item in eligible if item.document_id == document_id), None
+        )
+        if required is not None:
+            add(required)
+    if not selected:
+        add(eligible[0])
     if top_k >= 2:
-        primary_ids = {item.chunk_id for item in eligible}
         for neighbor in neighbors:
             if (
                 not neighbor.is_neighbor
-                or neighbor.neighbor_of not in primary_ids
-                or neighbor.chunk_id in primary_ids
+                or neighbor.neighbor_of not in selected_chunk_ids
             ):
                 continue
             if add(neighbor):
@@ -162,7 +190,7 @@ def select_evidence(
         add(item)
     if len(selected) < top_k:
         for neighbor in neighbors:
-            if neighbor.is_neighbor:
+            if neighbor.is_neighbor and neighbor.neighbor_of in selected_chunk_ids:
                 add(neighbor)
     return selected
 
@@ -213,13 +241,18 @@ def _read_vector_metadata(index_root: Path) -> dict[str, object]:
     return value
 
 
-def _readonly_connection(path: Path) -> sqlite3.Connection:
+def _readonly_connection(
+    path: Path, *, verify_integrity: bool = True
+) -> sqlite3.Connection:
     try:
         connection = sqlite3.connect(
             f"file:{path.as_posix()}?mode=ro&immutable=1", uri=True
         )
         connection.execute("PRAGMA query_only=ON")
-        if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
+        if (
+            verify_integrity
+            and connection.execute("PRAGMA quick_check").fetchone() != ("ok",)
+        ):
             raise HybridRetrievalError("index artifacts are invalid")
         return connection
     except HybridRetrievalError:
@@ -236,6 +269,8 @@ class HybridRetriever:
         embedding: EmbeddingBackend | None,
         dense_min: float = -1.0,
         scan_rows: int = 4096,
+        progress: Callable[..., None] | None = None,
+        verify_database_integrity: bool = True,
     ) -> None:
         root = Path(index_root)
         if (
@@ -246,22 +281,37 @@ class HybridRetriever:
             or not -1.0 <= float(dense_min) <= 1.0
             or type(scan_rows) is not int
             or scan_rows <= 0
+            or type(verify_database_integrity) is not bool
         ):
             raise HybridRetrievalError("retriever configuration is invalid")
         metadata = _read_vector_metadata(root)
         database = root / "metadata.sqlite3"
         vectors = root / "vectors.f16"
         try:
+            if progress is not None:
+                progress("retriever-integrity", 0, 2)
+            matrix_sha256 = _sha256_file(vectors)
+            if progress is not None:
+                progress("retriever-integrity", 1, 2)
+            database_sha256 = _sha256_file(database)
+            if progress is not None:
+                progress("retriever-integrity", 2, 2)
             if (
-                metadata["matrix_sha256"] != _sha256_file(vectors)
-                or metadata["database_sha256"] != _sha256_file(database)
+                metadata["matrix_sha256"] != matrix_sha256
+                or metadata["database_sha256"] != database_sha256
                 or vectors.stat().st_size
                 != metadata["rows"] * metadata["dimensions"] * 2
             ):
                 raise HybridRetrievalError("index artifacts are invalid")
         except OSError as error:
             raise HybridRetrievalError("index artifacts are invalid") from error
-        connection = _readonly_connection(database)
+        if progress is not None:
+            progress("retriever-database", 0, 2)
+        connection = _readonly_connection(
+            database, verify_integrity=verify_database_integrity
+        )
+        if progress is not None:
+            progress("retriever-database", 1, 2)
         try:
             expected = {
                 "schema_version": "2",
@@ -275,13 +325,25 @@ class HybridRetriever:
             vector_rows = connection.execute(
                 "SELECT chunk_id, vector_row FROM chunks ORDER BY vector_row"
             ).fetchall()
-            if actual != expected or len(vector_rows) != metadata["rows"]:
+            average_token_count = connection.execute(
+                "SELECT AVG(token_count) FROM chunks"
+            ).fetchone()[0]
+            if (
+                actual != expected
+                or len(vector_rows) != metadata["rows"]
+                or average_token_count is None
+                or average_token_count <= 0
+            ):
                 raise HybridRetrievalError("index artifacts are invalid")
             if [row[1] for row in vector_rows] != list(range(metadata["rows"])):
                 raise HybridRetrievalError("index artifacts are invalid")
         finally:
             connection.close()
+        if progress is not None:
+            progress("retriever-database", 2, 2)
         if embedding is not None:
+            if progress is not None:
+                progress("retriever-embedding-check", 0, 1)
             try:
                 fingerprint = tokenizer_fingerprint(getattr(embedding, "tokenizer"))
             except (EmbeddingError, AttributeError) as error:
@@ -293,6 +355,8 @@ class HybridRetriever:
                 or fingerprint != metadata["tokenizer_sha256"]
             ):
                 raise HybridRetrievalError("embedding backend does not match index")
+            if progress is not None:
+                progress("retriever-embedding-check", 1, 1)
         self._root = root
         self._database = database
         self._vectors_path = vectors
@@ -301,6 +365,7 @@ class HybridRetriever:
         self._dense_min = float(dense_min)
         self._scan_rows = scan_rows
         self._row_ids = tuple(str(row[0]) for row in vector_rows)
+        self._average_token_count = float(average_token_count)
         try:
             self._vectors = np.memmap(
                 vectors,
@@ -311,21 +376,18 @@ class HybridRetriever:
         except (OSError, ValueError) as error:
             raise HybridRetrievalError("index artifacts are invalid") from error
 
-    def _lexical(self, connection: sqlite3.Connection, query: str) -> list[str]:
+    def _lexical_scored(
+        self,
+        connection: sqlite3.Connection,
+        query: str,
+        *,
+        document_ids: Sequence[str] = (),
+    ) -> list[tuple[float, str]]:
         query_terms = list(dict.fromkeys(tokenize(query)))[:64]
         if not query_terms:
             return []
         chunk_count = int(self._metadata["rows"])
-        average = connection.execute("SELECT AVG(token_count) FROM chunks").fetchone()[0]
-        if average is None or average <= 0:
-            return []
         placeholders = ",".join("?" for _ in query_terms)
-        rows = connection.execute(
-            "SELECT p.term, p.chunk_id, p.tf, c.token_count "
-            "FROM postings AS p JOIN chunks AS c USING(chunk_id) "
-            f"WHERE p.term IN ({placeholders})",
-            query_terms,
-        ).fetchall()
         frequencies = dict(
             connection.execute(
                 "SELECT term, COUNT(*) FROM postings "
@@ -333,6 +395,36 @@ class HybridRetriever:
                 query_terms,
             )
         )
+        query_terms = [
+            term
+            for term in query_terms
+            if term in frequencies
+            and not (
+                frequencies[term] >= 8
+                and frequencies[term] * 4 > chunk_count
+            )
+        ]
+        if not query_terms:
+            return []
+        placeholders = ",".join("?" for _ in query_terms)
+        if document_ids:
+            document_placeholders = ",".join("?" for _ in document_ids)
+            rows = connection.execute(
+                "SELECT p.term, p.chunk_id, p.tf, c.token_count "
+                "FROM chunks AS c INDEXED BY chunks_document "
+                "JOIN postings AS p INDEXED BY postings_chunk "
+                "ON p.chunk_id = c.chunk_id "
+                f"WHERE c.document_id IN ({document_placeholders}) "
+                f"AND p.term IN ({placeholders})",
+                [*document_ids, *query_terms],
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT p.term, p.chunk_id, p.tf, c.token_count "
+                "FROM postings AS p JOIN chunks AS c USING(chunk_id) "
+                f"WHERE p.term IN ({placeholders})",
+                query_terms,
+            ).fetchall()
         scores: dict[str, float] = defaultdict(float)
         k1 = 1.5
         b = 0.75
@@ -343,9 +435,20 @@ class HybridRetriever:
                 + (chunk_count - document_frequency + 0.5)
                 / (document_frequency + 0.5)
             )
-            denominator = frequency + k1 * (1.0 - b + b * length / average)
+            denominator = frequency + k1 * (
+                1.0 - b + b * length / self._average_token_count
+            )
             scores[str(chunk_id)] += inverse * frequency * (k1 + 1.0) / denominator
-        return sorted(scores, key=lambda chunk_id: (-scores[chunk_id], chunk_id))[:100]
+        return sorted(
+            ((score, chunk_id) for chunk_id, score in scores.items()),
+            key=lambda item: (-item[0], item[1]),
+        )
+
+    def _lexical(self, connection: sqlite3.Connection, query: str) -> list[str]:
+        return [
+            chunk_id
+            for _, chunk_id in self._lexical_scored(connection, query)[:100]
+        ]
 
     def _dense_scored(self, query: str) -> list[tuple[float, str]]:
         if self._embedding is None:
@@ -387,11 +490,16 @@ class HybridRetriever:
         ]
 
     @staticmethod
-    def _normalized_citation(query: str) -> str | None:
-        matched = _CFR_CITATION.fullmatch(query)
-        if matched is None:
-            return None
-        return f"{int(matched.group(1))} cfr {matched.group(2).casefold()}"
+    def _normalized_citations(query: str) -> tuple[str, ...]:
+        matches = tuple(
+            dict.fromkeys(
+                f"{int(matched.group(1))} cfr {matched.group(2).casefold()}"
+                for matched in _CFR_CITATION.finditer(query)
+            )
+        )
+        if len(matches) > 8:
+            raise HybridRetrievalError("query parameters are invalid")
+        return matches
 
     @staticmethod
     def _has_exact_citation(
@@ -399,8 +507,93 @@ class HybridRetriever:
     ) -> bool:
         if normalized is None:
             return False
-        rows = connection.execute("SELECT citation FROM documents").fetchall()
-        return any(str(row[0]).strip().casefold() == normalized for row in rows)
+        return connection.execute(
+            "SELECT 1 FROM documents "
+            "WHERE lower(trim(citation)) = ? LIMIT 1",
+            (normalized,),
+        ).fetchone() is not None
+
+    @staticmethod
+    def _exact_citation_inventory(
+        connection: sqlite3.Connection, normalized: Sequence[str]
+    ) -> tuple[dict[str, str], list[tuple[str, str, int]]] | None:
+        if not normalized:
+            return {}, []
+        placeholders = ",".join("?" for _ in normalized)
+        document_rows = connection.execute(
+            "SELECT lower(trim(citation)), document_id FROM documents "
+            f"WHERE lower(trim(citation)) IN ({placeholders}) "
+            "ORDER BY citation, document_id",
+            list(normalized),
+        ).fetchall()
+        by_citation: dict[str, str] = {}
+        for citation, document_id in document_rows:
+            by_citation.setdefault(str(citation), str(document_id))
+        if any(citation not in by_citation for citation in normalized):
+            return None
+        document_ids = [by_citation[citation] for citation in normalized]
+        document_placeholders = ",".join("?" for _ in document_ids)
+        chunks = [
+            (str(chunk_id), str(document_id), int(vector_row))
+            for chunk_id, document_id, vector_row in connection.execute(
+                "SELECT chunk_id, document_id, vector_row FROM chunks "
+                f"WHERE document_id IN ({document_placeholders}) "
+                "ORDER BY vector_row",
+                document_ids,
+            )
+        ]
+        if any(
+            not any(chunk[1] == document_id for chunk in chunks)
+            for document_id in document_ids
+        ):
+            raise HybridRetrievalError("index artifacts are invalid")
+        return by_citation, chunks
+
+    def _dense_scored_subset(
+        self, query: str, chunks: Sequence[tuple[str, str, int]]
+    ) -> list[tuple[float, str]]:
+        if self._embedding is None:
+            raise HybridRetrievalError("hybrid mode requires an embedding backend")
+        try:
+            query_vector = encode_normalized(
+                self._embedding,
+                [query],
+                dimensions=int(self._metadata["dimensions"]),
+            )[0]
+            indices = np.asarray([item[2] for item in chunks], dtype=np.int64)
+            block = np.asarray(self._vectors[indices], dtype=np.float32)
+            scores = block @ query_vector
+        except (EmbeddingError, IndexError, TypeError, ValueError) as error:
+            raise HybridRetrievalError("query embedding failed") from error
+        if len(scores) != len(chunks) or not np.isfinite(scores).all():
+            raise HybridRetrievalError("dense scores are invalid")
+        return sorted(
+            ((float(score), chunks[index][0]) for index, score in enumerate(scores)),
+            key=lambda item: (-item[0], item[1]),
+        )
+
+    @staticmethod
+    def _ensure_document_coverage(
+        hits: Sequence[FusedHit],
+        chunks: Sequence[tuple[str, str, int]],
+        document_ids: Sequence[str],
+    ) -> list[FusedHit]:
+        chunk_documents = {chunk_id: document_id for chunk_id, document_id, _ in chunks}
+        ordered: list[FusedHit] = []
+        selected: set[str] = set()
+        for document_id in document_ids:
+            hit = next(
+                (item for item in hits if chunk_documents.get(item.chunk_id) == document_id),
+                None,
+            )
+            if hit is None:
+                fallback = next(item for item in chunks if item[1] == document_id)
+                hit = FusedHit(fallback[0], None, None, 0.0)
+            if hit.chunk_id not in selected:
+                ordered.append(hit)
+                selected.add(hit.chunk_id)
+        ordered.extend(item for item in hits if item.chunk_id not in selected)
+        return ordered
 
     def max_dense_score(self, query: str) -> float:
         if (
@@ -469,14 +662,14 @@ class HybridRetriever:
                 )
         return primary, neighbors
 
-    def query(
+    def query_result(
         self,
         query: str,
         *,
         top_k: int,
         max_total_bytes: int,
         mode: str,
-    ) -> list[EvidenceItem]:
+    ) -> RetrievalResult:
         if (
             type(query) is not str
             or not query
@@ -489,27 +682,90 @@ class HybridRetriever:
             or mode not in {"lexical", "dense", "hybrid"}
         ):
             raise HybridRetrievalError("query parameters are invalid")
-        connection = _readonly_connection(self._database)
+        # Construction already validated this immutable database. Repeating a
+        # full quick_check for every query turns one integrity proof into an
+        # O(database size) cost on the hot path without strengthening it.
+        connection = _readonly_connection(
+            self._database, verify_integrity=False
+        )
         try:
-            lexical = self._lexical(connection, query) if mode != "dense" else []
-            dense_scores = self._dense_scored(query) if mode != "lexical" else []
-            if dense_scores and dense_scores[0][0] < self._dense_min:
-                if not self._has_exact_citation(
-                    connection, self._normalized_citation(query)
-                ):
-                    return []
+            normalized_citations = self._normalized_citations(query)
+            if len(normalized_citations) > top_k:
+                raise HybridRetrievalError("query parameters are invalid")
+            exact_inventory = self._exact_citation_inventory(
+                connection, normalized_citations
+            )
+            if exact_inventory is None:
+                return RetrievalResult([], "authoritative_no_match")
+            exact_documents, exact_chunks = exact_inventory
+            required_document_ids = [
+                exact_documents[citation] for citation in normalized_citations
+            ]
+            if exact_chunks:
+                lexical_scores = (
+                    self._lexical_scored(
+                        connection,
+                        query,
+                        document_ids=required_document_ids,
+                    )
+                    if mode != "dense"
+                    else []
+                )
+                lexical = [chunk_id for _, chunk_id in lexical_scores]
+                if mode == "lexical" and not lexical:
+                    lexical = [chunk_id for chunk_id, _, _ in exact_chunks]
+                dense_scores = (
+                    self._dense_scored_subset(query, exact_chunks)
+                    if mode != "lexical"
+                    else []
+                )
+            else:
+                lexical = self._lexical(connection, query) if mode != "dense" else []
+                dense_scores = [] if mode == "lexical" else self._dense_scored(query)
+            if (
+                dense_scores
+                and dense_scores[0][0] < self._dense_min
+                and not normalized_citations
+            ):
+                return RetrievalResult([], "no_match")
             dense = [chunk_id for _, chunk_id in dense_scores]
-            hits = reciprocal_rank_fusion(lexical, dense, constant=60)
+            # The dense weight was selected only on the frozen development
+            # split. It improves cross-language/paraphrase ranking while BM25
+            # remains available for exact terminology and citation matching.
+            hits = reciprocal_rank_fusion(
+                lexical, dense, constant=60, dense_weight=3.0
+            )
+            if exact_chunks:
+                hits = self._ensure_document_coverage(
+                    hits, exact_chunks, required_document_ids
+                )
             primary, neighbors = self._evidence(connection, hits)
-            return select_evidence(
+            selected = select_evidence(
                 primary,
                 neighbors,
                 top_k=top_k,
                 max_total_bytes=max_total_bytes,
+                required_document_ids=required_document_ids,
             )
+            return RetrievalResult(selected, "matched" if selected else "no_match")
         except HybridRetrievalError:
             raise
         except (sqlite3.Error, UnicodeError, ValueError, TypeError) as error:
             raise HybridRetrievalError("retrieval query failed") from error
         finally:
             connection.close()
+
+    def query(
+        self,
+        query: str,
+        *,
+        top_k: int,
+        max_total_bytes: int,
+        mode: str,
+    ) -> list[EvidenceItem]:
+        return self.query_result(
+            query,
+            top_k=top_k,
+            max_total_bytes=max_total_bytes,
+            mode=mode,
+        ).items

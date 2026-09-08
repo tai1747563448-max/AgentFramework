@@ -88,6 +88,7 @@ add_library(agent_runtime STATIC
     src/adapters/process/reproc_jsonl_process.cpp
     src/adapters/rag/python_rag_knowledge_provider.cpp
     src/adapters/rag/rag_protocol.cpp
+    src/adapters/rag/native_rag_pack_verifier.cpp
     src/adapters/rag/persistent_rag_knowledge_provider.cpp
     src/adapters/build/cmake_tool_gateway.cpp
     src/adapters/tools/composite_tool_gateway.cpp
@@ -272,6 +273,9 @@ target_compile_definitions(reproc_jsonl_process_tests PRIVATE
     AGENT_JSONL_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/rag/tests/jsonl_sidecar_fixture.py")
 add_agent_test(rag_protocol_tests tests/adapters/rag_protocol_test.cpp)
 target_link_libraries(rag_protocol_tests PRIVATE agent_runtime)
+add_agent_test(native_rag_pack_verifier_tests
+    tests/adapters/native_rag_pack_verifier_test.cpp)
+target_link_libraries(native_rag_pack_verifier_tests PRIVATE agent_runtime)
 add_agent_test(persistent_rag_knowledge_provider_tests
     tests/adapters/persistent_rag_knowledge_provider_test.cpp)
 target_link_libraries(persistent_rag_knowledge_provider_tests PRIVATE agent_runtime)

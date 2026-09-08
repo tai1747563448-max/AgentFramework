@@ -2,6 +2,7 @@
 #include "adapters/rag/rag_protocol.h"
 #include "adapters/workspace/workspace_text.h"
 #include "ports/jsonl_process.h"
+#include "ports/rag_pack_verifier.h"
 #include "test_support.h"
 
 #include <nlohmann/json.hpp>
@@ -22,6 +23,7 @@ std::string ready_line() {
          {"op", "ready"},
          {"payload",
           {{"pack_id", "pack-cccccccccccccccccccccccccccccccc"},
+           {"retrieval_revision", "retrieval-" + std::string(64, 'e')},
            {"snapshot_date", "2026-09-03"},
            {"document_count", 30'000},
            {"chunk_count", 45'000},
@@ -40,7 +42,8 @@ std::string query_line(const std::string& request_line) {
          {"request_id", request.at("request_id")},
          {"op", "query_result"},
          {"payload",
-          {{"items",
+          {{"outcome", "matched"},
+           {"items",
             nlohmann::json::array(
                 {{{"source_id", "doc-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-chunk-0000000000000001"},
                   {"content", content},
@@ -53,6 +56,7 @@ std::string query_line(const std::string& request_line) {
                     {"official_url", "https://www.ecfr.gov/on/2026-09-03/title-40/section-60.1"},
                     {"content_sha256", agent::workspace::sha256_hex(content)},
                     {"document_sha256", std::string(64, 'b')},
+                    {"retrieval_revision", "retrieval-" + std::string(64, 'e')},
                     {"bm25_rank", 1},
                     {"dense_rank", 2},
                     {"fusion_score", 0.03},
@@ -113,6 +117,23 @@ public:
     std::vector<std::int64_t> timeouts;
 };
 
+class FakeRagPackVerifier final : public agent::RagPackVerifier {
+public:
+    agent::Result<void> verify_executable_payload(
+        const std::filesystem::path& root) override {
+        ++verify_count;
+        roots.push_back(root);
+        if (error.has_value()) {
+            return agent::Result<void>::failure(*error);
+        }
+        return agent::Result<void>::success();
+    }
+
+    int verify_count{0};
+    std::vector<std::filesystem::path> roots;
+    std::optional<agent::RuntimeError> error;
+};
+
 agent::RagConfig config() {
     agent::RagConfig result;
     result.enabled = true;
@@ -136,7 +157,9 @@ agent::TaskState state(std::string issue = "What does 40 CFR 60.1 say?") {
 
 TEST_CASE(persistent_rag_provider_starts_lazily_and_reuses_one_process) {
     fixtures::FakeJsonlProcess process;
-    agent::PersistentRagKnowledgeProvider provider(process, fixtures::config());
+    fixtures::FakeRagPackVerifier verifier;
+    agent::PersistentRagKnowledgeProvider provider(
+        process, verifier, fixtures::config());
     REQUIRE(process.start_count == 0);
 
     const auto first = provider.retrieve(fixtures::state());
@@ -145,8 +168,10 @@ TEST_CASE(persistent_rag_provider_starts_lazily_and_reuses_one_process) {
     REQUIRE(first.has_value());
     REQUIRE(second.has_value());
     REQUIRE(process.start_count == 1);
+    REQUIRE(verifier.verify_count == 1);
     REQUIRE(process.exchange_count == 2);
     REQUIRE(process.starts.front().startup_timeout_ms == 120'000);
+    REQUIRE(process.starts.front().arguments.front() == "-B");
     REQUIRE(process.starts.front().arguments.size() >= 2);
     REQUIRE(process.starts.front().arguments[process.starts.front().arguments.size() - 2] ==
             "--device");
@@ -166,30 +191,38 @@ TEST_CASE(persistent_rag_provider_skips_commands_and_explicit_opt_out) {
                               u8"不要用 RAG", "Do not use RAG for this answer",
                               "don't use the knowledge base"}) {
         fixtures::FakeJsonlProcess process;
-        agent::PersistentRagKnowledgeProvider provider(process, fixtures::config());
+        fixtures::FakeRagPackVerifier verifier;
+        agent::PersistentRagKnowledgeProvider provider(
+            process, verifier, fixtures::config());
         const auto result = provider.retrieve(fixtures::state(issue));
         REQUIRE(result.has_value());
         REQUIRE(result.value().items.empty());
         REQUIRE(process.start_count == 0);
         REQUIRE(process.exchange_count == 0);
+        REQUIRE(verifier.verify_count == 0);
     }
 }
 
 TEST_CASE(persistent_rag_provider_restarts_only_after_prequery_crash) {
     fixtures::FakeJsonlProcess process;
-    agent::PersistentRagKnowledgeProvider provider(process, fixtures::config());
+    fixtures::FakeRagPackVerifier verifier;
+    agent::PersistentRagKnowledgeProvider provider(
+        process, verifier, fixtures::config());
     REQUIRE(provider.retrieve(fixtures::state()).has_value());
     process.crash();
     REQUIRE(provider.retrieve(fixtures::state("after crash")).has_value());
     REQUIRE(process.start_count == 2);
+    REQUIRE(verifier.verify_count == 2);
     REQUIRE(process.exchange_count == 2);
 }
 
 TEST_CASE(persistent_rag_provider_does_not_replay_inflight_failure) {
     fixtures::FakeJsonlProcess process;
+    fixtures::FakeRagPackVerifier verifier;
     process.exchange_error = agent::RuntimeError{
         agent::ErrorCode::RequestTimeout, "SENTINEL raw error", true};
-    agent::PersistentRagKnowledgeProvider provider(process, fixtures::config());
+    agent::PersistentRagKnowledgeProvider provider(
+        process, verifier, fixtures::config());
 
     const auto result = provider.retrieve(fixtures::state());
 
@@ -203,13 +236,33 @@ TEST_CASE(persistent_rag_provider_does_not_replay_inflight_failure) {
 
 TEST_CASE(persistent_rag_provider_maps_malformed_handshake_and_stops_on_destroy) {
     fixtures::FakeJsonlProcess process;
+    fixtures::FakeRagPackVerifier verifier;
     process.ready = R"({"schema_version":2,"request_id":"wrong"})";
     {
-        agent::PersistentRagKnowledgeProvider provider(process, fixtures::config());
+        agent::PersistentRagKnowledgeProvider provider(
+            process, verifier, fixtures::config());
         const auto result = provider.retrieve(fixtures::state());
         REQUIRE(!result.has_value());
         REQUIRE(result.error().code == agent::ErrorCode::ProtocolFailure);
         REQUIRE(result.error().message == "invalid rag protocol response");
     }
     REQUIRE(process.stop_count >= 1);
+}
+
+TEST_CASE(persistent_rag_provider_never_starts_unverified_payload) {
+    fixtures::FakeJsonlProcess process;
+    fixtures::FakeRagPackVerifier verifier;
+    verifier.error = agent::RuntimeError{
+        agent::ErrorCode::DependencyUnavailable,
+        "rag executable payload integrity check failed", false};
+    agent::PersistentRagKnowledgeProvider provider(
+        process, verifier, fixtures::config());
+
+    const auto result = provider.retrieve(fixtures::state());
+
+    REQUIRE(!result.has_value());
+    REQUIRE(result.error().message ==
+            "rag executable payload integrity check failed");
+    REQUIRE(verifier.verify_count == 1);
+    REQUIRE(process.start_count == 0);
 }

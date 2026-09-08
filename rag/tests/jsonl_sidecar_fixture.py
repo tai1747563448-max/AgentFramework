@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import getpass
 from pathlib import Path
 import subprocess
 import sys
@@ -61,6 +62,13 @@ def main(arguments: list[str]) -> int:
         )
         ready(arguments[1:])
         return echo_loop()
+    if mode == "getpass":
+        try:
+            getpass.getuser()
+        except Exception:
+            return 66
+        ready([])
+        return echo_loop()
     ready(arguments[1:])
     if mode == "echo":
         return echo_loop()
@@ -68,6 +76,59 @@ def main(arguments: list[str]) -> int:
         return echo_loop(delay_ms=int(arguments[1]))
     if mode == "stderr-spam" and len(arguments) == 2:
         return echo_loop(stderr_bytes=int(arguments[1]))
+    if mode == "progress":
+        progress = {
+            "schema_version": 1,
+            "type": "progress",
+            "phase": "sidecar-model",
+            "mode": "sidecar",
+            "status": "running",
+            "completed": 1,
+            "total": 2,
+            "percent": 50.0,
+            "elapsed_seconds": 3.0,
+            "throughput_items_per_second": 0.333,
+            "eta_seconds": 3.0,
+        }
+        sys.stderr.write(json.dumps(progress, separators=(",", ":")) + "\n")
+        progress["secret"] = "SENTINEL"
+        sys.stderr.write(json.dumps(progress, separators=(",", ":")) + "\n")
+        sys.stderr.flush()
+        return echo_loop()
+    if mode == "invalid-progress":
+        progress = {
+            "schema_version": 1,
+            "type": "progress",
+            "phase": "sidecar-model",
+            "mode": "sidecar",
+            "status": "completed",
+            "completed": 1,
+            "total": 2,
+            "percent": 73.0,
+            "elapsed_seconds": 3.0,
+            "throughput_items_per_second": 0.333,
+            "eta_seconds": 3.0,
+        }
+        sys.stderr.write(json.dumps(progress, separators=(",", ":")) + "\n")
+        sys.stderr.flush()
+        return echo_loop()
+    if mode == "oversized-progress-prefix":
+        progress = {
+            "schema_version": 1,
+            "type": "progress",
+            "phase": "sidecar-model",
+            "mode": "sidecar",
+            "status": "running",
+            "completed": 1,
+            "total": 2,
+            "percent": 50.0,
+            "elapsed_seconds": 3.0,
+            "throughput_items_per_second": 0.333,
+            "eta_seconds": 3.0,
+        }
+        sys.stderr.write("x" * 2049 + json.dumps(progress, separators=(",", ":")) + "\n")
+        sys.stderr.flush()
+        return echo_loop()
     if mode == "oversized" and len(arguments) == 2:
         return echo_loop(oversized=int(arguments[1]))
     if mode == "unexpected-exit":

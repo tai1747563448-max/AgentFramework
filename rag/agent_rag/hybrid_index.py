@@ -9,7 +9,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import tempfile
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 import uuid
 
 import numpy as np
@@ -359,6 +359,7 @@ def build_index_from_chunks(
     embedding: EmbeddingBackend,
     *,
     batch_size: int = 16,
+    progress: Callable[..., None] | None = None,
 ) -> IndexBuildSummary:
     root = Path(index_root)
     if not root.is_absolute() or type(batch_size) is not int or batch_size <= 0:
@@ -377,6 +378,8 @@ def build_index_from_chunks(
     pending_positions: list[int] = []
     pending_texts: list[str] = []
     reused = 0
+    if progress is not None:
+        progress("index-reuse", 0, len(ordered))
     for position, chunk in enumerate(ordered):
         embedding_sha256 = _sha256_bytes(chunk.embedding_text.encode("utf-8"))
         previous = reusable.get(chunk.chunk_id)
@@ -386,18 +389,35 @@ def build_index_from_chunks(
         else:
             pending_positions.append(position)
             pending_texts.append(chunk.embedding_text)
+        if progress is not None:
+            progress("index-reuse", position + 1, len(ordered))
     if pending_texts:
-        try:
-            encoded = encode_normalized(
-                embedding,
-                pending_texts,
-                dimensions=dimensions,
-                batch_size=batch_size,
-            )
-        except EmbeddingError as error:
-            raise HybridIndexError("embedding failed") from error
-        for position, row in zip(pending_positions, encoded, strict=True):
-            vectors[position] = row
+        if progress is not None:
+            progress("index-embedding", 0, len(pending_texts), mode="dense")
+        block_size = batch_size * 8
+        for block_start in range(0, len(pending_texts), block_size):
+            block_texts = pending_texts[block_start : block_start + block_size]
+            try:
+                encoded = encode_normalized(
+                    embedding,
+                    block_texts,
+                    dimensions=dimensions,
+                    batch_size=batch_size,
+                )
+            except EmbeddingError as error:
+                raise HybridIndexError("embedding failed") from error
+            block_positions = pending_positions[
+                block_start : block_start + len(block_texts)
+            ]
+            for position, row in zip(block_positions, encoded, strict=True):
+                vectors[position] = row
+            if progress is not None:
+                progress(
+                    "index-embedding",
+                    block_start + len(block_texts),
+                    len(pending_texts),
+                    mode="dense",
+                )
     parent = root.parent
     parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{root.name}-build-", dir=parent))
@@ -405,6 +425,8 @@ def build_index_from_chunks(
         database = staging / "metadata.sqlite3"
         matrix_path = staging / "vectors.f16"
         metadata_path = staging / "vectors.json"
+        if progress is not None:
+            progress("index-database", 0, 1)
         _write_database(
             database,
             documents,
@@ -414,6 +436,9 @@ def build_index_from_chunks(
             dimensions=dimensions,
             tokenizer_sha256=tokenizer_sha256,
         )
+        if progress is not None:
+            progress("index-database", 1, 1)
+            progress("index-vectors", 0, 1)
         little_endian = np.asarray(vectors, dtype="<f2")
         with matrix_path.open("xb") as stream:
             stream.write(little_endian.tobytes(order="C"))
@@ -439,6 +464,8 @@ def build_index_from_chunks(
             stream.flush()
             os.fsync(stream.fileno())
         _publish_directory(staging, root)
+        if progress is not None:
+            progress("index-vectors", 1, 1)
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise
@@ -457,7 +484,9 @@ def build_index_from_chunks(
     )
 
 
-def _load_document_sources(pack_root: Path) -> list[DocumentSource]:
+def _load_document_sources(
+    pack_root: Path, progress: Callable[..., None] | None = None
+) -> list[DocumentSource]:
     manifest_path = pack_root / "manifest" / "documents.jsonl"
     try:
         lines = manifest_path.read_text(encoding="utf-8").splitlines()
@@ -466,7 +495,9 @@ def _load_document_sources(pack_root: Path) -> list[DocumentSource]:
     if not lines:
         raise HybridIndexError("document manifest is empty")
     sources: list[DocumentSource] = []
-    for line in lines:
+    if progress is not None:
+        progress("index-load-documents", 0, len(lines))
+    for completed, line in enumerate(lines, start=1):
         try:
             record = json.loads(line)
             relative = record["path"]
@@ -495,6 +526,8 @@ def _load_document_sources(pack_root: Path) -> list[DocumentSource]:
                     body_start_line=markdown.count("\n", 0, body_start) + 1,
                 )
             )
+            if progress is not None:
+                progress("index-load-documents", completed, len(lines))
         except HybridIndexError:
             raise
         except (OSError, UnicodeError, ValueError, TypeError, KeyError) as error:
@@ -508,6 +541,7 @@ def build_hybrid_index(
     *,
     device: str,
     batch_size: int = 16,
+    progress: Callable[..., None] | None = None,
 ) -> IndexBuildSummary:
     root = Path(pack_root)
     if (
@@ -519,8 +553,15 @@ def build_hybrid_index(
         or getattr(embedding, "dimensions", None) != EMBEDDING_DIMENSIONS
     ):
         raise HybridIndexError("hybrid index configuration is invalid")
-    sources = _load_document_sources(root)
-    chunks = chunk_documents(sources, getattr(embedding, "tokenizer"))
+    sources = _load_document_sources(root, progress)
+    chunks = chunk_documents(
+        sources, getattr(embedding, "tokenizer"), progress=progress
+    )
     return build_index_from_chunks(
-        root / "index", sources, chunks, embedding, batch_size=batch_size
+        root / "index",
+        sources,
+        chunks,
+        embedding,
+        batch_size=batch_size,
+        progress=progress,
     )

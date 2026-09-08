@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 from pathlib import Path
+import sqlite3
 import sys
 
 import numpy as np
@@ -22,6 +23,7 @@ from agent_rag.hybrid_retriever import (  # type: ignore[import-not-found]
     reciprocal_rank_fusion,
     select_evidence,
 )
+from agent_rag import hybrid_retriever as hybrid_retriever_module  # type: ignore[import-not-found]
 
 
 class WordTokenizer:
@@ -110,6 +112,7 @@ def _evidence(
     document_id: str = "doc-a",
     sha256: str | None = None,
     is_neighbor: bool = False,
+    neighbor_of: str | None = None,
 ) -> EvidenceItem:
     return EvidenceItem(
         chunk_id=chunk_id,
@@ -127,7 +130,7 @@ def _evidence(
         dense_rank=1,
         fusion_score=0.1,
         is_neighbor=is_neighbor,
-        neighbor_of="primary" if is_neighbor else None,
+        neighbor_of=(neighbor_of or "primary") if is_neighbor else None,
     )
 
 
@@ -156,6 +159,21 @@ def test_rrf_fuses_lexical_and_dense_with_constant_60() -> None:
     assert ranked[0].score == pytest.approx(1 / 62 + 1 / 61)
 
 
+def test_rrf_can_apply_a_validated_dense_weight() -> None:
+    ranked = reciprocal_rank_fusion(
+        ["lexical", "shared"],
+        ["dense", "shared"],
+        constant=60,
+        dense_weight=3.0,
+    )
+
+    assert [item.chunk_id for item in ranked] == ["shared", "dense", "lexical"]
+    assert ranked[0].score == pytest.approx(1 / 62 + 3 / 62)
+    assert ranked[1].score == pytest.approx(3 / 61)
+    with pytest.raises(HybridRetrievalError, match="RRF constant"):
+        reciprocal_rank_fusion([], [], dense_weight=float("nan"))
+
+
 def test_evidence_selection_preserves_primary_and_budget() -> None:
     primary = [_evidence("p1", "primary one"), _evidence("p2", "primary two")]
     neighbors = [_evidence("n1", "neighbor", is_neighbor=True)]
@@ -164,6 +182,23 @@ def test_evidence_selection_preserves_primary_and_budget() -> None:
 
     assert any(not item.is_neighbor for item in items)
     assert sum(len(item.content.encode("utf-8")) for item in items) <= 100
+
+
+def test_evidence_selection_never_emits_an_orphan_neighbor() -> None:
+    primary = [_evidence("p1", "primary one"), _evidence("p2", "primary two")]
+    neighbors = [
+        _evidence("n1", "linked neighbor", is_neighbor=True, neighbor_of="p1"),
+        _evidence("n2", "orphan neighbor", is_neighbor=True, neighbor_of="missing"),
+    ]
+
+    items = select_evidence(primary, neighbors, top_k=4, max_total_bytes=100)
+
+    selected_ids = {item.chunk_id for item in items}
+    assert "n1" in selected_ids
+    assert "n2" not in selected_ids
+    assert all(
+        not item.is_neighbor or item.neighbor_of in selected_ids for item in items
+    )
 
 
 def test_evidence_dedupes_sha_and_caps_two_primary_hits_per_document() -> None:
@@ -193,7 +228,14 @@ def test_lexical_mode_does_not_call_embedding_and_returns_source_metadata(
     tmp_path: Path,
 ) -> None:
     root, backend, _ = _built(tmp_path)
-    retriever = HybridRetriever(root, embedding=backend)
+    progress: list[tuple[str, int, int]] = []
+    retriever = HybridRetriever(
+        root,
+        embedding=backend,
+        progress=lambda phase, completed, total, **_: progress.append(
+            (phase, completed, total)
+        ),
+    )
 
     items = retriever.query("alpha legal", top_k=3, max_total_bytes=1024, mode="lexical")
 
@@ -202,6 +244,102 @@ def test_lexical_mode_does_not_call_embedding_and_returns_source_metadata(
     assert items[0].lexical_rank == 1
     assert items[0].dense_rank is None
     assert items[0].official_url.startswith("https://www.ecfr.gov/")
+    assert progress == [
+        ("retriever-integrity", 0, 2),
+        ("retriever-integrity", 1, 2),
+        ("retriever-integrity", 2, 2),
+        ("retriever-database", 0, 2),
+        ("retriever-database", 1, 2),
+        ("retriever-database", 2, 2),
+        ("retriever-embedding-check", 0, 1),
+        ("retriever-embedding-check", 1, 1),
+    ]
+
+
+def test_lexical_posting_scan_excludes_high_frequency_terms(tmp_path: Path) -> None:
+    documents: list[DocumentSource] = []
+    chunks: list[ChunkRecord] = []
+    for index in range(8):
+        document = _document(
+            f"doc-{index:032x}",
+            f"{index + 1} CFR {index + 1}.1",
+        )
+        documents.append(document)
+        chunks.append(
+            _chunk(
+                document,
+                f"{index:x}",
+                "common rare beta" if index == 0 else "common beta",
+            )
+        )
+    backend = KeywordEmbedding()
+    root = build_index_from_chunks(
+        tmp_path / "index", documents, chunks, backend
+    ).database.parent
+    retriever = HybridRetriever(root, embedding=backend)
+    statements: list[str] = []
+    with sqlite3.connect(root / "metadata.sqlite3") as connection:
+        connection.set_trace_callback(statements.append)
+        ranked = retriever._lexical(connection, "common rare")
+
+    posting_scans = [
+        statement for statement in statements if "FROM postings AS p" in statement
+    ]
+    assert len(posting_scans) == 1
+    assert "'rare'" in posting_scans[0]
+    assert "'common'" not in posting_scans[0]
+    assert ranked[0] == chunks[0].chunk_id
+
+
+def test_lexical_query_does_not_recompute_average_chunk_length(tmp_path: Path) -> None:
+    root, backend, _ = _built(tmp_path)
+    retriever = HybridRetriever(root, embedding=backend)
+    statements: list[str] = []
+    with sqlite3.connect(root / "metadata.sqlite3") as connection:
+        connection.set_trace_callback(statements.append)
+        retriever._lexical(connection, "alpha")
+
+    assert not any("AVG(token_count)" in statement for statement in statements)
+
+
+def test_integrity_check_runs_at_open_not_again_for_each_query(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, backend, _ = _built(tmp_path)
+    original = hybrid_retriever_module._readonly_connection
+    checks: list[bool] = []
+
+    def tracked(path: Path, *, verify_integrity: bool = True):
+        checks.append(verify_integrity)
+        return original(path, verify_integrity=verify_integrity)
+
+    monkeypatch.setattr(hybrid_retriever_module, "_readonly_connection", tracked)
+    retriever = HybridRetriever(root, embedding=backend)
+    retriever.query("alpha", top_k=3, max_total_bytes=1024, mode="lexical")
+
+    assert checks == [True, False]
+
+
+def test_preverified_database_can_skip_duplicate_open_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, backend, _ = _built(tmp_path)
+    original = hybrid_retriever_module._readonly_connection
+    checks: list[bool] = []
+
+    def tracked(path: Path, *, verify_integrity: bool = True):
+        checks.append(verify_integrity)
+        return original(path, verify_integrity=verify_integrity)
+
+    monkeypatch.setattr(hybrid_retriever_module, "_readonly_connection", tracked)
+    retriever = HybridRetriever(
+        root,
+        embedding=backend,
+        verify_database_integrity=False,
+    )
+    retriever.query("alpha", top_k=3, max_total_bytes=1024, mode="lexical")
+
+    assert checks == [False, False]
 
 
 def test_hybrid_dense_and_lexical_fusion_is_repeatable(tmp_path: Path) -> None:
@@ -242,6 +380,124 @@ def test_dense_no_answer_gate_fails_closed_but_exact_citation_bypasses_it(
     )
     assert cited
     assert cited[0].citation == "1 CFR 1.1"
+    assert all(item.citation == "1 CFR 1.1" for item in cited)
+    assert backend.calls == 2
+
+
+def test_single_citation_inside_natural_language_uses_exact_route(
+    tmp_path: Path,
+) -> None:
+    root, backend, _ = _built(tmp_path)
+    retriever = HybridRetriever(root, embedding=backend, dense_min=0.9)
+
+    cited = retriever.query(
+        "请根据知识库说明 1 CFR 1.1 的要求和官方 URL。",
+        top_k=3,
+        max_total_bytes=1024,
+        mode="hybrid",
+    )
+
+    assert cited
+    assert all(item.citation == "1 CFR 1.1" for item in cited)
+    assert backend.calls == 1
+
+
+def test_missing_single_citation_fails_closed_without_semantic_fallback(
+    tmp_path: Path,
+) -> None:
+    root, backend, _ = _built(tmp_path)
+    retriever = HybridRetriever(root, embedding=backend)
+
+    for mode in ("lexical", "dense", "hybrid"):
+        result = retriever.query_result(
+            "根据美国联邦法规，21 CFR 11.10 对封闭系统有哪些控制要求？",
+            top_k=3,
+            max_total_bytes=1024,
+            mode=mode,
+        )
+
+        assert result.items == []
+        assert result.outcome == "authoritative_no_match"
+    assert backend.calls == 0
+
+
+def test_multiple_distinct_citations_are_all_covered_by_exact_route(
+    tmp_path: Path,
+) -> None:
+    root, backend, _ = _built(tmp_path)
+    retriever = HybridRetriever(root, embedding=backend)
+
+    items = retriever.query(
+        "Compare 1 CFR 1.1 and 2 CFR 2.1.",
+        top_k=3,
+        max_total_bytes=1024,
+        mode="hybrid",
+    )
+
+    assert {item.citation for item in items} == {"1 CFR 1.1", "2 CFR 2.1"}
+    assert backend.calls == 1
+
+
+@pytest.mark.parametrize("mode", ["lexical", "dense", "hybrid"])
+def test_multiple_citations_fail_closed_when_any_one_is_missing(
+    tmp_path: Path, mode: str
+) -> None:
+    root, backend, _ = _built(tmp_path)
+    retriever = HybridRetriever(root, embedding=backend)
+
+    result = retriever.query_result(
+        "Compare 1 CFR 1.1 and 21 CFR 11.10.",
+        top_k=3,
+        max_total_bytes=1024,
+        mode=mode,
+    )
+
+    assert result.items == []
+    assert result.outcome == "authoritative_no_match"
+    assert backend.calls == 0
+
+
+@pytest.mark.parametrize("mode", ["lexical", "hybrid"])
+def test_exact_route_can_rank_a_relevant_chunk_after_the_first_hundred(
+    tmp_path: Path, mode: str
+) -> None:
+    document = _document("doc-cccccccccccccccccccccccccccccccc", "3 CFR 3.1")
+    chunks = [
+        _chunk(
+            document,
+            f"{index:04x}",
+            "target alpha requirement" if index == 119 else f"beta boilerplate {index}",
+        )
+        for index in range(120)
+    ]
+    backend = KeywordEmbedding()
+    root = build_index_from_chunks(
+        tmp_path / "index", [document], chunks, backend
+    ).database.parent
+    backend.calls = 0
+    retriever = HybridRetriever(root, embedding=backend)
+
+    items = retriever.query(
+        "What is the target alpha requirement in 3 CFR 3.1?",
+        top_k=2,
+        max_total_bytes=1024,
+        mode=mode,
+    )
+
+    assert any("target alpha requirement" in item.content for item in items)
+
+
+def test_explicit_citation_count_must_fit_evidence_top_k(tmp_path: Path) -> None:
+    root, backend, _ = _built(tmp_path)
+    retriever = HybridRetriever(root, embedding=backend)
+
+    with pytest.raises(HybridRetrievalError, match="query parameters"):
+        retriever.query(
+            "Compare 1 CFR 1.1 and 2 CFR 2.1.",
+            top_k=1,
+            max_total_bytes=1024,
+            mode="hybrid",
+        )
 
 
 @pytest.mark.parametrize(

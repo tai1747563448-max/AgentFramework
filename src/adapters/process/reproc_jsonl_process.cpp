@@ -2,6 +2,7 @@
 
 #include "adapters/workspace/workspace_text.h"
 
+#include <nlohmann/json.hpp>
 #include <reproc++/reproc.hpp>
 
 #if defined(_WIN32)
@@ -12,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
@@ -19,6 +21,8 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -83,7 +87,8 @@ std::map<std::string, std::string> safe_environment() {
         "COMSPEC",       "TEMP",         "TMP",        "USERPROFILE",
         "HOMEDRIVE",     "HOMEPATH",     "APPDATA",    "LOCALAPPDATA",
         "PROGRAMDATA",   "PROGRAMFILES", "NUMBER_OF_PROCESSORS",
-        "PROCESSOR_ARCHITECTURE",          "OS",         "SYSTEMDRIVE"};
+        "PROCESSOR_ARCHITECTURE",          "OS",         "SYSTEMDRIVE",
+        "USERNAME"};
     std::map<std::string, std::string> result;
     for (const auto* name : names) {
         const char* value = std::getenv(name);
@@ -94,10 +99,101 @@ std::map<std::string, std::string> safe_environment() {
     return result;
 }
 
+bool progress_identifier(const std::string& value) {
+    if (value.empty() || value.size() > 64 || value.front() < 'a' ||
+        value.front() > 'z') {
+        return false;
+    }
+    return std::all_of(value.begin() + 1, value.end(), [](unsigned char byte) {
+        return (byte >= 'a' && byte <= 'z') ||
+               (byte >= '0' && byte <= '9') || byte == '.' || byte == '_' ||
+               byte == '-';
+    });
+}
+
+std::optional<std::string> safe_progress_message(const std::string& line) {
+    try {
+        if (line.empty() || line.size() > 2'048 ||
+            !workspace::is_strict_utf8_text(line)) {
+            return std::nullopt;
+        }
+        const auto value = nlohmann::json::parse(line);
+        static constexpr const char* fields[] = {
+            "schema_version", "type", "phase", "mode", "status",
+            "completed", "total", "percent", "elapsed_seconds",
+            "throughput_items_per_second", "eta_seconds"};
+        if (!value.is_object() || value.size() != std::size(fields)) {
+            return std::nullopt;
+        }
+        for (const auto* field : fields) {
+            if (!value.contains(field)) return std::nullopt;
+        }
+        if (!value.at("schema_version").is_number_integer() ||
+            value.at("schema_version").get<std::int64_t>() != 1 ||
+            !value.at("type").is_string() ||
+            value.at("type").get_ref<const std::string&>() != "progress" ||
+            !value.at("phase").is_string() ||
+            !progress_identifier(
+                value.at("phase").get_ref<const std::string&>()) ||
+            !value.at("mode").is_string() ||
+            value.at("mode").get_ref<const std::string&>() != "sidecar" ||
+            !value.at("status").is_string() ||
+            !value.at("completed").is_number_integer() ||
+            !value.at("total").is_number_integer() ||
+            !value.at("percent").is_number() ||
+            !value.at("elapsed_seconds").is_number() ||
+            !value.at("throughput_items_per_second").is_number()) {
+            return std::nullopt;
+        }
+        const auto status = value.at("status").get<std::string>();
+        const auto completed = value.at("completed").get<std::int64_t>();
+        const auto total = value.at("total").get<std::int64_t>();
+        const auto percent = value.at("percent").get<double>();
+        const auto elapsed = value.at("elapsed_seconds").get<double>();
+        const auto throughput =
+            value.at("throughput_items_per_second").get<double>();
+        const auto expected_percent =
+            static_cast<double>(completed) * 100.0 /
+            static_cast<double>(total);
+        if ((status != "running" && status != "completed" &&
+             status != "failed") ||
+            completed < 0 || total <= 0 || completed > total ||
+            !std::isfinite(percent) || percent < 0.0 || percent > 100.0 ||
+            std::abs(percent - expected_percent) > 0.001 ||
+            !std::isfinite(elapsed) || elapsed < 0.0 ||
+            !std::isfinite(throughput) || throughput < 0.0 ||
+            (status == "completed" && completed != total) ||
+            (status == "running" && completed == total)) {
+            return std::nullopt;
+        }
+        std::optional<double> eta;
+        if (!value.at("eta_seconds").is_null()) {
+            if (!value.at("eta_seconds").is_number()) return std::nullopt;
+            eta = value.at("eta_seconds").get<double>();
+            if (!std::isfinite(*eta) || *eta < 0.0) return std::nullopt;
+        }
+        if ((status != "running" || completed == total) && eta.has_value()) {
+            return std::nullopt;
+        }
+        std::ostringstream message;
+        message << "RAG " << value.at("phase").get<std::string>() << ' '
+                << status << ": " << completed << '/' << total << " ("
+                << percent << "%), elapsed " << elapsed << 's';
+        message << ", throughput " << throughput << " items/s";
+        if (eta.has_value()) message << ", ETA " << *eta << 's';
+        return message.str();
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
 }  // namespace
 
 class ReprocJsonlProcess::Impl final {
 public:
+    explicit Impl(std::function<void(const std::string&)> progress_observer)
+        : progress_observer_(std::move(progress_observer)) {}
+
     ~Impl() { stop_noexcept(500); }
 
     Result<std::string> start(const JsonlProcessRequest& request) {
@@ -115,6 +211,8 @@ public:
             outbound_lines_.clear();
             outbound_offset_ = 0;
             stderr_bytes_.clear();
+            stderr_line_buffer_.clear();
+            stderr_line_discarded_ = false;
             stderr_truncated_ = false;
             protocol_failed_ = false;
             exited_ = false;
@@ -273,13 +371,46 @@ private:
     }
 
     void append_stderr(const std::uint8_t* bytes, std::size_t size) {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        for (std::size_t index = 0; index < size; ++index) {
-            if (stderr_bytes_.size() == max_stderr_bytes_) {
-                stderr_bytes_.pop_front();
-                stderr_truncated_ = true;
+        std::vector<std::string> progress_messages;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            for (std::size_t index = 0; index < size; ++index) {
+                const char byte = static_cast<char>(bytes[index]);
+                if (stderr_bytes_.size() == max_stderr_bytes_) {
+                    stderr_bytes_.pop_front();
+                    stderr_truncated_ = true;
+                }
+                stderr_bytes_.push_back(byte);
+                if (byte == '\n') {
+                    if (!stderr_line_discarded_ &&
+                        !stderr_line_buffer_.empty() &&
+                        stderr_line_buffer_.back() == '\r') {
+                        stderr_line_buffer_.pop_back();
+                    }
+                    if (!stderr_line_discarded_) {
+                        auto message = safe_progress_message(stderr_line_buffer_);
+                        if (message.has_value()) {
+                            progress_messages.push_back(std::move(*message));
+                        }
+                    }
+                    stderr_line_buffer_.clear();
+                    stderr_line_discarded_ = false;
+                } else if (!stderr_line_discarded_ &&
+                           stderr_line_buffer_.size() < 2'048) {
+                    stderr_line_buffer_.push_back(byte);
+                } else {
+                    stderr_line_buffer_.clear();
+                    stderr_line_discarded_ = true;
+                }
             }
-            stderr_bytes_.push_back(static_cast<char>(bytes[index]));
+        }
+        for (const auto& message : progress_messages) {
+            if (!progress_observer_) break;
+            try {
+                progress_observer_(message);
+            } catch (...) {
+                progress_observer_ = nullptr;
+            }
         }
     }
 
@@ -472,13 +603,21 @@ private:
     std::deque<std::string> outbound_lines_;
     std::size_t outbound_offset_{0};
     std::deque<char> stderr_bytes_;
+    std::string stderr_line_buffer_;
+    bool stderr_line_discarded_{false};
     bool stderr_truncated_{false};
+    std::function<void(const std::string&)> progress_observer_;
 #if defined(_WIN32)
     HANDLE job_{nullptr};
 #endif
 };
 
-ReprocJsonlProcess::ReprocJsonlProcess() : impl_(std::make_unique<Impl>()) {}
+ReprocJsonlProcess::ReprocJsonlProcess()
+    : ReprocJsonlProcess(std::function<void(const std::string&)>{}) {}
+
+ReprocJsonlProcess::ReprocJsonlProcess(
+    std::function<void(const std::string&)> progress_observer)
+    : impl_(std::make_unique<Impl>(std::move(progress_observer))) {}
 
 ReprocJsonlProcess::~ReprocJsonlProcess() = default;
 

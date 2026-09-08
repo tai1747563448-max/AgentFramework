@@ -29,6 +29,8 @@ namespace {
 constexpr const char* kDefaultSystemPrompt =
     "You are a coding agent. Inspect the workspace, make focused edits, "
     "and verify the result. Use only the tools explicitly provided.";
+constexpr std::uintmax_t kMaximumSmallJsonBytes = 65'536;
+constexpr std::uintmax_t kMaximumPackManifestBytes = 32U * 1024U * 1024U;
 
 class NullOutputBuffer final : public std::streambuf {
 protected:
@@ -244,13 +246,14 @@ bool trusted_path_components(const std::filesystem::path& supplied) noexcept {
 }
 
 std::optional<nlohmann::json> read_strict_json_file(
-    const std::filesystem::path& path) noexcept {
+    const std::filesystem::path& path,
+    std::uintmax_t maximum_bytes = kMaximumSmallJsonBytes) noexcept {
     try {
         std::error_code error;
         if (!std::filesystem::is_regular_file(path, error) || error ||
             path_is_link_or_reparse(path, error) || error ||
             std::filesystem::hard_link_count(path, error) != 1 || error ||
-            std::filesystem::file_size(path, error) > 65'536 || error) {
+            std::filesystem::file_size(path, error) > maximum_bytes || error) {
             return std::nullopt;
         }
         std::ifstream input(path, std::ios::binary);
@@ -333,7 +336,8 @@ std::optional<std::filesystem::path> trusted_pack_root(
             !trusted_path_components(canonical)) {
             return std::nullopt;
         }
-        const auto manifest = read_strict_json_file(canonical / "pack.json");
+        const auto manifest = read_strict_json_file(
+            canonical / "pack.json", kMaximumPackManifestBytes);
         if (!manifest.has_value() || !manifest_is_complete(*manifest)) {
             return std::nullopt;
         }
@@ -520,10 +524,11 @@ Result<RuntimeConfig> load_runtime_config(
     if (rag_enabled.value()) {
         const auto mode = environment.get("AGENT_RAG_MODE");
         const auto device = environment.get("AGENT_RAG_DEVICE");
-        rag.mode = mode.has_value() ? *mode : "hybrid";
+        rag.mode = mode.has_value() ? *mode : "dense";
         rag.device = device.has_value() ? *device : "auto";
-        if (rag.mode != "hybrid" && rag.mode != "lexical") {
-            return invalid_config("rag mode must be hybrid or lexical");
+        if (rag.mode != "hybrid" && rag.mode != "dense" &&
+            rag.mode != "lexical") {
+            return invalid_config("rag mode must be hybrid, dense, or lexical");
         }
         if (rag.device != "auto" && rag.device != "cuda" &&
             rag.device != "cpu") {

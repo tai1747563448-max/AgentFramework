@@ -23,6 +23,41 @@ class WordCodec:
         return " ".join(tokens)
 
 
+class CountingWordCodec(WordCodec):
+    def __init__(self) -> None:
+        self.encode_calls = 0
+        self.max_encoded_words = 0
+
+    def encode(self, text: str) -> list[str]:
+        self.encode_calls += 1
+        tokens = super().encode(text)
+        self.max_encoded_words = max(self.max_encoded_words, len(tokens))
+        return tokens
+
+
+class OffsetWordCodec(CountingWordCodec):
+    def __init__(self) -> None:
+        super().__init__()
+        self.offset_calls = 0
+
+    def __call__(self, text: str, **kwargs: object) -> dict[str, list[tuple[int, int]]]:
+        assert kwargs["add_special_tokens"] is False
+        assert kwargs["return_offsets_mapping"] is True
+        self.offset_calls += 1
+        return {"offset_mapping": [match.span() for match in re.finditer(r"\S+", text)]}
+
+
+class InstrumentedText(str):
+    def __new__(cls, value: str) -> "InstrumentedText":
+        instance = super().__new__(cls, value)
+        instance.count_calls = 0
+        return instance
+
+    def count(self, *args: object, **kwargs: object) -> int:
+        self.count_calls += 1
+        return super().count(*args, **kwargs)
+
+
 def _source(document_id: str, body: str, citation: str = "1 CFR 1.1") -> DocumentSource:
     return DocumentSource(
         document_id=document_id,
@@ -114,3 +149,36 @@ def test_chunk_documents_never_links_across_documents() -> None:
         by_document[chunk.document_id].append(chunk)
     assert by_document[left.document_id][-1].next_id is None
     assert by_document[right.document_id][0].previous_id is None
+
+
+def test_long_document_chunk_boundary_search_is_sublinear() -> None:
+    codec = CountingWordCodec()
+    source = _source(
+        "doc-11111111111111111111111111111111",
+        " ".join(f"word-{index}" for index in range(20_000)),
+    )
+
+    chunks = chunk_document(source, codec, max_tokens=768, overlap_tokens=96)
+
+    assert len(chunks) > 20
+    assert all(chunk.token_count <= 768 for chunk in chunks)
+    assert codec.encode_calls < 1_500
+    assert codec.max_encoded_words < 2_000
+
+
+def test_fast_tokenizer_offsets_seed_near_budget_boundaries() -> None:
+    codec = OffsetWordCodec()
+    body = InstrumentedText(" ".join(f"word-{index}" for index in range(20_000)))
+    source = _source(
+        "doc-22222222222222222222222222222222",
+        body,
+    )
+
+    chunks = chunk_document(source, codec, max_tokens=768, overlap_tokens=96)
+
+    assert len(chunks) > 20
+    assert all(chunk.token_count <= 768 for chunk in chunks)
+    assert codec.offset_calls == 1
+    assert codec.encode_calls < 600
+    assert codec.max_encoded_words < 2_000
+    assert body.count_calls == 0

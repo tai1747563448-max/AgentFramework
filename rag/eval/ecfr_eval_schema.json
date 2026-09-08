@@ -56,7 +56,7 @@
         "multi_concept",
         "adjacent_context",
         "no_answer",
-        "injection_damaged"
+        "hostile_query"
       ]
     },
     "rationale": {

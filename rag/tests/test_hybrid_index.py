@@ -117,14 +117,29 @@ def _row_ids(database: Path) -> list[str]:
 
 def test_index_rows_follow_stable_chunk_id_order(tmp_path: Path) -> None:
     documents, chunks = _fixtures()
+    progress: list[tuple[str, int, int]] = []
 
     summary = build_index_from_chunks(
-        tmp_path / "index", documents, list(reversed(chunks)), DeterministicEmbedding()
+        tmp_path / "index",
+        documents,
+        list(reversed(chunks)),
+        DeterministicEmbedding(),
+        progress=lambda phase, completed, total, **_: progress.append(
+            (phase, completed, total)
+        ),
     )
 
     assert _row_ids(summary.database) == sorted(chunk.chunk_id for chunk in chunks)
     assert summary.rows == 2
     assert summary.reused_vector_rows == 0
+    assert ("index-reuse", 0, 2) in progress
+    assert ("index-reuse", 2, 2) in progress
+    assert ("index-embedding", 0, 2) in progress
+    assert ("index-embedding", 2, 2) in progress
+    assert ("index-database", 0, 1) in progress
+    assert ("index-database", 1, 1) in progress
+    assert ("index-vectors", 0, 1) in progress
+    assert ("index-vectors", 1, 1) in progress
 
 
 def test_index_has_foreign_keys_unique_rows_and_little_endian_f16(

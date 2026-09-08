@@ -256,12 +256,13 @@ bool valid_item(const nlohmann::json& item) {
         !exact_keys(metadata,
                     {"citation", "path", "start_line", "end_line",
                      "snapshot_date", "official_url", "content_sha256",
-                     "document_sha256", "bm25_rank", "dense_rank",
+                     "document_sha256", "retrieval_revision", "bm25_rank", "dense_rank",
                      "fusion_score", "is_neighbor", "neighbor_of"})) {
         return false;
     }
     for (const auto* name : {"citation", "path", "snapshot_date", "official_url",
-                             "content_sha256", "document_sha256"}) {
+                             "content_sha256", "document_sha256",
+                             "retrieval_revision"}) {
         if (!metadata.at(name).is_string()) {
             return false;
         }
@@ -284,6 +285,8 @@ bool valid_item(const nlohmann::json& item) {
         metadata.at("content_sha256").get_ref<const std::string&>();
     const auto& document_sha =
         metadata.at("document_sha256").get_ref<const std::string&>();
+    const auto& retrieval_revision =
+        metadata.at("retrieval_revision").get_ref<const std::string&>();
     const auto start = metadata.at("start_line").get<std::int64_t>();
     const auto end = metadata.at("end_line").get<std::int64_t>();
     const auto score = metadata.at("fusion_score").get<double>();
@@ -295,7 +298,11 @@ bool valid_item(const nlohmann::json& item) {
         !canonical_date(date) || !official_url_is_valid(url, date) ||
         !lower_hex(content_sha, 64) ||
         content_sha != workspace::sha256_hex(content) ||
-        !lower_hex(document_sha, 64) || start < 1 || end < start ||
+        !lower_hex(document_sha, 64) ||
+        retrieval_revision.size() != 74U ||
+        retrieval_revision.rfind("retrieval-", 0) != 0 ||
+        !lower_hex(retrieval_revision.substr(10), 64) ||
+        start < 1 || end < start ||
         end > 10'000'000 || !std::isfinite(score) || score < 0.0 ||
         (neighbor && (has_rank || score != 0.0 || !neighbor_id)) ||
         (!neighbor && (!has_rank || score <= 0.0 || neighbor_id))) {
@@ -317,9 +324,10 @@ Result<ReadyInfo> decode_ready(const std::string& line) {
         const auto& payload = value.at("payload");
         if (!exact_keys(payload,
                         {"pack_id", "snapshot_date", "document_count",
-                         "chunk_count", "model", "revision", "dimensions",
+                         "retrieval_revision", "chunk_count", "model", "revision", "dimensions",
                          "device"}) ||
             !payload.at("pack_id").is_string() ||
+            !payload.at("retrieval_revision").is_string() ||
             !payload.at("snapshot_date").is_string() ||
             !payload.at("document_count").is_number_integer() ||
             !payload.at("chunk_count").is_number_integer() ||
@@ -331,6 +339,7 @@ Result<ReadyInfo> decode_ready(const std::string& line) {
         }
         ReadyInfo result{
             payload.at("pack_id").get<std::string>(),
+            payload.at("retrieval_revision").get<std::string>(),
             payload.at("snapshot_date").get<std::string>(),
             payload.at("document_count").get<std::int64_t>(),
             payload.at("chunk_count").get<std::int64_t>(),
@@ -339,6 +348,9 @@ Result<ReadyInfo> decode_ready(const std::string& line) {
             payload.at("dimensions").get<std::int64_t>(),
             payload.at("device").get<std::string>()};
         if (!pack_id_is_valid(result.pack_id) ||
+            result.retrieval_revision.size() != 74U ||
+            result.retrieval_revision.rfind("retrieval-", 0) != 0 ||
+            !lower_hex(result.retrieval_revision.substr(10), 64) ||
             !canonical_date(result.snapshot_date) ||
             result.document_count != kExpectedDocuments ||
             result.chunk_count < result.document_count ||
@@ -355,28 +367,48 @@ Result<ReadyInfo> decode_ready(const std::string& line) {
 
 Result<EvidencePack> decode_query_result(const std::string& line,
                                          const std::string& expected_request_id,
+                                         const std::string& expected_retrieval_revision,
                                          std::size_t top_k,
                                          std::size_t max_total_bytes) {
     try {
         if (top_k == 0 || top_k > 20 || max_total_bytes == 0 ||
             max_total_bytes > 32'768 ||
-            !request_id_is_valid(expected_request_id)) {
+            !request_id_is_valid(expected_request_id) ||
+            expected_retrieval_revision.size() != 74U ||
+            expected_retrieval_revision.rfind("retrieval-", 0) != 0 ||
+            !lower_hex(expected_retrieval_revision.substr(10), 64)) {
             return failure<EvidencePack>();
         }
         nlohmann::json value;
         if (!parse_json(line, value) ||
             !exact_envelope(value, "query_result", expected_request_id) ||
-            !exact_keys(value.at("payload"), {"items"}) ||
+            !exact_keys(value.at("payload"), {"items", "outcome"}) ||
             !value.at("payload").at("items").is_array() ||
+            !value.at("payload").at("outcome").is_string() ||
             value.at("payload").at("items").size() > top_k) {
             return failure<EvidencePack>();
         }
         EvidencePack result;
+        const auto& outcome = value.at("payload")
+                                  .at("outcome")
+                                  .get_ref<const std::string&>();
+        const bool has_items = !value.at("payload").at("items").empty();
+        if ((outcome != "matched" && outcome != "no_match" &&
+             outcome != "authoritative_no_match") ||
+            (outcome == "matched") != has_items) {
+            return failure<EvidencePack>();
+        }
+        result.authoritative_no_match = outcome == "authoritative_no_match";
+        result.tool_use_forbidden = has_items;
         std::size_t total_bytes = 0;
         std::set<std::string> source_ids;
         std::set<std::string> content_shas;
         for (const auto& item : value.at("payload").at("items")) {
             if (!valid_item(item)) {
+                return failure<EvidencePack>();
+            }
+            if (item.at("metadata").at("retrieval_revision") !=
+                expected_retrieval_revision) {
                 return failure<EvidencePack>();
             }
             const auto& content = item.at("content").get_ref<const std::string&>();

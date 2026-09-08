@@ -5,6 +5,7 @@ import io
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,7 +13,11 @@ import pytest
 RAG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(RAG_ROOT))
 
-from agent_rag.hybrid_retriever import EvidenceItem  # type: ignore[import-not-found]
+from agent_rag.hybrid_retriever import (  # type: ignore[import-not-found]
+    EvidenceItem,
+    RetrievalResult,
+)
+from agent_rag import sidecar as sidecar_module  # type: ignore[import-not-found]
 from agent_rag.protocol import ProtocolError, parse_v2_message  # type: ignore[import-not-found]
 from agent_rag.sidecar import (  # type: ignore[import-not-found]
     LoadedRuntime,
@@ -23,6 +28,59 @@ from agent_rag.sidecar import (  # type: ignore[import-not-found]
 REQUEST_ONE = "req-11111111111111111111111111111111"
 REQUEST_TWO = "req-22222222222222222222222222222222"
 REQUEST_THREE = "req-33333333333333333333333333333333"
+
+
+def test_runtime_loader_uses_bounded_pack_check_and_skips_duplicate_quick_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: dict[str, object] = {}
+    manifest = SimpleNamespace(
+        pack_id="pack-" + "c" * 32,
+        snapshot_date="2026-09-03",
+        document_count=30_000,
+        chunk_count=45_000,
+        embedding_model="BAAI/bge-m3",
+        embedding_revision="d" * 40,
+        embedding_dimensions=1024,
+        relevance_dense_min=0.6,
+    )
+
+    def verify(root: Path, *, progress: object) -> object:
+        calls["verified_root"] = root
+        calls["verify_progress"] = progress
+        return manifest
+
+    class FakeEmbedding:
+        pass
+
+    class FakeRetriever:
+        def __init__(self, root: Path, **kwargs: object) -> None:
+            calls["retriever_root"] = root
+            calls.update(kwargs)
+
+    monkeypatch.setattr(sidecar_module, "verify_runtime_pack", verify)
+    monkeypatch.setattr(
+        sidecar_module, "retrieval_revision", lambda _: "retrieval-" + "e" * 64
+    )
+    monkeypatch.setattr(sidecar_module, "select_embedding_device", lambda _: "cpu")
+    monkeypatch.setattr(sidecar_module, "BgeM3Embedding", lambda *_, **__: FakeEmbedding())
+    monkeypatch.setattr(sidecar_module, "encode_normalized", lambda *_, **__: None)
+    monkeypatch.setattr(sidecar_module, "HybridRetriever", FakeRetriever)
+    events: list[tuple[str, int, int]] = []
+
+    loaded = sidecar_module._load_runtime(
+        tmp_path.resolve(),
+        device="cpu",
+        progress=lambda phase, completed, total, **_: events.append(
+            (phase, completed, total)
+        ),
+    )
+
+    assert loaded.ready_payload["pack_id"] == manifest.pack_id
+    assert loaded.ready_payload["retrieval_revision"] == "retrieval-" + "e" * 64
+    assert calls["verified_root"] == tmp_path.resolve()
+    assert calls["verify_database_integrity"] is False
+    assert events == [("sidecar-model", 0, 1), ("sidecar-model", 1, 1)]
 
 
 def _request(request_id: str, op: str, payload: dict[str, object]) -> bytes:
@@ -67,13 +125,13 @@ class ScriptedRetriever:
         self.fail = fail
         self.calls: list[tuple[str, int, int, str]] = []
 
-    def query(
+    def query_result(
         self, query: str, *, top_k: int, max_total_bytes: int, mode: str
-    ) -> list[EvidenceItem]:
+    ) -> RetrievalResult:
         self.calls.append((query, top_k, max_total_bytes, mode))
         if self.fail:
             raise RuntimeError("SENTINEL query secret")
-        return [self.item]
+        return RetrievalResult([self.item], "matched")
 
 
 @dataclass
@@ -88,6 +146,7 @@ class Factory:
             retriever=self.retriever,
             ready_payload={
                 "pack_id": "pack-" + "c" * 32,
+                "retrieval_revision": "retrieval-" + "e" * 64,
                 "snapshot_date": "2026-09-03",
                 "document_count": 30_000,
                 "chunk_count": 45_000,
@@ -143,11 +202,32 @@ def test_sidecar_emits_ready_once_and_reuses_loaded_retriever(tmp_path: Path) ->
     ]
     assert output[1]["request_id"] == REQUEST_ONE
     assert output[2]["request_id"] == REQUEST_TWO
+    assert output[2]["payload"]["outcome"] == "matched"
     assert factory.calls == 1
     assert factory.retriever.calls == [("tax", 6, 32768, "hybrid")]
     item = output[2]["payload"]["items"][0]
     assert item["source_id"].startswith("doc-")
     assert item["metadata"]["citation"] == "1 CFR 1.1"
+    assert item["metadata"]["retrieval_revision"] == "retrieval-" + "e" * 64
+
+
+def test_sidecar_accepts_dense_query_mode(tmp_path: Path) -> None:
+    code, output, errors, factory = _run(
+        tmp_path,
+        [
+            _request(
+                REQUEST_ONE,
+                "query",
+                {"query": "tax", "top_k": 6, "max_total_bytes": 32768, "mode": "dense"},
+            ),
+            _request(REQUEST_TWO, "shutdown", {}),
+        ],
+    )
+
+    assert code == 0
+    assert errors == ""
+    assert [line["op"] for line in output] == ["ready", "query_result", "shutdown_result"]
+    assert factory.retriever.calls == [("tax", 6, 32768, "dense")]
 
 
 @pytest.mark.parametrize(
@@ -292,4 +372,31 @@ def test_runtime_load_failure_emits_no_ready_or_private_path(tmp_path: Path) -> 
     assert code == 2
     assert output.getvalue() == b""
     assert errors.getvalue() == "rag sidecar initialization failed\n"
+    assert "SENTINEL" not in errors.getvalue()
+
+
+def test_default_runtime_load_failure_marks_the_active_progress_phase_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(root: Path, *, device: str, progress: object) -> LoadedRuntime:
+        del root, device
+        assert callable(progress)
+        progress("sidecar-model", 0, 1)
+        raise RuntimeError("SENTINEL")
+
+    monkeypatch.setattr(sidecar_module, "_load_runtime", fail)
+    output = io.BytesIO()
+    errors = io.StringIO()
+
+    code = run_sidecar(tmp_path.resolve(), io.BytesIO(), output, errors)
+
+    lines = errors.getvalue().splitlines()
+    started = json.loads(lines[0])
+    failed = json.loads(lines[1])
+    assert code == 2
+    assert output.getvalue() == b""
+    assert started["phase"] == failed["phase"] == "sidecar-model"
+    assert started["status"] == "running"
+    assert failed["status"] == "failed"
+    assert lines[2] == "rag sidecar initialization failed"
     assert "SENTINEL" not in errors.getvalue()

@@ -27,12 +27,20 @@ public:
 };
 
 std::filesystem::path make_pack(const test::ScopedTempDir& temp,
-                                const std::filesystem::path& relative = "pack") {
+                                const std::filesystem::path& relative = "pack",
+                                std::size_t inventory_entries = 0) {
     const auto root = temp.path() / relative;
     std::filesystem::create_directories(root / "runtime");
     std::filesystem::create_directories(root / "sidecar");
     temp.write_text(relative / "runtime" / "python.exe", "fixture");
     temp.write_text(relative / "sidecar" / "agent_rag_cli.py", "fixture");
+    auto files = nlohmann::json::array();
+    for (std::size_t index = 0; index < inventory_entries; ++index) {
+        files.push_back(
+            {{"path", "corpus/document-" + std::to_string(index) + ".md"},
+             {"sha256", std::string(64, 'a')},
+             {"size_bytes", 1}});
+    }
     temp.write_text(
         relative / "pack.json",
         nlohmann::json(
@@ -46,7 +54,7 @@ std::filesystem::path make_pack(const test::ScopedTempDir& temp,
              {"embedding_dimensions", 1024},
              {"relevance_dense_min", 0.1},
              {"complete", true},
-             {"files", nlohmann::json::array()}})
+             {"files", std::move(files)}})
             .dump());
     return std::filesystem::canonical(root);
 }
@@ -60,6 +68,17 @@ Environment enabled(const std::filesystem::path& root) {
 
 }  // namespace fixtures
 
+TEST_CASE(rag_pack_config_accepts_bounded_full_inventory_manifests) {
+    test::ScopedTempDir temp("rag-config-large-manifest");
+    const auto root = fixtures::make_pack(temp, "pack", 2'000);
+    REQUIRE(std::filesystem::file_size(root / "pack.json") > 65'536);
+
+    const auto loaded = agent::load_runtime_config(fixtures::enabled(root));
+
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded.value().rag.pack_root == root);
+}
+
 TEST_CASE(rag_pack_config_defaults_are_complete_and_external) {
     test::ScopedTempDir temp("rag-config-defaults");
     const auto root = fixtures::make_pack(temp);
@@ -71,7 +90,7 @@ TEST_CASE(rag_pack_config_defaults_are_complete_and_external) {
     REQUIRE(loaded.has_value());
     REQUIRE(loaded.value().rag_enabled);
     REQUIRE(loaded.value().rag.enabled);
-    REQUIRE(loaded.value().rag.mode == "hybrid");
+    REQUIRE(loaded.value().rag.mode == "dense");
     REQUIRE(loaded.value().rag.pack_root == root);
     REQUIRE(loaded.value().rag.top_k == 6);
     REQUIRE(loaded.value().rag.max_total_bytes == 32'768);
@@ -129,7 +148,7 @@ TEST_CASE(rag_pack_config_rejects_invalid_enums_numbers_without_echoing_values) 
     test::ScopedTempDir temp("rag-config-invalid");
     const auto root = fixtures::make_pack(temp);
     const std::vector<std::pair<std::string, std::string>> invalid{
-        {"AGENT_RAG_MODE", "dense"},
+        {"AGENT_RAG_MODE", "unsafe-mode"},
         {"AGENT_RAG_DEVICE", "gpu-secret-value"},
         {"AGENT_RAG_TOP_K", "21"},
         {"AGENT_RAG_MAX_TOTAL_BYTES", "32769"},

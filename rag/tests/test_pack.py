@@ -18,12 +18,41 @@ from agent_rag.pack import (  # type: ignore[import-not-found]
     BGE_M3_REVISION,
     PackError,
     atomic_publish,
+    retrieval_revision,
     verify_complete_pack,
+    verify_runtime_pack,
 )
 from agent_rag.cli import main as rag_main  # type: ignore[import-not-found]
 
 
 PACK_ID = "pack-0123456789abcdef0123456789abcdef"
+
+
+def test_retrieval_revision_binds_runtime_policy_and_evaluation_identity() -> None:
+    from agent_rag.pack import FileDigest, PackManifest
+
+    paths = {
+        "build.intent.json": "a",
+        "runtime.lock.json": "b",
+        "eval/ecfr-cases.jsonl": "c",
+        "reports/retrieval-eval.json": "d",
+    }
+
+    def manifest(dense_min: float, report_digest: str = "d") -> PackManifest:
+        records = tuple(
+            FileDigest(path, 1, (report_digest if path.startswith("reports/") else digest) * 64)
+            for path, digest in paths.items()
+        )
+        return PackManifest(
+            2, PACK_ID, "2026-09-03", 30_000, 45_000,
+            BGE_M3_MODEL, BGE_M3_REVISION, 1024, dense_min, True, records
+        )
+
+    baseline = retrieval_revision(manifest(0.61))
+    assert baseline.startswith("retrieval-")
+    assert len(baseline) == 74
+    assert retrieval_revision(manifest(0.62)) != baseline
+    assert retrieval_revision(manifest(0.61, "e")) != baseline
 
 
 def _sha256(path: Path) -> str:
@@ -42,6 +71,7 @@ def _minimal_pack(
     chunk_count: int = 2,
     vector_rows: int = 2,
     complete: bool = True,
+    runtime_assets: bool = False,
 ) -> Path:
     root.mkdir(parents=True)
     document_path = "corpus/title-001/part-1/section-1.1--0123456789ab.md"
@@ -109,6 +139,10 @@ def _minimal_pack(
         root / "model.lock.json",
         json.dumps(model_lock, sort_keys=True, separators=(",", ":")).encode("utf-8"),
     )
+    if runtime_assets:
+        _write(root / "runtime" / "python.exe", b"runtime-fixture")
+        _write(root / "runtime.lock.json", b"runtime-lock-fixture")
+        _write(root / "sidecar" / "agent_rag_cli.py", b"sidecar-fixture")
     files = []
     for path in sorted(item for item in root.rglob("*") if item.is_file()):
         files.append(
@@ -138,13 +172,57 @@ def _minimal_pack(
     return root
 
 
+def test_runtime_pack_uses_bounded_startup_validation_and_reports_progress(
+    tmp_path: Path,
+) -> None:
+    root = _minimal_pack(tmp_path / "pack", runtime_assets=True)
+    document = next((root / "corpus").rglob("*.md"))
+    document.write_bytes(document.read_bytes().replace(b"body", b"BODY"))
+    events: list[tuple[str, int, int]] = []
+
+    manifest = verify_runtime_pack(
+        root,
+        progress=lambda phase, completed, total, **_: events.append(
+            (phase, completed, total)
+        ),
+    )
+
+    assert manifest.pack_id == PACK_ID
+    assert events[0][0] == "runtime-pack-assets"
+    assert events[-1][1] == events[-1][2]
+    with pytest.raises(PackError, match="pack file digest"):
+        verify_complete_pack(root)
+
+
+def test_runtime_pack_rejects_resized_retrieval_asset(tmp_path: Path) -> None:
+    root = _minimal_pack(tmp_path / "pack", runtime_assets=True)
+    with (root / "index" / "vectors.f16").open("ab") as stream:
+        stream.write(b"extra")
+
+    with pytest.raises(PackError, match="pack file digest"):
+        verify_runtime_pack(root)
+
+
 def test_verify_complete_pack_accepts_consistent_fixture(tmp_path: Path) -> None:
-    manifest = verify_complete_pack(_minimal_pack(tmp_path / "pack"))
+    events: list[tuple[str, int, int]] = []
+    manifest = verify_complete_pack(
+        _minimal_pack(tmp_path / "pack"),
+        progress=lambda phase, completed, total, **_: events.append(
+            (phase, completed, total)
+        ),
+    )
 
     assert manifest.pack_id == PACK_ID
     assert manifest.document_count == 1
     assert manifest.chunk_count == 2
     assert manifest.embedding_dimensions == 1024
+    assert events[0] == ("verify-pack-files", 0, 6)
+    assert events[6] == ("verify-pack-files", 6, 6)
+    assert [event for event in events if event[0] == "verify-pack-vectors"] == [
+        ("verify-pack-vectors", 0, 2),
+        ("verify-pack-vectors", 1, 2),
+        ("verify-pack-vectors", 2, 2),
+    ]
 
 
 def test_verify_pack_cli_reports_only_stable_manifest_metadata(
@@ -198,6 +276,37 @@ def test_atomic_publish_preserves_existing_complete_pack_on_failure(
 
     assert verify_complete_pack(destination).pack_id == PACK_ID
     assert staging.exists()
+
+
+def test_atomic_publish_reports_verification_progress(tmp_path: Path) -> None:
+    staging = _minimal_pack(tmp_path / "staging")
+    destination = tmp_path / "published"
+    events: list[tuple[str, int, int]] = []
+
+    atomic_publish(
+        staging,
+        destination,
+        progress=lambda phase, completed, total, **_: events.append(
+            (phase, completed, total)
+        ),
+    )
+
+    assert destination.is_dir()
+    assert not staging.exists()
+    assert events[0][0] == "verify-pack-files"
+    assert events[-1] == ("verify-pack-vectors", 2, 2)
+
+
+def test_atomic_publish_accepts_exact_hidden_staging_parent(tmp_path: Path) -> None:
+    staging_parent = tmp_path / ".staging"
+    staging_parent.mkdir()
+    staging = _minimal_pack(staging_parent / "pack-build")
+    destination = tmp_path / "published"
+
+    atomic_publish(staging, destination)
+
+    assert destination.is_dir()
+    assert not staging.exists()
 
 
 def test_verify_pack_rejects_unlisted_and_linked_files(tmp_path: Path) -> None:

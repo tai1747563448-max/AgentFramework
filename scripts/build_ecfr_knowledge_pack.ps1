@@ -14,6 +14,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$env:PYTHONDONTWRITEBYTECODE = "1"
 
 $PythonVersion = "3.11.9"
 $PythonArchiveUrl =
@@ -82,7 +83,7 @@ function Write-JsonUtf8NoBom([string]$Path, [object]$Value) {
 }
 
 function Invoke-PackPython([string[]]$Arguments, [string]$Failure) {
-    & $script:PackPython @Arguments
+    & $script:PackPython -B @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw $Failure
     }
@@ -92,7 +93,51 @@ function Invoke-PackPythonReport(
     [string[]]$Arguments,
     [string]$ReportPath,
     [string]$Failure) {
-    $result = & $script:PackPython @Arguments
+    $result = & $script:PackPython -B @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw $Failure
+    }
+    [System.IO.File]::WriteAllText(
+        $ReportPath,
+        (($result -join [Environment]::NewLine) + [Environment]::NewLine),
+        [System.Text.UTF8Encoding]::new($false))
+}
+
+function Get-CachedPythonSource([string]$Source) {
+    if (-not (Test-Path -LiteralPath $script:PythonSourceRoot -PathType Container)) {
+        throw "Python source cache is unavailable"
+    }
+    $sourceSha = [System.BitConverter]::ToString(
+        [System.Security.Cryptography.SHA256]::Create().ComputeHash(
+            [System.Text.Encoding]::UTF8.GetBytes($Source))).Replace("-", "").ToLowerInvariant()
+    $sourcePath = Join-Path $script:PythonSourceRoot "$sourceSha.py"
+    if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+        [System.IO.File]::WriteAllText(
+            $sourcePath, $Source, [System.Text.UTF8Encoding]::new($false))
+    }
+    return $sourcePath
+}
+
+function Invoke-PythonSource(
+    [string]$Python,
+    [string]$Source,
+    [string[]]$ScriptArguments,
+    [string]$Failure) {
+    $sourcePath = Get-CachedPythonSource $Source
+    & $Python -B -E -s -X utf8 $sourcePath @ScriptArguments
+    if ($LASTEXITCODE -ne 0) {
+        throw $Failure
+    }
+}
+
+function Invoke-PythonSourceReport(
+    [string]$Python,
+    [string]$Source,
+    [string[]]$ScriptArguments,
+    [string]$ReportPath,
+    [string]$Failure) {
+    $sourcePath = Get-CachedPythonSource $Source
+    $result = & $Python -B -E -s -X utf8 $sourcePath @ScriptArguments
     if ($LASTEXITCODE -ne 0) {
         throw $Failure
     }
@@ -158,8 +203,8 @@ if ($null -eq $hostPythonCommand) {
     throw "Python 3.11 is required to resolve locked wheels"
 }
 $HostPython = $hostPythonCommand.Source
-$hostVersion = & $HostPython -c "import sys; print('.'.join(map(str, sys.version_info[:2])))"
-if ($LASTEXITCODE -ne 0 -or $hostVersion.Trim() -ne "3.11") {
+$hostVersion = (& $HostPython --version 2>&1) -join ""
+if ($LASTEXITCODE -ne 0 -or $hostVersion -notmatch '^Python 3\.11(?:\.|$)') {
     throw "Python 3.11 is required to resolve locked wheels"
 }
 
@@ -167,12 +212,17 @@ $cacheRoot = Join-Path $KnowledgeRoot ".build-cache"
 $stagingParent = Join-Path $KnowledgeRoot ".staging"
 $wheelhouse = Join-Path $cacheRoot "wheels-py311-win-amd64"
 $pythonArchive = Join-Path $cacheRoot "python-$PythonVersion-embed-amd64.zip"
-foreach ($path in @($cacheRoot, $stagingParent, $wheelhouse, $pythonArchive)) {
+$script:PythonSourceRoot = Join-Path $cacheRoot "python-sources"
+foreach ($path in @(
+        $cacheRoot, $stagingParent, $wheelhouse, $pythonArchive,
+        $script:PythonSourceRoot)) {
     Assert-ChildPath $KnowledgeRoot $path
 }
 [System.IO.Directory]::CreateDirectory($cacheRoot) | Out-Null
 [System.IO.Directory]::CreateDirectory($stagingParent) | Out-Null
 [System.IO.Directory]::CreateDirectory($wheelhouse) | Out-Null
+[System.IO.Directory]::CreateDirectory($script:PythonSourceRoot) | Out-Null
+Assert-NoReparseComponents $script:PythonSourceRoot
 
 $sidecarDigestLines = @()
 foreach ($file in Get-ChildItem -LiteralPath $SidecarSource -Recurse -File |
@@ -212,7 +262,12 @@ if (Test-Path -LiteralPath $Destination) {
         -not (Test-Path -LiteralPath $publishedSidecar -PathType Leaf)) {
         throw "published Knowledge Pack is incomplete"
     }
-    & $publishedPython -E -s -X utf8 $publishedSidecar verify-pack --pack-root $Destination
+    $publishedIntent = Join-Path $Destination "build.intent.json"
+    if (-not (Test-Path -LiteralPath $publishedIntent -PathType Leaf) -or
+        (Get-Content -LiteralPath $publishedIntent -Raw -Encoding UTF8) -ne $intentJson) {
+        throw "published Knowledge Pack build intent differs from current sources"
+    }
+    & $publishedPython -B -E -s -X utf8 $publishedSidecar verify-pack --pack-root $Destination
     if ($LASTEXITCODE -ne 0) {
         throw "published Knowledge Pack verification failed"
     }
@@ -292,17 +347,16 @@ for record in lock["files"]:
         hashlib.sha256(path.read_bytes()).hexdigest() != record["sha256"]):
         raise SystemExit(2)
 '@
-        & $HostPython -c $verifyRuntime $StagingRoot $intentSha
-        if ($LASTEXITCODE -ne 0) {
-            throw "resume runtime lock mismatch"
-        }
+        Invoke-PythonSource -Python $HostPython -Source $verifyRuntime `
+            -ScriptArguments @($StagingRoot, $intentSha) `
+            -Failure "resume runtime lock mismatch"
     } else {
         if (Test-Path -LiteralPath $RuntimeRoot) {
             throw "partial runtime without a lock is not resumable"
         }
         Write-Host "Resolving and recording the portable Python wheel set."
         & $HostPython -m pip download --disable-pip-version-check --only-binary=:all: `
-            --requirement $RequirementsLock --dest $wheelhouse
+            --require-hashes --requirement $RequirementsLock --dest $wheelhouse
         if ($LASTEXITCODE -ne 0) {
             throw "locked wheel download failed"
         }
@@ -318,7 +372,7 @@ for record in lock["files"]:
         [System.IO.Directory]::CreateDirectory(
             (Join-Path $RuntimeRoot "Lib\site-packages")) | Out-Null
         & $HostPython -m pip install --disable-pip-version-check --no-index `
-            --find-links $wheelhouse --requirement $RequirementsLock `
+            --require-hashes --find-links $wheelhouse --requirement $RequirementsLock `
             --target (Join-Path $RuntimeRoot "Lib\site-packages")
         if ($LASTEXITCODE -ne 0) {
             throw "portable runtime dependency installation failed"
@@ -356,8 +410,13 @@ for record in lock["files"]:
         [System.IO.Directory]::CreateDirectory($SidecarRoot) | Out-Null
         Copy-Item -LiteralPath (Join-Path $SidecarSource "agent_rag_cli.py") `
             -Destination $SidecarRoot
-        Copy-Item -LiteralPath (Join-Path $SidecarSource "agent_rag") `
-            -Destination $SidecarRoot -Recurse
+        $SidecarPackage = Join-Path $SidecarRoot "agent_rag"
+        [System.IO.Directory]::CreateDirectory($SidecarPackage) | Out-Null
+        foreach ($sourceFile in Get-ChildItem `
+                -LiteralPath (Join-Path $SidecarSource "agent_rag") `
+                -File -Filter "*.py" | Sort-Object Name) {
+            Copy-Item -LiteralPath $sourceFile.FullName -Destination $SidecarPackage
+        }
     }
     Assert-NoReparseComponents $StagingRoot
 
@@ -369,8 +428,9 @@ assert numpy.__version__
 assert callable(main)
 assert torch.empty((1,), device="cpu").numel() == 1
 '@
-    Invoke-PackPython @("-E", "-s", "-X", "utf8", "-c", $importProbe) `
-        "portable runtime import verification failed"
+    Invoke-PythonSource -Python $script:PackPython -Source $importProbe `
+        -ScriptArguments @() `
+        -Failure "portable runtime import verification failed"
 
     $ModelRoot = Join-Path $StagingRoot "model\bge-m3"
     if (-not (Test-Path -LiteralPath $ModelRoot -PathType Container)) {
@@ -382,10 +442,9 @@ import pathlib, sys
 snapshot_download(repo_id=sys.argv[1], revision=sys.argv[2],
                   local_dir=pathlib.Path(sys.argv[3]))
 '@
-        Invoke-PackPython @(
-            "-E", "-s", "-X", "utf8", "-c", $modelDownload,
-            $EmbeddingModel, $EmbeddingRevision, $ModelRoot) `
-            "pinned embedding model download failed"
+        Invoke-PythonSource -Python $script:PackPython -Source $modelDownload `
+            -ScriptArguments @($EmbeddingModel, $EmbeddingRevision, $ModelRoot) `
+            -Failure "pinned embedding model download failed"
     }
     Assert-NoReparseComponents $ModelRoot
     $modelRecords = Get-FileRecords $StagingRoot "model\bge-m3"
@@ -447,14 +506,10 @@ assert (root / "index" / "vectors.f16").stat().st_size == rows * 1024 * 2
 print(json.dumps({"schema_version":2,"sqlite":"ok","rows":rows,
                   "dimensions":1024}, sort_keys=True, separators=(",",":")))
 '@
-    $integrity = & $script:PackPython -E -s -X utf8 -c $integrityProbe $StagingRoot
-    if ($LASTEXITCODE -ne 0) {
-        throw "SQLite or vector integrity verification failed"
-    }
-    [System.IO.File]::WriteAllText(
-        (Join-Path $ReportsRoot "integrity.json"),
-        (($integrity -join [Environment]::NewLine) + [Environment]::NewLine),
-        [System.Text.UTF8Encoding]::new($false))
+    Invoke-PythonSourceReport -Python $script:PackPython -Source $integrityProbe `
+        -ScriptArguments @($StagingRoot) `
+        -ReportPath (Join-Path $ReportsRoot "integrity.json") `
+        -Failure "SQLite or vector integrity verification failed"
 
     $vectors = Get-Content -LiteralPath (Join-Path $StagingRoot "index\vectors.json") `
         -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -468,38 +523,101 @@ print(json.dumps({"schema_version":2,"sqlite":"ok","rows":rows,
         throw "corpus document count is inconsistent"
     }
 
-    $allRecords = @()
-    foreach ($file in Get-ChildItem -LiteralPath $StagingRoot -Recurse -File |
-            Where-Object { $_.Name -ne "pack.json" } | Sort-Object FullName) {
-        if (($file.Attributes -band
-                [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "Knowledge Pack files must not be links"
+    function Write-CompletePackManifest([double]$DenseMinimum) {
+        $runtimeDebris = @(Get-ChildItem -LiteralPath $SidecarRoot -Recurse -Force |
+            Where-Object {
+                $_.Name -eq "__pycache__" -or $_.Name -like "*.pyc"
+            })
+        if ($runtimeDebris.Count -ne 0) {
+            throw "Knowledge Pack contains Python runtime debris"
         }
-        $relative = $file.FullName.Substring($StagingRoot.Length + 1).Replace("\", "/")
-        $allRecords += [ordered]@{
-            path = $relative
-            bytes = [int64]$file.Length
-            sha256 = Get-Sha256 $file.FullName
+        $allRecords = @()
+        $manifestFiles = @(Get-ChildItem -LiteralPath $StagingRoot -Recurse -File |
+            Where-Object { $_.Name -ne "pack.json" } | Sort-Object FullName)
+        $manifestTimer = [System.Diagnostics.Stopwatch]::StartNew()
+        $lastManifestProgress = -5.0
+        $completedManifestFiles = 0
+        $manifestStartEvent = [ordered]@{
+            schema_version = 1
+            type = "progress"
+            phase = "finalize-pack-files"
+            mode = $null
+            status = "running"
+            completed = 0
+            total = $manifestFiles.Count
+            percent = 0.0
+            elapsed_seconds = 0.0
+            throughput_items_per_second = 0.0
+            eta_seconds = $null
         }
+        [Console]::Error.WriteLine(
+            ($manifestStartEvent | ConvertTo-Json -Depth 4 -Compress))
+        $lastManifestProgress = 0.0
+        foreach ($file in $manifestFiles) {
+            if (($file.Attributes -band
+                    [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Knowledge Pack files must not be links"
+            }
+            $relative = $file.FullName.Substring($StagingRoot.Length + 1).Replace("\", "/")
+            $allRecords += [ordered]@{
+                path = $relative
+                bytes = [int64]$file.Length
+                sha256 = Get-Sha256 $file.FullName
+            }
+            $completedManifestFiles += 1
+            if ($completedManifestFiles -eq $manifestFiles.Count -or
+                $manifestTimer.Elapsed.TotalSeconds - $lastManifestProgress -ge 5.0) {
+                $elapsed = $manifestTimer.Elapsed.TotalSeconds
+                $throughput = if ($elapsed -gt 0.0) {
+                    $completedManifestFiles / $elapsed
+                } else { 0.0 }
+                $eta = if ($throughput -gt 0.0) {
+                    ($manifestFiles.Count - $completedManifestFiles) / $throughput
+                } else { $null }
+                $event = [ordered]@{
+                    schema_version = 1
+                    type = "progress"
+                    phase = "finalize-pack-files"
+                    mode = $null
+                    status = if ($completedManifestFiles -eq $manifestFiles.Count) {
+                        "completed"
+                    } else { "running" }
+                    completed = $completedManifestFiles
+                    total = $manifestFiles.Count
+                    percent = [Math]::Round(
+                        100.0 * $completedManifestFiles / $manifestFiles.Count, 3)
+                    elapsed_seconds = [Math]::Round($elapsed, 3)
+                    throughput_items_per_second = [Math]::Round($throughput, 3)
+                    eta_seconds = if ($null -eq $eta) { $null } else {
+                        [Math]::Round($eta, 3)
+                    }
+                }
+                [Console]::Error.WriteLine(
+                    ($event | ConvertTo-Json -Depth 4 -Compress))
+                $lastManifestProgress = $elapsed
+            }
+        }
+        # Pack identity describes the immutable knowledge content. Sidecar
+        # source identity remains independently pinned in build.intent.json.
+        $identitySeed = "$Snapshot`n$DocumentCount`n$(Get-Sha256 $documentsPath)`n$($vectors.matrix_sha256)`n$EmbeddingRevision"
+        $identityHash = [System.BitConverter]::ToString(
+            [System.Security.Cryptography.SHA256]::Create().ComputeHash(
+                [System.Text.Encoding]::UTF8.GetBytes($identitySeed))).Replace("-", "").ToLowerInvariant()
+        $manifest = [ordered]@{
+            schema_version = $SchemaVersion
+            pack_id = "pack-" + $identityHash.Substring(0, 32)
+            snapshot_date = $Snapshot
+            document_count = $DocumentCount
+            chunk_count = [int64]$vectors.rows
+            embedding_model = $EmbeddingModel
+            embedding_revision = $EmbeddingRevision
+            embedding_dimensions = $EmbeddingDimensions
+            relevance_dense_min = $DenseMinimum
+            complete = $true
+            files = @($allRecords)
+        }
+        Write-JsonUtf8NoBom (Join-Path $StagingRoot "pack.json") $manifest
     }
-    $identitySeed = "$Snapshot`n$DocumentCount`n$(Get-Sha256 $documentsPath)`n$($vectors.matrix_sha256)`n$EmbeddingRevision"
-    $identityHash = [System.BitConverter]::ToString(
-        [System.Security.Cryptography.SHA256]::Create().ComputeHash(
-            [System.Text.Encoding]::UTF8.GetBytes($identitySeed))).Replace("-", "").ToLowerInvariant()
-    $manifest = [ordered]@{
-        schema_version = $SchemaVersion
-        pack_id = "pack-" + $identityHash.Substring(0, 32)
-        snapshot_date = $Snapshot
-        document_count = $DocumentCount
-        chunk_count = [int64]$vectors.rows
-        embedding_model = $EmbeddingModel
-        embedding_revision = $EmbeddingRevision
-        embedding_dimensions = $EmbeddingDimensions
-        relevance_dense_min = 0.0
-        complete = $true
-        files = @($allRecords)
-    }
-    Write-JsonUtf8NoBom (Join-Path $StagingRoot "pack.json") $manifest
 
     $verifyPack = @'
 import pathlib, sys
@@ -508,20 +626,110 @@ m = verify_complete_pack(pathlib.Path(sys.argv[1]))
 if m.document_count != 30000 or m.embedding_dimensions != 1024:
     raise SystemExit(2)
 '@
+    # Evaluation outputs live outside the staging pack until all three modes
+    # finish, so each mode verifies the same immutable preliminary manifest.
+    Write-CompletePackManifest -DenseMinimum -1.0
+    Invoke-PythonSource -Python $script:PackPython -Source $verifyPack `
+        -ScriptArguments @($StagingRoot) `
+        -Failure "complete Knowledge Pack verification failed"
+
+    $EvaluationWork = Join-Path $cacheRoot (
+        "evaluation-$Snapshot-" + [Guid]::NewGuid().ToString("N"))
+    Assert-ChildPath $KnowledgeRoot $EvaluationWork
+    [System.IO.Directory]::CreateDirectory($EvaluationWork) | Out-Null
+    $EvaluationCases = Join-Path $EvaluationWork "ecfr-cases.jsonl"
+    $NegativeCases = Join-Path $SourceRoot "rag\eval\negative_cases.jsonl"
+    $CuratedCases = Join-Path $SourceRoot "rag\eval\frozen_curated_cases.jsonl"
+    Write-Host "Generating label-resolved retrieval cases, including the frozen curated holdout."
     Invoke-PackPython @(
-        "-E", "-s", "-X", "utf8", "-c", $verifyPack, $StagingRoot) `
-        "complete Knowledge Pack verification failed"
+        "-E", "-s", "-X", "utf8", $SidecarCli,
+        "generate-eval", "--index-root", (Join-Path $StagingRoot "index"),
+        "--negative-cases", $NegativeCases,
+        "--curated-cases", $CuratedCases, "--output", $EvaluationCases) `
+        "retrieval evaluation case generation failed"
+    $modeReports = [ordered]@{}
+    foreach ($mode in @("lexical", "dense", "hybrid")) {
+        $modeReportPath = Join-Path $EvaluationWork "$mode.json"
+        Write-Host "Evaluating $mode retrieval on the identical frozen case order."
+        Invoke-PackPython @(
+            "-E", "-s", "-X", "utf8", $SidecarCli,
+            "evaluate", "--pack-root", $StagingRoot,
+            "--cases", $EvaluationCases, "--mode", $mode,
+            "--output", $modeReportPath) `
+            "$mode retrieval evaluation failed"
+        $modeReports[$mode] = Get-Content -LiteralPath $modeReportPath -Raw `
+            -Encoding UTF8 | ConvertFrom-Json
+    }
+    $qualitySelection = Join-Path $EvaluationWork "selection.json"
+    $qualityGate = @'
+import json, pathlib, sys
+from agent_rag.evaluation import select_retrieval_mode
+reports = [json.loads(pathlib.Path(p).read_text(encoding="utf-8")) for p in sys.argv[1:4]]
+selected = select_retrieval_mode(lexical=reports[0], dense=reports[1], hybrid=reports[2])
+payload = {"schema_version": 2, "selection_split": "development", "selected_mode": selected}
+pathlib.Path(sys.argv[4]).write_text(
+    json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+)
+'@
+    Invoke-PythonSource -Python $script:PackPython -Source $qualityGate `
+        -ScriptArguments @(
+            (Join-Path $EvaluationWork "lexical.json"),
+            (Join-Path $EvaluationWork "dense.json"),
+            (Join-Path $EvaluationWork "hybrid.json"),
+            $qualitySelection) `
+        -Failure "selected retrieval quality gate failed"
+    $selection = Get-Content -LiteralPath $qualitySelection -Raw -Encoding UTF8 |
+        ConvertFrom-Json
+    if ($selection.schema_version -ne $SchemaVersion -or
+        $selection.selection_split -ne "development" -or
+        $selection.selected_mode -notin @("dense", "hybrid")) {
+        throw "retrieval mode selection is invalid"
+    }
+    $SelectedMode = [string]$selection.selected_mode
+    $DenseMinimum = [double]$modeReports[$SelectedMode].threshold.dense_cosine_min
+    if ([double]::IsNaN($DenseMinimum) -or [double]::IsInfinity($DenseMinimum) -or
+        $DenseMinimum -lt -1.0 -or $DenseMinimum -gt 1.0) {
+        throw "fitted dense threshold is invalid"
+    }
+    $EvaluationRoot = Join-Path $StagingRoot "eval"
+    [System.IO.Directory]::CreateDirectory($EvaluationRoot) | Out-Null
+    Copy-Item -LiteralPath $EvaluationCases `
+        -Destination (Join-Path $EvaluationRoot "ecfr-cases.jsonl")
+    Copy-Item -LiteralPath (Join-Path $SourceRoot "rag\eval\ecfr_eval_schema.json") `
+        -Destination (Join-Path $EvaluationRoot "ecfr_eval_schema.json")
+    $combinedReport = [ordered]@{
+        schema_version = $SchemaVersion
+        case_count = [int]$modeReports[$SelectedMode].case_count
+        quality_gate = "passed"
+        selection_split = "development"
+        selected_mode = $SelectedMode
+        relevance_dense_min = $DenseMinimum
+        modes = $modeReports
+    }
+    Write-JsonUtf8NoBom (Join-Path $ReportsRoot "retrieval-eval.json") $combinedReport
+    Write-CompletePackManifest -DenseMinimum $DenseMinimum
+    Invoke-PythonSource -Python $script:PackPython -Source $verifyPack `
+        -ScriptArguments @($StagingRoot) `
+        -Failure "evaluated Knowledge Pack verification failed"
 
     $publishPack = @'
 import pathlib, sys
 from agent_rag.pack import atomic_publish
-atomic_publish(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]))
+from agent_rag.progress import ProgressReporter
+reporter = ProgressReporter(sys.stderr)
+reporter.update("publish-pack-command", 0, 1)
+try:
+    atomic_publish(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]),
+                   progress=reporter.update)
+except (Exception, KeyboardInterrupt):
+    reporter.fail("publish-pack-command")
+    raise
+reporter.update("publish-pack-command", 1, 1)
 '@
     Write-Host "Publishing the verified Knowledge Pack atomically."
-    Invoke-PackPython @(
-        "-E", "-s", "-X", "utf8", "-c", $publishPack,
-        $StagingRoot, $Destination) `
-        "Knowledge Pack publication failed"
+    Invoke-PythonSource -Python $script:PackPython -Source $publishPack `
+        -ScriptArguments @($StagingRoot, $Destination) `
+        -Failure "Knowledge Pack publication failed"
     $PublishedRoot = Get-FullPath $Destination
 }
 

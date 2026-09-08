@@ -3,6 +3,7 @@
 #include "ports/jsonl_process.h"
 
 #include <memory>
+#include <functional>
 #include <string>
 
 namespace agent {
@@ -10,6 +11,8 @@ namespace agent {
 class ReprocJsonlProcess final : public JsonlProcess {
 public:
     ReprocJsonlProcess();
+    explicit ReprocJsonlProcess(
+        std::function<void(const std::string&)> progress_observer);
     ~ReprocJsonlProcess() override;
     ReprocJsonlProcess(const ReprocJsonlProcess&) = delete;
     ReprocJsonlProcess& operator=(const ReprocJsonlProcess&) = delete;

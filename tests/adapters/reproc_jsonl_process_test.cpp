@@ -67,6 +67,47 @@ TEST_CASE(reproc_jsonl_process_drains_bounded_stderr_without_deadlock) {
     REQUIRE(process.stderr_truncated());
 }
 
+TEST_CASE(reproc_jsonl_process_forwards_only_strict_safe_progress) {
+    test::ScopedTempDir temp("jsonl-progress");
+    std::vector<std::string> messages;
+    agent::ReprocJsonlProcess process(
+        [&](const std::string& message) { messages.push_back(message); });
+    REQUIRE(process.start(fixtures::request(temp.path(), {"progress"})).has_value());
+    REQUIRE(process.exchange(R"({"request":1})", 1'000).has_value());
+    REQUIRE(process.stop(1'000).has_value());
+
+    REQUIRE(messages.size() == 1);
+    REQUIRE(messages.front().find("RAG sidecar-model running: 1/2") == 0);
+    REQUIRE(messages.front().find("throughput 0.333 items/s") !=
+            std::string::npos);
+    REQUIRE(messages.front().find("ETA 3s") != std::string::npos);
+    REQUIRE(messages.front().find("SENTINEL") == std::string::npos);
+}
+
+TEST_CASE(reproc_jsonl_process_rejects_inconsistent_and_overlong_progress) {
+    for (const auto* mode : {"invalid-progress", "oversized-progress-prefix"}) {
+        test::ScopedTempDir temp(mode);
+        std::vector<std::string> messages;
+        agent::ReprocJsonlProcess process(
+            [&](const std::string& message) { messages.push_back(message); });
+        REQUIRE(process.start(fixtures::request(temp.path(), {mode})).has_value());
+        REQUIRE(process.exchange(R"({"request":1})", 1'000).has_value());
+        REQUIRE(process.stop(1'000).has_value());
+        REQUIRE(messages.empty());
+    }
+}
+
+TEST_CASE(reproc_jsonl_process_preserves_the_username_required_by_python_getpass) {
+    test::ScopedTempDir temp("jsonl-getpass");
+    agent::ReprocJsonlProcess process;
+
+    const auto started =
+        process.start(fixtures::request(temp.path(), {"getpass"}));
+
+    REQUIRE(started.has_value());
+    REQUIRE(process.stop(1'000).has_value());
+}
+
 TEST_CASE(reproc_jsonl_process_startup_timeout_stops_child) {
     test::ScopedTempDir temp("jsonl-start-timeout");
     agent::ReprocJsonlProcess process;

@@ -46,11 +46,26 @@ foreach(required_text
         "model.lock.json"
         "active-pack.json"
         "verify_complete_pack"
+        "finalize-pack-files"
+        "ProgressReporter"
+        "PYTHONDONTWRITEBYTECODE"
+        "runtime debris"
+        "build intent differs"
+        "Invoke-PythonSource"
         "PRAGMA integrity_check")
     string(FIND "${script_text}" "${required_text}" found)
     if(found EQUAL -1)
         message(FATAL_ERROR "Knowledge Pack script omits ${required_text}")
     endif()
 endforeach()
+
+# Windows PowerShell 5.1 can strip quotes embedded in a native process `-c`
+# argument. The production build must execute inline Python through a cached
+# script file instead, including resume verification and publication helpers.
+string(FIND "${script_text}" "\"-c\"" quoted_python_c)
+string(FIND "${script_text}" " -c " bare_python_c)
+if(NOT quoted_python_c EQUAL -1 OR NOT bare_python_c EQUAL -1)
+    message(FATAL_ERROR "Knowledge Pack script uses quote-unsafe Python -c")
+endif()
 
 message(STATUS "Knowledge Pack build script preflight contract passed")

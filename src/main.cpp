@@ -8,6 +8,7 @@
 #include "adapters/process/direct_process_runner.h"
 #include "adapters/process/reproc_jsonl_process.h"
 #include "adapters/rag/persistent_rag_knowledge_provider.h"
+#include "adapters/rag/native_rag_pack_verifier.h"
 #include "adapters/system/random_id_generator.h"
 #include "adapters/system/signal_cancellation.h"
 #include "adapters/system/system_clock.h"
@@ -144,13 +145,24 @@ int run_agent(std::vector<std::string> args) {
             gateways.push_back(std::ref(build_tools));
         }
         agent::CompositeToolGateway tools(std::move(gateways));
-        std::unique_ptr<agent::KnowledgeProvider> knowledge;
         std::unique_ptr<agent::JsonlProcess> rag_process;
+        std::unique_ptr<agent::RagPackVerifier> rag_pack_verifier;
+        // The knowledge provider keeps a non-owning reference to rag_process.
+        // Declare the process first so reverse destruction tears down the
+        // provider before the referenced process.
+        std::unique_ptr<agent::KnowledgeProvider> knowledge;
         if (config.value().rag_enabled) {
-            rag_process = std::make_unique<agent::ReprocJsonlProcess>();
+            const auto rag_progress = [](const std::string& message) {
+                std::cerr << message << '\n';
+                std::cerr.flush();
+            };
+            rag_process =
+                std::make_unique<agent::ReprocJsonlProcess>(rag_progress);
+            rag_pack_verifier =
+                std::make_unique<agent::NativeRagPackVerifier>(rag_progress);
             knowledge =
                 std::make_unique<agent::PersistentRagKnowledgeProvider>(
-                    *rag_process, config.value().rag);
+                    *rag_process, *rag_pack_verifier, config.value().rag);
         } else {
             knowledge = std::make_unique<agent::EmptyKnowledgeProvider>();
         }

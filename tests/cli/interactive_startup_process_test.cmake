@@ -150,7 +150,7 @@ function(run_rag_startup expected_result expected_error)
         TIMEOUT 20)
     if(NOT rag_result EQUAL expected_result)
         message(FATAL_ERROR
-            "RAG startup returned ${rag_result}, expected ${expected_result}")
+            "RAG startup returned ${rag_result}, expected ${expected_result}: ${rag_error}")
     endif()
     if(expected_error)
         string(STRIP "${rag_error}" rag_error)

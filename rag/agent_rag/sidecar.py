@@ -6,8 +6,9 @@ from pathlib import Path
 from typing import BinaryIO, Callable, Protocol, TextIO
 
 from .embedding import BgeM3Embedding, EmbeddingError, encode_normalized, select_embedding_device
-from .hybrid_retriever import EvidenceItem, HybridRetriever
-from .pack import verify_complete_pack
+from .hybrid_retriever import EvidenceItem, HybridRetriever, RetrievalResult
+from .pack import retrieval_revision, verify_runtime_pack
+from .progress import ProgressReporter
 from .protocol import ClientMessage, ProtocolError, parse_v2_message
 
 
@@ -16,14 +17,14 @@ MAX_LINE_BYTES = 65_536
 
 
 class Retriever(Protocol):
-    def query(
+    def query_result(
         self,
         query: str,
         *,
         top_k: int,
         max_total_bytes: int,
         mode: str,
-    ) -> list[EvidenceItem]: ...
+    ) -> RetrievalResult: ...
 
 
 @dataclass(frozen=True)
@@ -32,10 +33,17 @@ class LoadedRuntime:
     ready_payload: dict[str, object]
 
 
-def _load_runtime(pack_root: Path, device: str = "auto") -> LoadedRuntime:
-    manifest = verify_complete_pack(pack_root)
+def _load_runtime(
+    pack_root: Path,
+    device: str = "auto",
+    progress: Callable[..., None] | None = None,
+) -> LoadedRuntime:
+    manifest = verify_runtime_pack(pack_root, progress=progress)
+    runtime_revision = retrieval_revision(manifest)
     model_root = pack_root / "model" / "bge-m3"
     selected = select_embedding_device(device)
+    if progress is not None:
+        progress("sidecar-model", 0, 1)
     try:
         embedding = BgeM3Embedding(model_root, device=selected)
         encode_normalized(embedding, ["sidecar startup self test"], dimensions=1024)
@@ -45,15 +53,20 @@ def _load_runtime(pack_root: Path, device: str = "auto") -> LoadedRuntime:
         selected = "cpu"
         embedding = BgeM3Embedding(model_root, device=selected)
         encode_normalized(embedding, ["sidecar startup self test"], dimensions=1024)
+    if progress is not None:
+        progress("sidecar-model", 1, 1)
     retriever = HybridRetriever(
         pack_root / "index",
         embedding=embedding,
         dense_min=manifest.relevance_dense_min,
+        progress=progress,
+        verify_database_integrity=False,
     )
     return LoadedRuntime(
         retriever,
         {
             "pack_id": manifest.pack_id,
+            "retrieval_revision": runtime_revision,
             "snapshot_date": manifest.snapshot_date,
             "document_count": manifest.document_count,
             "chunk_count": manifest.chunk_count,
@@ -137,7 +150,9 @@ def _readline(source: BinaryIO | TextIO) -> bytes | None:
     return data
 
 
-def _evidence_json(item: EvidenceItem) -> dict[str, object]:
+def _evidence_json(
+    item: EvidenceItem, runtime_revision: str
+) -> dict[str, object]:
     return {
         "source_id": item.chunk_id,
         "content": item.content,
@@ -150,6 +165,7 @@ def _evidence_json(item: EvidenceItem) -> dict[str, object]:
             "official_url": item.official_url,
             "content_sha256": item.content_sha256,
             "document_sha256": item.document_sha256,
+            "retrieval_revision": runtime_revision,
             "bm25_rank": item.lexical_rank,
             "dense_rank": item.dense_rank,
             "fusion_score": item.fusion_score,
@@ -167,7 +183,7 @@ def _handle(runtime: LoadedRuntime, message: ClientMessage) -> tuple[dict[str, o
             message.request_id, "shutdown_result", {"status": "stopping"}
         ), True
     payload = message.payload
-    items = runtime.retriever.query(
+    result = runtime.retriever.query_result(
         str(payload["query"]),
         top_k=int(payload["top_k"]),
         max_total_bytes=int(payload["max_total_bytes"]),
@@ -176,7 +192,13 @@ def _handle(runtime: LoadedRuntime, message: ClientMessage) -> tuple[dict[str, o
     return _response(
         message.request_id,
         "query_result",
-        {"items": [_evidence_json(item) for item in items]},
+        {
+            "outcome": result.outcome,
+            "items": [
+                _evidence_json(item, str(runtime.ready_payload["retrieval_revision"]))
+                for item in result.items
+            ],
+        },
     ), False
 
 
@@ -197,13 +219,30 @@ def run_sidecar(
     try:
         if device not in {"auto", "cuda", "cpu"}:
             raise ValueError("invalid device")
+        reporter = ProgressReporter(stderr)
+        active_phase: str | None = None
+
+        def report(phase: str, completed: int, total: int, **_: object) -> None:
+            nonlocal active_phase
+            reporter.update(phase, completed, total, mode="sidecar")
+            if completed == total:
+                if active_phase == phase:
+                    active_phase = None
+            else:
+                active_phase = phase
+
         runtime = (
             runtime_factory(root)
             if runtime_factory is not None
-            else _load_runtime(root, device=device)
+            else _load_runtime(root, device=device, progress=report)
         )
         _write(stdout, _response(SERVER_REQUEST_ID, "ready", runtime.ready_payload))
     except Exception:
+        if "active_phase" in locals() and active_phase is not None:
+            try:
+                reporter.fail(active_phase, mode="sidecar")
+            except Exception:
+                pass
         stderr.write("rag sidecar initialization failed\n")
         stderr.flush()
         return 2
