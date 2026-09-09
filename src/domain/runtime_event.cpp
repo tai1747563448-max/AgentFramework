@@ -20,6 +20,8 @@ EventKind event_kind(const EventPayload& payload) {
                 return EventKind::ContextPreparationStarted;
             } else if constexpr (std::is_same_v<Payload, ContextPreparedPayload>) {
                 return EventKind::ContextPrepared;
+            } else if constexpr (std::is_same_v<Payload, KnowledgeNoMatchPayload>) {
+                return EventKind::KnowledgeNoMatch;
             } else if constexpr (std::is_same_v<Payload, ContextPreparationFailedPayload>) {
                 return EventKind::ContextPreparationFailed;
             } else if constexpr (std::is_same_v<Payload, ModelCallStartedPayload>) {

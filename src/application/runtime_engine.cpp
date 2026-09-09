@@ -11,6 +11,7 @@
 #include "ports/tool_gateway.h"
 
 #include <string>
+#include <cstdint>
 #include <utility>
 #include <variant>
 
@@ -52,6 +53,48 @@ std::string concatenate_text_blocks(
 
 std::string concatenate_text(const ModelResponse& response) {
     return concatenate_text_blocks(response.content);
+}
+
+bool contains_cjk(const std::string& text) {
+    for (std::size_t index = 0; index < text.size();) {
+        const auto first = static_cast<unsigned char>(text[index]);
+        std::uint32_t codepoint = first;
+        std::size_t width = 1;
+        if ((first & 0xE0U) == 0xC0U && index + 1 < text.size()) {
+            codepoint = static_cast<std::uint32_t>(first & 0x1FU) << 6U;
+            width = 2;
+        } else if ((first & 0xF0U) == 0xE0U && index + 2 < text.size()) {
+            codepoint = static_cast<std::uint32_t>(first & 0x0FU) << 12U;
+            width = 3;
+        } else if ((first & 0xF8U) == 0xF0U && index + 3 < text.size()) {
+            codepoint = static_cast<std::uint32_t>(first & 0x07U) << 18U;
+            width = 4;
+        }
+        for (std::size_t offset = 1; offset < width; ++offset) {
+            codepoint |= static_cast<std::uint32_t>(
+                             static_cast<unsigned char>(text[index + offset]) &
+                             0x3FU)
+                         << (6U * static_cast<unsigned int>(width - offset - 1));
+        }
+        if ((codepoint >= 0x3400U && codepoint <= 0x4DBFU) ||
+            (codepoint >= 0x4E00U && codepoint <= 0x9FFFU) ||
+            (codepoint >= 0xF900U && codepoint <= 0xFAFFU) ||
+            (codepoint >= 0x20000U && codepoint <= 0x323AFU)) {
+            return true;
+        }
+        index += width;
+    }
+    return false;
+}
+
+std::string authoritative_no_match_text(const std::string& issue) {
+    if (contains_cjk(issue)) {
+        return u8"已配置的知识库快照中没有找到所请求权威条目的支持证据，因此未生成答案或引文。请核对条目编号，或将该资料加入知识库后重建索引。";
+    }
+    return "The configured Knowledge Pack contains no supporting evidence for "
+           "the requested authoritative reference, so no answer or citation "
+           "was generated. Check the reference or rebuild the index after "
+           "adding the source.";
 }
 
 }  // namespace
@@ -250,6 +293,13 @@ RuntimeResult RuntimeEngine::continue_task(
         }
 
         if (state->status == TaskStatus::AwaitingModel) {
+            if (state->evidence.authoritative_no_match) {
+                return append_event(
+                    state, task_id,
+                    KnowledgeNoMatchPayload{
+                        authoritative_no_match_text(state->issue)},
+                    observer);
+            }
             if (!state->model_call_in_flight &&
                 state->accepted_model_stop_reason.has_value()) {
                 switch (*state->accepted_model_stop_reason) {
@@ -310,6 +360,12 @@ RuntimeResult RuntimeEngine::continue_task(
                     return transition;
                 }
                 auto definitions = tools_.definitions();
+                if (state->evidence.tool_use_forbidden) {
+                    // Retrieved articles are untrusted data. A model may quote or
+                    // summarize them, but it cannot turn their contents into an
+                    // executable capability request.
+                    definitions.clear();
+                }
 
                 model_request = ModelRequest{
                     system_prompt, state->messages, std::move(definitions),
@@ -366,6 +422,10 @@ RuntimeResult RuntimeEngine::continue_task(
 
             const bool has_tool_call = contains_tool_call(response.value());
             const auto final_text = concatenate_text(response.value());
+            if (has_tool_call && state->evidence.tool_use_forbidden) {
+                return protocol_failure(
+                    "model tool use is forbidden while retrieval evidence is active");
+            }
 
             switch (response.value().stop_reason) {
             case StopReason::Unknown:

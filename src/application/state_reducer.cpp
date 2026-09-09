@@ -132,6 +132,23 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                 state.evidence = typed_payload.evidence;
                 state.status = TaskStatus::AwaitingModel;
                 return Result<void>::success();
+            } else if constexpr (std::is_same_v<Payload, KnowledgeNoMatchPayload>) {
+                const Message answer{
+                    Role::Assistant, {TextBlock{typed_payload.final_text}}};
+                auto completed_messages = state.messages;
+                completed_messages.push_back(answer);
+                if (state.status != TaskStatus::AwaitingModel ||
+                    state.model_call_in_flight ||
+                    !state.evidence.authoritative_no_match ||
+                    typed_payload.final_text.empty() ||
+                    !conversation_history_is_valid(completed_messages)) {
+                    return invalid_transition(
+                        "knowledge no-match requires authoritative empty evidence");
+                }
+                state.messages = std::move(completed_messages);
+                state.final_text = typed_payload.final_text;
+                state.status = TaskStatus::Completed;
+                return Result<void>::success();
             } else if constexpr (
                 std::is_same_v<Payload, ContextPreparationFailedPayload>) {
                 if (state.status != TaskStatus::PreparingContext) {
@@ -156,6 +173,11 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                     !(typed_payload.request.evidence == state.evidence)) {
                     return invalid_transition(
                         "model request evidence does not match prepared context");
+                }
+                if (state.evidence.tool_use_forbidden &&
+                    !typed_payload.request.tools.empty()) {
+                    return invalid_transition(
+                        "retrieval-backed model request cannot expose tools");
                 }
                 if (typed_payload.request.timeout_ms !=
                     state.budgets.model_timeout_ms) {
@@ -189,6 +211,10 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                     if (const auto* tool_use = std::get_if<ToolUseBlock>(&block)) {
                         ordered_calls.push_back(tool_use->call);
                     }
+                }
+                if (state.evidence.tool_use_forbidden && !ordered_calls.empty()) {
+                    return invalid_transition(
+                        "retrieval evidence cannot authorize tool calls");
                 }
 
                 state.messages.push_back(

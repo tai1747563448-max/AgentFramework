@@ -160,6 +160,9 @@ bool metadata_is_valid(const Value& value, std::size_t depth,
 }  // namespace
 
 bool evidence_pack_is_valid(const EvidencePack& evidence) noexcept {
+    if (evidence.authoritative_no_match && !evidence.items.empty()) {
+        return false;
+    }
     if (evidence.items.size() > kMaxEvidenceItems) {
         return false;
     }

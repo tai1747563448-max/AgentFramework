@@ -1,12 +1,18 @@
 #include "config/runtime_config.h"
 
 #include <dotenv.h>
+#include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <charconv>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
+#include <set>
 #include <streambuf>
 #include <string>
 #include <system_error>
@@ -23,6 +29,8 @@ namespace {
 constexpr const char* kDefaultSystemPrompt =
     "You are a coding agent. Inspect the workspace, make focused edits, "
     "and verify the result. Use only the tools explicitly provided.";
+constexpr std::uintmax_t kMaximumSmallJsonBytes = 65'536;
+constexpr std::uintmax_t kMaximumPackManifestBytes = 32U * 1024U * 1024U;
 
 class NullOutputBuffer final : public std::streambuf {
 protected:
@@ -202,6 +210,173 @@ std::optional<std::string> wide_to_utf8(const std::wstring& wide) {
 }
 #endif
 
+bool path_is_link_or_reparse(const std::filesystem::path& path,
+                             std::error_code& error) noexcept {
+    const auto status = std::filesystem::symlink_status(path, error);
+    if (error || std::filesystem::is_symlink(status)) {
+        return true;
+    }
+#if defined(_WIN32)
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        error = std::error_code(static_cast<int>(GetLastError()),
+                                std::system_category());
+        return true;
+    }
+    return (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+#else
+    return false;
+#endif
+}
+
+bool trusted_path_components(const std::filesystem::path& supplied) noexcept {
+    try {
+        std::error_code error;
+        auto current = supplied.root_path();
+        for (const auto& component : supplied.relative_path()) {
+            current /= component;
+            if (path_is_link_or_reparse(current, error) || error) {
+                return false;
+            }
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::optional<nlohmann::json> read_strict_json_file(
+    const std::filesystem::path& path,
+    std::uintmax_t maximum_bytes = kMaximumSmallJsonBytes) noexcept {
+    try {
+        std::error_code error;
+        if (!std::filesystem::is_regular_file(path, error) || error ||
+            path_is_link_or_reparse(path, error) || error ||
+            std::filesystem::hard_link_count(path, error) != 1 || error ||
+            std::filesystem::file_size(path, error) > maximum_bytes || error) {
+            return std::nullopt;
+        }
+        std::ifstream input(path, std::ios::binary);
+        const std::string bytes{std::istreambuf_iterator<char>(input),
+                                std::istreambuf_iterator<char>()};
+        if ((!input.good() && !input.eof()) || bytes.empty()) {
+            return std::nullopt;
+        }
+        bool duplicate = false;
+        std::vector<std::set<std::string>> keys;
+        const nlohmann::json::parser_callback_t callback =
+            [&](int depth, nlohmann::json::parse_event_t event,
+                nlohmann::json& parsed) {
+                if (event == nlohmann::json::parse_event_t::object_start) {
+                    const auto index = static_cast<std::size_t>(depth + 1);
+                    if (keys.size() <= index) {
+                        keys.resize(index + 1);
+                    }
+                    keys[index].clear();
+                } else if (event == nlohmann::json::parse_event_t::key) {
+                    const auto index = static_cast<std::size_t>(depth);
+                    if (keys.size() <= index) {
+                        keys.resize(index + 1);
+                    }
+                    if (!keys[index].insert(parsed.get<std::string>()).second) {
+                        duplicate = true;
+                    }
+                }
+                return true;
+            };
+        auto value = nlohmann::json::parse(bytes, callback, true, false);
+        if (value.is_discarded() || duplicate) {
+            return std::nullopt;
+        }
+        return value;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+bool manifest_is_complete(const nlohmann::json& value) {
+    static const std::set<std::string> expected{
+        "schema_version", "pack_id", "snapshot_date", "document_count",
+        "chunk_count", "embedding_model", "embedding_revision",
+        "embedding_dimensions", "relevance_dense_min", "complete", "files"};
+    if (!value.is_object() || value.size() != expected.size()) {
+        return false;
+    }
+    for (const auto& key : expected) {
+        if (!value.contains(key)) {
+            return false;
+        }
+    }
+    return value.at("schema_version").is_number_integer() &&
+           value.at("schema_version").get<std::int64_t>() == 2 &&
+           value.at("document_count").is_number_integer() &&
+           value.at("document_count").get<std::int64_t>() == 30'000 &&
+           value.at("embedding_model").is_string() &&
+           value.at("embedding_model").get_ref<const std::string&>() ==
+               "BAAI/bge-m3" &&
+           value.at("embedding_revision").is_string() &&
+           value.at("embedding_revision").get_ref<const std::string&>() ==
+               "5617a9f61b028005a4858fdac845db406aefb181" &&
+           value.at("embedding_dimensions").is_number_integer() &&
+           value.at("embedding_dimensions").get<std::int64_t>() == 1'024 &&
+           value.at("complete").is_boolean() &&
+           value.at("complete").get<bool>();
+}
+
+std::optional<std::filesystem::path> trusted_pack_root(
+    const std::filesystem::path& supplied) noexcept {
+    try {
+        if (supplied.empty() || !supplied.is_absolute() ||
+            !trusted_path_components(supplied)) {
+            return std::nullopt;
+        }
+        std::error_code error;
+        const auto canonical = std::filesystem::canonical(supplied, error);
+        if (error || !std::filesystem::is_directory(canonical, error) || error ||
+            !trusted_path_components(canonical)) {
+            return std::nullopt;
+        }
+        const auto manifest = read_strict_json_file(
+            canonical / "pack.json", kMaximumPackManifestBytes);
+        if (!manifest.has_value() || !manifest_is_complete(*manifest)) {
+            return std::nullopt;
+        }
+        for (const auto& required : {
+                 std::filesystem::path("runtime") / "python.exe",
+                 std::filesystem::path("sidecar") / "agent_rag_cli.py"}) {
+            const auto file = canonical / required;
+            if (!std::filesystem::is_regular_file(file, error) || error ||
+                path_is_link_or_reparse(file, error) || error ||
+                std::filesystem::hard_link_count(file, error) != 1 || error) {
+                return std::nullopt;
+            }
+        }
+        return canonical;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::string lower_component(const std::filesystem::path& value) {
+    auto text = value.generic_u8string();
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char byte) {
+        return static_cast<char>(std::tolower(byte));
+    });
+    return text;
+}
+
+bool inside_ready_directory(const std::filesystem::path& root) {
+    std::string previous;
+    for (const auto& component : root) {
+        const auto current = lower_component(component);
+        if (previous == "out" && current == "agentframework-ready") {
+            return true;
+        }
+        previous = current;
+    }
+    return false;
+}
+
 }  // namespace
 
 std::optional<std::string> ProcessEnvironment::get(
@@ -245,7 +420,9 @@ std::optional<std::string> ProcessEnvironment::get(
 #endif
 }
 
-Result<RuntimeConfig> load_runtime_config(const Environment& environment) {
+Result<RuntimeConfig> load_runtime_config(
+    const Environment& environment,
+    const std::filesystem::path& executable_path) {
     const auto base_url = nonempty(environment, "AGENT_BASE_URL");
     if (!base_url.has_value()) {
         return invalid_config("AGENT_BASE_URL is required");
@@ -342,39 +519,86 @@ Result<RuntimeConfig> load_runtime_config(const Environment& environment) {
     }
     const auto system_prompt = environment.get("AGENT_SYSTEM_PROMPT");
 
-    PythonRagConfig rag;
+    RagConfig rag;
+    rag.enabled = rag_enabled.value();
     if (rag_enabled.value()) {
-        const auto python = environment.get("AGENT_RAG_PYTHON");
-        if (python.has_value() && python->empty()) {
-            return invalid_config("AGENT_RAG_PYTHON must not be empty");
+        const auto mode = environment.get("AGENT_RAG_MODE");
+        const auto device = environment.get("AGENT_RAG_DEVICE");
+        rag.mode = mode.has_value() ? *mode : "dense";
+        rag.device = device.has_value() ? *device : "auto";
+        if (rag.mode != "hybrid" && rag.mode != "dense" &&
+            rag.mode != "lexical") {
+            return invalid_config("rag mode must be hybrid, dense, or lexical");
         }
-        const auto script = nonempty(environment, "AGENT_RAG_SCRIPT");
-        const auto index = nonempty(environment, "AGENT_RAG_INDEX");
-        if (!script.has_value() || !index.has_value()) {
-            return invalid_config(
-                "enabled rag requires script and index paths");
+        if (rag.device != "auto" && rag.device != "cuda" &&
+            rag.device != "cpu") {
+            return invalid_config("rag device must be auto, cuda, or cpu");
         }
-        const auto top_k =
-            positive_integer(environment, "AGENT_RAG_TOP_K", 5);
-        const auto rag_timeout =
-            positive_integer(environment, "AGENT_RAG_TIMEOUT_SECONDS", 10);
-        if (!top_k.has_value() || !rag_timeout.has_value()) {
+        const auto top_k = positive_integer(environment, "AGENT_RAG_TOP_K", 6);
+        const auto maximum = positive_integer(
+            environment, "AGENT_RAG_MAX_TOTAL_BYTES", 32'768);
+        const auto startup = positive_integer(
+            environment, "AGENT_RAG_STARTUP_TIMEOUT_SECONDS", 120);
+        const auto query = positive_integer(
+            environment, "AGENT_RAG_QUERY_TIMEOUT_SECONDS", 30);
+        if (!top_k.has_value() || !maximum.has_value() ||
+            !startup.has_value() || !query.has_value()) {
             return invalid_config(
-                "rag numeric configuration must be a positive integer");
+                "rag numeric configuration must be a positive bounded integer");
         }
         if (top_k.value() > 20) {
             return invalid_config("rag top-k must be between 1 and 20");
         }
-        if (rag_timeout.value() > 60) {
-            return invalid_config("rag timeout must be between 1 and 60 seconds");
+        if (maximum.value() > 32'768) {
+            return invalid_config("rag evidence budget must be at most 32768 bytes");
+        }
+        if (startup.value() > 600) {
+            return invalid_config("rag startup timeout must be between 1 and 600 seconds");
+        }
+        if (query.value() > 120) {
+            return invalid_config("rag query timeout must be between 1 and 120 seconds");
+        }
+        if (startup.value() >
+                static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max() / 1000) ||
+            query.value() >
+                static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max() / 1000)) {
+            return invalid_config("rag numeric configuration is out of range");
         }
         try {
-            rag.python_program = python.has_value() ? *python : "python";
-            rag.script_path = std::filesystem::u8path(*script);
-            rag.index_path = std::filesystem::u8path(*index);
+            const auto supplied = environment.get("AGENT_RAG_PACK_ROOT");
+            if (supplied.has_value()) {
+                if (supplied->empty()) {
+                    return invalid_config("AGENT_RAG_PACK_ROOT must not be empty");
+                }
+                const auto requested = std::filesystem::u8path(*supplied);
+                if (!requested.is_absolute()) {
+                    return invalid_config("AGENT_RAG_PACK_ROOT must be absolute");
+                }
+                const auto trusted = trusted_pack_root(requested);
+                if (!trusted.has_value()) {
+                    return invalid_config("rag knowledge pack is unavailable");
+                }
+                rag.pack_root = *trusted;
+            } else {
+                auto discovered = discover_rag_pack_root(executable_path);
+                if (!discovered.has_value()) {
+                    return Result<RuntimeConfig>::failure(discovered.error());
+                }
+                if (!discovered.value().has_value()) {
+                    return invalid_config(
+                        "enabled rag requires an external knowledge pack");
+                }
+                rag.pack_root = *discovered.value();
+            }
+            if (inside_ready_directory(rag.pack_root)) {
+                return invalid_config("rag knowledge pack must be external");
+            }
             rag.top_k = static_cast<std::size_t>(top_k.value());
-            rag.timeout_seconds =
-                static_cast<std::int64_t>(rag_timeout.value());
+            rag.max_total_bytes = static_cast<std::size_t>(maximum.value());
+            rag.startup_timeout_ms =
+                static_cast<std::int64_t>(startup.value() * 1000);
+            rag.query_timeout_ms =
+                static_cast<std::int64_t>(query.value() * 1000);
         } catch (const std::filesystem::filesystem_error&) {
             return invalid_config("rag path configuration is invalid");
         }
@@ -482,6 +706,64 @@ Result<std::optional<std::filesystem::path>> discover_interactive_env_file(
         return Result<std::optional<std::filesystem::path>>::failure(
             {ErrorCode::InvalidConfiguration,
              "interactive environment discovery failed", false});
+    }
+}
+
+Result<std::optional<std::filesystem::path>> discover_rag_pack_root(
+    const std::filesystem::path& executable_path) {
+    try {
+        if (executable_path.empty()) {
+            return Result<std::optional<std::filesystem::path>>::success(
+                std::nullopt);
+        }
+        std::error_code error;
+        const auto executable = std::filesystem::absolute(
+            executable_path, error).lexically_normal();
+        if (error || executable.parent_path().empty()) {
+            return Result<std::optional<std::filesystem::path>>::failure(
+                {ErrorCode::InvalidConfiguration,
+                 "rag active pack pointer is invalid", false});
+        }
+        const auto pointer = executable.parent_path().parent_path() /
+                             "AgentFramework-Knowledge" / "active-pack.json";
+        if (!std::filesystem::exists(pointer, error)) {
+            if (error) {
+                return Result<std::optional<std::filesystem::path>>::failure(
+                    {ErrorCode::InvalidConfiguration,
+                     "rag active pack pointer is invalid", false});
+            }
+            return Result<std::optional<std::filesystem::path>>::success(
+                std::nullopt);
+        }
+        const auto value = read_strict_json_file(pointer);
+        if (!value.has_value() || !value->is_object() || value->size() != 2 ||
+            !value->contains("schema_version") ||
+            !value->contains("pack_root") ||
+            !value->at("schema_version").is_number_integer() ||
+            value->at("schema_version").get<std::int64_t>() != 1 ||
+            !value->at("pack_root").is_string()) {
+            return Result<std::optional<std::filesystem::path>>::failure(
+                {ErrorCode::InvalidConfiguration,
+                 "rag active pack pointer is invalid", false});
+        }
+        const auto supplied =
+            std::filesystem::u8path(value->at("pack_root").get<std::string>());
+        if (!supplied.is_absolute()) {
+            return Result<std::optional<std::filesystem::path>>::failure(
+                {ErrorCode::InvalidConfiguration,
+                 "rag active pack pointer is invalid", false});
+        }
+        const auto trusted = trusted_pack_root(supplied);
+        if (!trusted.has_value() || inside_ready_directory(*trusted)) {
+            return Result<std::optional<std::filesystem::path>>::failure(
+                {ErrorCode::InvalidConfiguration,
+                 "rag active pack pointer is invalid", false});
+        }
+        return Result<std::optional<std::filesystem::path>>::success(*trusted);
+    } catch (...) {
+        return Result<std::optional<std::filesystem::path>>::failure(
+            {ErrorCode::InvalidConfiguration,
+             "rag active pack pointer is invalid", false});
     }
 }
 

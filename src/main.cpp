@@ -6,7 +6,9 @@
 #include "adapters/persistence/jsonl_memory_store.h"
 #include "adapters/persistence/jsonl_session_store.h"
 #include "adapters/process/direct_process_runner.h"
-#include "adapters/rag/python_rag_knowledge_provider.h"
+#include "adapters/process/reproc_jsonl_process.h"
+#include "adapters/rag/persistent_rag_knowledge_provider.h"
+#include "adapters/rag/native_rag_pack_verifier.h"
 #include "adapters/system/random_id_generator.h"
 #include "adapters/system/signal_cancellation.h"
 #include "adapters/system/system_clock.h"
@@ -123,7 +125,9 @@ int run_agent(std::vector<std::string> args) {
         }
 
         agent::ProcessEnvironment environment;
-        auto config = agent::load_runtime_config(environment);
+        auto config = agent::load_runtime_config(
+            environment,
+            std::filesystem::u8path(startup.value().command_args.front()));
         if (!config.has_value()) {
             std::cerr << config.error().message << '\n';
             return agent::ExitCode::InvalidInputOrConfig;
@@ -141,10 +145,22 @@ int run_agent(std::vector<std::string> args) {
             gateways.push_back(std::ref(build_tools));
         }
         agent::CompositeToolGateway tools(std::move(gateways));
+        std::unique_ptr<agent::JsonlProcess> rag_process;
+        std::unique_ptr<agent::RagPackVerifier> rag_pack_verifier;
+        // Destroy the provider before the process and verifier it references.
         std::unique_ptr<agent::KnowledgeProvider> knowledge;
         if (config.value().rag_enabled) {
-            knowledge = std::make_unique<agent::PythonRagKnowledgeProvider>(
-                process, config.value().rag);
+            const auto rag_progress = [](const std::string& message) {
+                std::cerr << message << '\n';
+                std::cerr.flush();
+            };
+            rag_process =
+                std::make_unique<agent::ReprocJsonlProcess>(rag_progress);
+            rag_pack_verifier =
+                std::make_unique<agent::NativeRagPackVerifier>(rag_progress);
+            knowledge =
+                std::make_unique<agent::PersistentRagKnowledgeProvider>(
+                    *rag_process, *rag_pack_verifier, config.value().rag);
         } else {
             knowledge = std::make_unique<agent::EmptyKnowledgeProvider>();
         }

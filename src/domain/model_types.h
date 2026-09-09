@@ -63,6 +63,8 @@ struct Evidence {
 
 struct EvidencePack {
     std::vector<Evidence> items;
+    bool authoritative_no_match{false};
+    bool tool_use_forbidden{false};
 };
 
 struct ModelRequest {
@@ -254,7 +256,9 @@ inline bool operator==(const Evidence& left, const Evidence& right) {
 }
 
 inline bool operator==(const EvidencePack& left, const EvidencePack& right) {
-    return left.items == right.items;
+    return left.items == right.items &&
+           left.authoritative_no_match == right.authoritative_no_match &&
+           left.tool_use_forbidden == right.tool_use_forbidden;
 }
 
 inline bool operator==(const ModelRequest& left, const ModelRequest& right) {

@@ -53,6 +53,8 @@ const char* event_kind_name(EventKind event_kind) {
             return "ContextPreparationStarted";
         case EventKind::ContextPrepared:
             return "ContextPrepared";
+        case EventKind::KnowledgeNoMatch:
+            return "KnowledgeNoMatch";
         case EventKind::ContextPreparationFailed:
             return "ContextPreparationFailed";
         case EventKind::ModelCallStarted:

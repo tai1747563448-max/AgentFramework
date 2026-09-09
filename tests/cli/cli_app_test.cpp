@@ -848,11 +848,14 @@ TEST_CASE(config_loads_defaults_and_api_key_authentication) {
     REQUIRE(config.value().build_tools_enabled == false);
     REQUIRE(config.value().build_timeout_ms == 300'000);
     REQUIRE(config.value().rag_enabled == false);
-    REQUIRE(config.value().rag.python_program == "python");
-    REQUIRE(config.value().rag.script_path.empty());
-    REQUIRE(config.value().rag.index_path.empty());
-    REQUIRE(config.value().rag.top_k == 5);
-    REQUIRE(config.value().rag.timeout_seconds == 10);
+    REQUIRE(config.value().rag.enabled == false);
+    REQUIRE(config.value().rag.mode == "hybrid");
+    REQUIRE(config.value().rag.pack_root.empty());
+    REQUIRE(config.value().rag.top_k == 6);
+    REQUIRE(config.value().rag.max_total_bytes == 32'768);
+    REQUIRE(config.value().rag.startup_timeout_ms == 120'000);
+    REQUIRE(config.value().rag.query_timeout_ms == 30'000);
+    REQUIRE(config.value().rag.device == "auto");
     REQUIRE(config.value().system_prompt ==
             "You are a coding agent. Inspect the workspace, make focused edits, "
             "and verify the result. Use only the tools explicitly provided.");
@@ -870,12 +873,7 @@ TEST_CASE(config_loads_explicit_values_and_bearer_authentication) {
         {"AGENT_MODEL_TIMEOUT_SECONDS", "13"},
         {"AGENT_ENABLE_BUILD_TOOLS", "1"},
         {"AGENT_BUILD_TIMEOUT_SECONDS", "17"},
-        {"AGENT_ENABLE_RAG", "1"},
-        {"AGENT_RAG_PYTHON", u8"工具/python🙂"},
-        {"AGENT_RAG_SCRIPT", u8"知识/检索.py"},
-        {"AGENT_RAG_INDEX", u8"知识/索引.sqlite3"},
-        {"AGENT_RAG_TOP_K", "17"},
-        {"AGENT_RAG_TIMEOUT_SECONDS", "23"},
+        {"AGENT_ENABLE_RAG", "0"},
         {"AGENT_RUNTIME_ROOT", u8"运行数据"},
         {"AGENT_SYSTEM_PROMPT", u8"仅使用已提供的工具。"},
     };
@@ -890,14 +888,8 @@ TEST_CASE(config_loads_explicit_values_and_bearer_authentication) {
     REQUIRE(config.value().runtime_root == std::filesystem::u8path(u8"运行数据"));
     REQUIRE(config.value().build_tools_enabled == true);
     REQUIRE(config.value().build_timeout_ms == 17'000);
-    REQUIRE(config.value().rag_enabled == true);
-    REQUIRE(config.value().rag.python_program == u8"工具/python🙂");
-    REQUIRE(config.value().rag.script_path ==
-            std::filesystem::u8path(u8"知识/检索.py"));
-    REQUIRE(config.value().rag.index_path ==
-            std::filesystem::u8path(u8"知识/索引.sqlite3"));
-    REQUIRE(config.value().rag.top_k == 17);
-    REQUIRE(config.value().rag.timeout_seconds == 23);
+    REQUIRE(config.value().rag_enabled == false);
+    REQUIRE(config.value().rag.enabled == false);
     REQUIRE(config.value().system_prompt == u8"仅使用已提供的工具。");
 }
 
@@ -946,32 +938,18 @@ TEST_CASE(config_rejects_malformed_build_opt_in_and_out_of_range_timeout) {
 }
 
 TEST_CASE(config_parses_rag_opt_in_exactly_and_ignores_disabled_details) {
-    for (const auto& entry :
-         std::vector<std::pair<std::string, bool>>{{"0", false},
-                                                   {"1", true}}) {
-        test::MapEnvironment env{
-            {"AGENT_BASE_URL", "https://provider.example"},
-            {"AGENT_MODEL", "model-id"},
-            {"AGENT_API_KEY", "credential"},
-            {"AGENT_ENABLE_RAG", entry.first},
-            {"AGENT_RAG_SCRIPT", "C:/trusted/agent_rag_cli.py"},
-            {"AGENT_RAG_INDEX", "C:/trusted/knowledge.sqlite3"}};
-        const auto config = agent::load_runtime_config(env);
-        REQUIRE(config.has_value());
-        REQUIRE(config.value().rag_enabled == entry.second);
-    }
-
     test::MapEnvironment disabled{
         {"AGENT_BASE_URL", "https://provider.example"},
         {"AGENT_MODEL", "model-id"},
         {"AGENT_API_KEY", "credential"},
         {"AGENT_ENABLE_RAG", "0"},
-        {"AGENT_RAG_PYTHON", ""},
-        {"AGENT_RAG_SCRIPT", ""},
-        {"AGENT_RAG_INDEX", ""},
+        {"AGENT_RAG_MODE", "not-a-mode"},
+        {"AGENT_RAG_PACK_ROOT", "relative-pack"},
         {"AGENT_RAG_TOP_K", "not-a-number"},
-        {"AGENT_RAG_TIMEOUT_SECONDS", "999999"}};
-    REQUIRE(agent::load_runtime_config(disabled).has_value());
+        {"AGENT_RAG_QUERY_TIMEOUT_SECONDS", "999999"}};
+    const auto loaded = agent::load_runtime_config(disabled);
+    REQUIRE(loaded.has_value());
+    REQUIRE(!loaded.value().rag.enabled);
 }
 
 TEST_CASE(config_rejects_malformed_or_incomplete_enabled_rag_settings) {
@@ -985,55 +963,15 @@ TEST_CASE(config_rejects_malformed_or_incomplete_enabled_rag_settings) {
         REQUIRE(!config.has_value());
         REQUIRE(config.error().code == agent::ErrorCode::InvalidConfiguration);
     }
-
-    const std::vector<std::pair<std::string, std::string>> invalid_values{
-        {"AGENT_RAG_PYTHON", ""},
-        {"AGENT_RAG_SCRIPT", ""},
-        {"AGENT_RAG_INDEX", ""},
-        {"AGENT_RAG_TOP_K", ""},
-        {"AGENT_RAG_TOP_K", "0"},
-        {"AGENT_RAG_TOP_K", "21"},
-        {"AGENT_RAG_TOP_K", "18446744073709551616"},
-        {"AGENT_RAG_TIMEOUT_SECONDS", ""},
-        {"AGENT_RAG_TIMEOUT_SECONDS", "0"},
-        {"AGENT_RAG_TIMEOUT_SECONDS", "61"},
-        {"AGENT_RAG_TIMEOUT_SECONDS", "18446744073709551616"}};
-    for (const auto& invalid : invalid_values) {
-        std::map<std::string, std::string> values{
-            {"AGENT_BASE_URL", "https://provider.example"},
-            {"AGENT_MODEL", "model-id"},
-            {"AGENT_API_KEY", "credential"},
-            {"AGENT_ENABLE_RAG", "1"},
-            {"AGENT_RAG_PYTHON", "python"},
-            {"AGENT_RAG_SCRIPT", "C:/trusted/agent_rag_cli.py"},
-            {"AGENT_RAG_INDEX", "C:/trusted/knowledge.sqlite3"}};
-        values[invalid.first] = invalid.second;
-        test::MapEnvironment env(std::move(values));
-        const auto config = agent::load_runtime_config(env);
-        REQUIRE(!config.has_value());
-        REQUIRE(config.error().code == agent::ErrorCode::InvalidConfiguration);
-        if (!invalid.second.empty()) {
-            REQUIRE(config.error().message.find(invalid.second) ==
-                    std::string::npos);
-        }
-    }
-
-    const std::vector<test::MapEnvironment> missing_paths{
-        {{"AGENT_BASE_URL", "https://provider.example"},
-         {"AGENT_MODEL", "model-id"},
-         {"AGENT_API_KEY", "credential"},
-         {"AGENT_ENABLE_RAG", "1"},
-         {"AGENT_RAG_INDEX", "C:/trusted/knowledge.sqlite3"}},
-        {{"AGENT_BASE_URL", "https://provider.example"},
-         {"AGENT_MODEL", "model-id"},
-         {"AGENT_API_KEY", "credential"},
-         {"AGENT_ENABLE_RAG", "1"},
-         {"AGENT_RAG_SCRIPT", "C:/trusted/agent_rag_cli.py"}}};
-    for (const auto& env : missing_paths) {
-        const auto config = agent::load_runtime_config(env);
-        REQUIRE(!config.has_value());
-        REQUIRE(config.error().code == agent::ErrorCode::InvalidConfiguration);
-    }
+    test::MapEnvironment missing_pack{
+        {"AGENT_BASE_URL", "https://provider.example"},
+        {"AGENT_MODEL", "model-id"},
+        {"AGENT_API_KEY", "credential"},
+        {"AGENT_ENABLE_RAG", "1"}};
+    const auto config = agent::load_runtime_config(missing_pack);
+    REQUIRE(!config.has_value());
+    REQUIRE(config.error().message ==
+            "enabled rag requires an external knowledge pack");
 }
 
 TEST_CASE(config_rejects_missing_or_multiple_authentication_modes) {

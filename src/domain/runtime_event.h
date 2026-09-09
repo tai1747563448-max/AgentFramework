@@ -12,6 +12,7 @@ enum class EventKind {
     TaskStarted,
     ContextPreparationStarted,
     ContextPrepared,
+    KnowledgeNoMatch,
     ContextPreparationFailed,
     ModelCallStarted,
     ModelCallSucceeded,
@@ -37,6 +38,10 @@ struct ContextPreparationStartedPayload {};
 
 struct ContextPreparedPayload {
     EvidencePack evidence;
+};
+
+struct KnowledgeNoMatchPayload {
+    std::string final_text;
 };
 
 struct ContextPreparationFailedPayload {
@@ -89,6 +94,7 @@ struct TaskCancelledPayload {
 using EventPayload = std::variant<
     TaskStartedPayload,
     ContextPreparationStartedPayload, ContextPreparedPayload,
+    KnowledgeNoMatchPayload,
     ContextPreparationFailedPayload,
     ModelCallStartedPayload, ModelCallSucceededPayload, ModelCallFailedPayload,
     ToolCallStartedPayload, ToolCallSucceededPayload, ToolCallFailedPayload,
@@ -121,6 +127,11 @@ inline bool operator==(const ContextPreparationStartedPayload&,
 inline bool operator==(const ContextPreparedPayload& left,
                        const ContextPreparedPayload& right) {
     return left.evidence == right.evidence;
+}
+
+inline bool operator==(const KnowledgeNoMatchPayload& left,
+                       const KnowledgeNoMatchPayload& right) {
+    return left.final_text == right.final_text;
 }
 
 inline bool operator==(const ContextPreparationFailedPayload& left,

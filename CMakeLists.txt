@@ -19,6 +19,11 @@ set(CPR_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(CPR_BUILD_TESTS_SSL OFF CACHE BOOL "" FORCE)
 set(CPR_CURL_USE_LIBPSL OFF CACHE BOOL "" FORCE)
 set(CPR_USE_SYSTEM_CURL OFF CACHE BOOL "" FORCE)
+set(REPROC++ ON CACHE BOOL "" FORCE)
+set(REPROC_TEST OFF CACHE BOOL "" FORCE)
+set(REPROC_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(REPROC_OBJECT_LIBRARIES ON CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     cpr
     GIT_REPOSITORY https://github.com/libcpr/cpr.git
@@ -29,7 +34,11 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/laserpants/dotenv-cpp.git
     GIT_TAG 9275210b8abf1a551fb81e0ba45866286d764acd
     SOURCE_SUBDIR _header_only)
-FetchContent_MakeAvailable(nlohmann_json cpr dotenv_source)
+FetchContent_Declare(
+    reproc
+    GIT_REPOSITORY https://github.com/DaanDeMeyer/reproc.git
+    GIT_TAG 06034a7fca1ec46eddb4997f7764db89380c5216)
+FetchContent_MakeAvailable(nlohmann_json cpr dotenv_source reproc)
 
 add_library(dotenv_header_only INTERFACE)
 target_include_directories(dotenv_header_only INTERFACE
@@ -76,7 +85,11 @@ add_library(agent_runtime STATIC
     src/adapters/workspace/workspace_file_ops.cpp
     src/adapters/workspace/workspace_tool_gateway.cpp
     src/adapters/process/direct_process_runner.cpp
+    src/adapters/process/reproc_jsonl_process.cpp
     src/adapters/rag/python_rag_knowledge_provider.cpp
+    src/adapters/rag/rag_protocol.cpp
+    src/adapters/rag/native_rag_pack_verifier.cpp
+    src/adapters/rag/persistent_rag_knowledge_provider.cpp
     src/adapters/build/cmake_tool_gateway.cpp
     src/adapters/tools/composite_tool_gateway.cpp
     src/adapters/system/system_clock.cpp
@@ -89,7 +102,7 @@ add_library(agent_runtime STATIC
 target_include_directories(agent_runtime PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(agent_runtime
     PUBLIC agent_kernel Threads::Threads
-    PRIVATE dotenv_header_only)
+    PRIVATE dotenv_header_only reproc++)
 if(MSVC)
     target_compile_options(agent_runtime PRIVATE /W4 /permissive- /utf-8)
     target_compile_definitions(agent_runtime PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -100,9 +113,11 @@ target_link_libraries(agent PRIVATE agent_runtime)
 set_target_properties(agent PROPERTIES OUTPUT_NAME AgentFramework)
 if(WIN32)
     add_custom_command(TARGET agent POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_RUNTIME_DLLS:agent> $<TARGET_FILE_DIR:agent>
-        COMMAND_EXPAND_LISTS)
+        COMMAND ${CMAKE_COMMAND}
+            "-DDLLS=$<JOIN:$<TARGET_RUNTIME_DLLS:agent>,|>"
+            "-DTARGET_DIR=$<TARGET_FILE_DIR:agent>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_runtime_dlls.cmake"
+        VERBATIM)
 endif()
 if(MSVC)
     target_compile_options(agent PRIVATE /W4 /permissive- /utf-8)
@@ -196,6 +211,8 @@ add_agent_test(python_rag_adapter_tests
 target_link_libraries(python_rag_adapter_tests PRIVATE agent_runtime)
 add_agent_test(cli_tests tests/cli/cli_app_test.cpp)
 target_link_libraries(cli_tests PRIVATE agent_runtime)
+add_agent_test(rag_runtime_config_tests tests/config/rag_runtime_config_test.cpp)
+target_link_libraries(rag_runtime_config_tests PRIVATE agent_runtime)
 add_agent_test(interactive_cli_tests tests/cli/interactive_cli_test.cpp)
 target_link_libraries(interactive_cli_tests PRIVATE agent_runtime)
 add_agent_test(runtime_config_tests tests/config/runtime_config_test.cpp)
@@ -247,6 +264,21 @@ add_dependencies(direct_process_runner_tests process_fixture)
 target_compile_definitions(direct_process_runner_tests PRIVATE
     AGENT_PROCESS_FIXTURE_PATH="$<TARGET_FILE:process_fixture>"
     _CRT_SECURE_NO_WARNINGS)
+add_agent_test(reproc_jsonl_process_tests
+    tests/adapters/reproc_jsonl_process_test.cpp)
+target_link_libraries(reproc_jsonl_process_tests PRIVATE
+    agent_runtime reproc++ Threads::Threads)
+target_compile_definitions(reproc_jsonl_process_tests PRIVATE
+    AGENT_JSONL_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
+    AGENT_JSONL_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/rag/tests/jsonl_sidecar_fixture.py")
+add_agent_test(rag_protocol_tests tests/adapters/rag_protocol_test.cpp)
+target_link_libraries(rag_protocol_tests PRIVATE agent_runtime)
+add_agent_test(native_rag_pack_verifier_tests
+    tests/adapters/native_rag_pack_verifier_test.cpp)
+target_link_libraries(native_rag_pack_verifier_tests PRIVATE agent_runtime)
+add_agent_test(persistent_rag_knowledge_provider_tests
+    tests/adapters/persistent_rag_knowledge_provider_test.cpp)
+target_link_libraries(persistent_rag_knowledge_provider_tests PRIVATE agent_runtime)
 add_agent_test(composite_tool_gateway_tests tests/adapters/composite_tool_gateway_test.cpp)
 target_link_libraries(composite_tool_gateway_tests PRIVATE agent_runtime)
 add_agent_test(cmake_tool_gateway_tests tests/adapters/cmake_tool_gateway_test.cpp)
@@ -274,6 +306,14 @@ add_test(
         "-DRUNTIME_DLLS=$<JOIN:$<TARGET_RUNTIME_DLLS:agent>,|>"
         "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/interactive-startup-process"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/interactive_startup_process_test.cmake")
+if(WIN32)
+    add_test(
+        NAME knowledge_pack_build_script_contract
+        COMMAND ${CMAKE_COMMAND}
+            "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+            "-DPOWERSHELL_EXE=powershell"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/rag/knowledge_pack_build_script_contract_test.cmake")
+endif()
 add_test(
     NAME agent_benchmark_process
     COMMAND ${CMAKE_COMMAND}

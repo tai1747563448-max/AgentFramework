@@ -12,6 +12,13 @@ if(NOT EXISTS "${stage_script}" OR NOT EXISTS "${verify_script}")
     message(FATAL_ERROR "Ready package support is missing: staging and verification scripts are required")
 endif()
 
+string(REPLACE "|" ";" dlls "${RUNTIME_DLLS}")
+list(LENGTH dlls runtime_dll_count)
+if(NOT runtime_dll_count EQUAL 2)
+    message(FATAL_ERROR
+        "Ready must have exactly two runtime DLLs; got ${runtime_dll_count}")
+endif()
+
 # Modify only unique synthetic test data.
 string(RANDOM LENGTH 16 ALPHABET 0123456789abcdef fixture_id)
 set(fixture_root "${BINARY_DIR}/ready-package-contract-${fixture_id}")
@@ -103,7 +110,6 @@ endif()
 
 get_filename_component(exe_name "${AGENT_EXE}" NAME)
 configure_file("${AGENT_EXE}" "${fixture}/${exe_name}" COPYONLY)
-string(REPLACE "|" ";" dlls "${RUNTIME_DLLS}")
 foreach(dll IN LISTS dlls)
     get_filename_component(dll_name "${dll}" NAME)
     configure_file("${dll}" "${fixture}/${dll_name}" COPYONLY)
@@ -127,6 +133,9 @@ function(verify_fixture should_pass)
 endfunction()
 
 verify_fixture(TRUE)
+file(WRITE "${fixture}/fifth-unmanaged-file.bin" "must be rejected")
+verify_fixture(FALSE)
+file(REMOVE "${fixture}/fifth-unmanaged-file.bin")
 file(MAKE_DIRECTORY "${fixture}/runtime_data")
 verify_fixture(FALSE)
 file(RENAME "${fixture}/runtime_data" "${fixture_root}/rejected-runtime-data")
