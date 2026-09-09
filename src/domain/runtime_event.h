@@ -29,6 +29,8 @@ struct TaskStartedPayload {
     std::string issue;
     std::string workspace_utf8;
     RuntimeBudgets budgets;
+    std::vector<Message> initial_messages;
+    std::optional<SessionTaskLink> session_link;
 };
 
 struct ContextPreparationStartedPayload {};
@@ -106,7 +108,9 @@ EventKind event_kind(const EventPayload& payload);
 
 inline bool operator==(const TaskStartedPayload& left, const TaskStartedPayload& right) {
     return left.issue == right.issue && left.workspace_utf8 == right.workspace_utf8 &&
-           left.budgets == right.budgets;
+           left.budgets == right.budgets &&
+           left.initial_messages == right.initial_messages &&
+           left.session_link == right.session_link;
 }
 
 inline bool operator==(const ContextPreparationStartedPayload&,

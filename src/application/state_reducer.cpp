@@ -42,6 +42,10 @@ Result<void> validate_model_response(const ModelResponse& response) {
         return invalid_transition(
             "model response contains an invalid tool-use block");
     }
+    if (!response_text_blocks_are_valid(response)) {
+        return invalid_transition(
+            "model response contains an invalid text block");
+    }
     bool contains_tool_use = false;
     bool contains_tool_result = false;
     for (const auto& block : response.content) {
@@ -379,13 +383,34 @@ Result<TaskState> reduce_event(const std::optional<TaskState>& current,
                 {ErrorCode::InvalidInput,
                  "runtime budgets must be positive", false});
         }
+        if (!conversation_history_is_valid(started->initial_messages)) {
+            return Result<TaskState>::failure(
+                {ErrorCode::InvalidInput,
+                 "initial conversation history is invalid", false});
+        }
+        if (!started->initial_messages.empty() &&
+            !started->session_link.has_value()) {
+            return Result<TaskState>::failure(
+                {ErrorCode::InvalidInput,
+                 "initial conversation history requires a session link",
+                 false});
+        }
+        if (started->session_link.has_value() &&
+            (!is_valid_session_id(started->session_link->session_id) ||
+             started->session_link->turn_index == 0)) {
+            return Result<TaskState>::failure(
+                {ErrorCode::InvalidInput,
+                 "task session link is invalid", false});
+        }
 
         TaskState state;
         state.task_id = event.task_id;
         state.status = TaskStatus::Created;
         state.issue = started->issue;
         state.workspace_utf8 = started->workspace_utf8;
+        state.session_link = started->session_link;
         state.budgets = started->budgets;
+        state.messages = started->initial_messages;
         state.messages.push_back(
             {Role::User, {TextBlock{started->issue}}});
         state.last_sequence = event.sequence;

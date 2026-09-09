@@ -280,6 +280,26 @@ Json message_to_json(const Message& message) {
             {"content", content_to_json(message.content)}};
 }
 
+Message message_from_json(const Json& json);
+
+Json messages_to_json(const std::vector<Message>& messages) {
+    auto json = Json::array();
+    for (const auto& message : messages) {
+        json.push_back(message_to_json(message));
+    }
+    return json;
+}
+
+std::vector<Message> messages_from_json(const Json& json) {
+    require_array(json);
+    std::vector<Message> messages;
+    messages.reserve(json.size());
+    for (const auto& message : json) {
+        messages.push_back(message_from_json(message));
+    }
+    return messages;
+}
+
 Message message_from_json(const Json& json) {
     require_exact_keys(json, {"role", "content"});
     return {role_from_name(required_string(json, "role")),
@@ -316,16 +336,12 @@ EvidencePack evidence_pack_from_json(const Json& json) {
 }
 
 Json model_request_to_json(const ModelRequest& request) {
-    auto messages = Json::array();
-    for (const auto& message : request.messages) {
-        messages.push_back(message_to_json(message));
-    }
     auto tools = Json::array();
     for (const auto& tool : request.tools) {
         tools.push_back(tool_definition_to_json(tool));
     }
     return {{"system_prompt", request.system_prompt},
-            {"messages", std::move(messages)},
+            {"messages", messages_to_json(request.messages)},
             {"tools", std::move(tools)},
             {"timeout_ms", request.timeout_ms},
             {"evidence", evidence_pack_to_json(request.evidence)}};
@@ -424,9 +440,19 @@ Json payload_to_json(const EventPayload& payload) {
         [](const auto& typed) -> Json {
             using Payload = std::decay_t<decltype(typed)>;
             if constexpr (std::is_same_v<Payload, TaskStartedPayload>) {
-                return {{"issue", typed.issue},
-                        {"workspace_utf8", typed.workspace_utf8},
-                        {"budgets", budgets_to_json(typed.budgets)}};
+                Json json{{"issue", typed.issue},
+                          {"workspace_utf8", typed.workspace_utf8},
+                          {"budgets", budgets_to_json(typed.budgets)}};
+                if (!typed.initial_messages.empty()) {
+                    json["initial_messages"] =
+                        messages_to_json(typed.initial_messages);
+                }
+                if (typed.session_link.has_value()) {
+                    json["session_link"] = {
+                        {"session_id", typed.session_link->session_id},
+                        {"turn_index", typed.session_link->turn_index}};
+                }
+                return json;
             } else if constexpr (
                 std::is_same_v<Payload, ContextPreparationStartedPayload>) {
                 return Json::object();
@@ -467,10 +493,36 @@ Json payload_to_json(const EventPayload& payload) {
 EventPayload payload_from_json(const std::string& type, const Json& json) {
     require_object(json);
     if (type == "task_started") {
-        require_exact_keys(json, {"issue", "workspace_utf8", "budgets"});
-        return TaskStartedPayload{required_string(json, "issue"),
-                                  required_string(json, "workspace_utf8"),
-                                  budgets_from_json(json.at("budgets"))};
+        const bool has_messages = json.contains("initial_messages");
+        const bool has_link = json.contains("session_link");
+        if (has_messages && has_link) {
+            require_exact_keys(json, {"issue", "workspace_utf8", "budgets",
+                                      "initial_messages", "session_link"});
+        } else if (has_messages) {
+            require_exact_keys(json, {"issue", "workspace_utf8", "budgets",
+                                      "initial_messages"});
+        } else if (has_link) {
+            require_exact_keys(json, {"issue", "workspace_utf8", "budgets",
+                                      "session_link"});
+        } else {
+            require_exact_keys(json, {"issue", "workspace_utf8", "budgets"});
+        }
+        TaskStartedPayload payload{
+            required_string(json, "issue"),
+            required_string(json, "workspace_utf8"),
+            budgets_from_json(json.at("budgets"))};
+        if (has_messages) {
+            payload.initial_messages =
+                messages_from_json(json.at("initial_messages"));
+        }
+        if (has_link) {
+            const auto& link = json.at("session_link");
+            require_exact_keys(link, {"session_id", "turn_index"});
+            payload.session_link = SessionTaskLink{
+                required_string(link, "session_id"),
+                unsigned_integer<std::uint64_t>(link.at("turn_index"))};
+        }
+        return payload;
     }
     if (type == "context_preparation_started") {
         require_exact_keys(json, {});
@@ -534,6 +586,25 @@ EventPayload payload_from_json(const std::string& type, const Json& json) {
 }
 
 }  // namespace
+
+nlohmann::json message_list_to_json(const std::vector<Message>& messages) {
+    return messages_to_json(messages);
+}
+
+Result<std::vector<Message>> message_list_from_json(
+    const nlohmann::json& json) {
+    try {
+        auto messages = messages_from_json(json);
+        if (!conversation_history_is_valid(messages)) {
+            throw DecodeError("invalid conversation history");
+        }
+        return Result<std::vector<Message>>::success(std::move(messages));
+    } catch (const std::exception&) {
+        return Result<std::vector<Message>>::failure(
+            {ErrorCode::PersistenceFailure,
+             "message list validation failed", false});
+    }
+}
 
 nlohmann::json event_to_json(const RuntimeEvent& event) {
     return {{"schema_version", event.schema_version},

@@ -213,6 +213,44 @@ TEST_CASE(event_json_round_trip_preserves_every_typed_payload) {
     }
 }
 
+TEST_CASE(task_started_json_round_trip_preserves_session_context_link) {
+    const auto call = fixtures::tool_call();
+    const agent::ToolResult result{"call-1", u8"旧工具结果", false};
+    const agent::TaskStartedPayload payload{
+        u8"继续检查",
+        u8"E:/工作区",
+        {3, 4, 5, 6},
+        {{agent::Role::User, {agent::TextBlock{u8"先前问题"}}},
+         {agent::Role::Assistant, {agent::ToolUseBlock{call}}},
+         {agent::Role::User, {agent::ToolResultBlock{result}}},
+         {agent::Role::Assistant, {agent::TextBlock{u8"先前回答"}}}},
+        agent::SessionTaskLink{
+            "session-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 2}};
+    const auto original = fixtures::event("session-codec", 1, payload);
+
+    const auto encoded = agent::event_to_json(original);
+    const auto decoded = agent::event_from_json(encoded);
+
+    REQUIRE(encoded.at("payload").contains("initial_messages"));
+    REQUIRE(encoded.at("payload").contains("session_link"));
+    REQUIRE(decoded.has_value());
+    REQUIRE(decoded.value() == original);
+}
+
+TEST_CASE(legacy_task_started_json_omits_empty_session_fields) {
+    const auto original = fixtures::event(
+        "legacy-start", 1,
+        agent::TaskStartedPayload{"issue", "E:/workspace", {1, 2, 3, 4}});
+
+    const auto encoded = agent::event_to_json(original);
+
+    REQUIRE(!encoded.at("payload").contains("initial_messages"));
+    REQUIRE(!encoded.at("payload").contains("session_link"));
+    const auto decoded = agent::event_from_json(encoded);
+    REQUIRE(decoded.has_value());
+    REQUIRE(decoded.value() == original);
+}
+
 TEST_CASE(event_json_uses_the_versioned_wire_keys_and_names) {
     const auto original = fixtures::event(
         "wire-task", 4, agent::ModelCallStartedPayload{fixtures::request()});

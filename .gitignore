@@ -30,6 +30,9 @@ __pycache__/
 .idea/
 .vscode/
 .worktrees/
+.superpowers/
+.assistant-hardening/
+.pytest_cache/
 *.user
 *.suo
 

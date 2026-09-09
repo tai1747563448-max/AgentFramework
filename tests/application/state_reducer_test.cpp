@@ -193,6 +193,47 @@ std::vector<agent::RuntimeEvent> completed_two_tool_trace(const std::string& tas
     };
 }
 
+TEST_CASE(task_start_loads_valid_session_history_before_current_user_message) {
+    const auto call = fixtures::first_call();
+    const auto result = fixtures::first_result();
+    const std::vector<agent::Message> history{
+        {agent::Role::User, {agent::TextBlock{"first"}}},
+        {agent::Role::Assistant, {agent::ToolUseBlock{call}}},
+        {agent::Role::User, {agent::ToolResultBlock{result}}},
+        {agent::Role::Assistant, {agent::TextBlock{"answer"}}},
+    };
+    auto started = fixtures::task_started("session-history", 1, "second");
+    auto* payload = std::get_if<agent::TaskStartedPayload>(&started.payload);
+    REQUIRE(payload != nullptr);
+    payload->initial_messages = history;
+    payload->session_link = agent::SessionTaskLink{
+        "session-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 2};
+
+    const auto reduced = agent::reduce_event(std::nullopt, started);
+
+    REQUIRE(reduced.has_value());
+    auto expected = history;
+    expected.push_back(
+        {agent::Role::User, {agent::TextBlock{"second"}}});
+    REQUIRE(reduced.value().messages == expected);
+    REQUIRE(reduced.value().session_link == payload->session_link);
+}
+
+TEST_CASE(task_start_rejects_unbalanced_session_history) {
+    auto started = fixtures::task_started("bad-session-history", 1, "next");
+    auto* payload = std::get_if<agent::TaskStartedPayload>(&started.payload);
+    REQUIRE(payload != nullptr);
+    payload->initial_messages = {
+        {agent::Role::Assistant,
+         {agent::ToolUseBlock{fixtures::first_call()}}},
+    };
+
+    const auto reduced = agent::reduce_event(std::nullopt, started);
+
+    REQUIRE(!reduced.has_value());
+    REQUIRE(reduced.error().code == agent::ErrorCode::InvalidInput);
+}
+
 agent::TaskState replay_prefix(const std::vector<agent::RuntimeEvent>& events,
                                std::size_t count) {
     const std::vector<agent::RuntimeEvent> prefix(events.begin(), events.begin() + count);
@@ -548,6 +589,8 @@ TEST_CASE(replay_binds_every_stop_reason_to_its_content_shape) {
         {agent::StopReason::StopSequence, {}},
         {agent::StopReason::EndTurn, {agent::TextBlock{""}}},
         {agent::StopReason::StopSequence, {agent::TextBlock{""}}},
+        {agent::StopReason::ToolUse,
+         {agent::TextBlock{""}, agent::ToolUseBlock{call}}},
     };
     for (const auto& item : invalid) {
         std::vector<agent::RuntimeEvent> events = {

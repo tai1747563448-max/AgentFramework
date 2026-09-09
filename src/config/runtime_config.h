@@ -2,6 +2,8 @@
 
 #include "adapters/anthropic/anthropic_messages_client.h"
 #include "adapters/rag/python_rag_knowledge_provider.h"
+#include "application/memory_policy.h"
+#include "application/session_engine.h"
 #include "domain/result.h"
 #include "domain/task_state.h"
 
@@ -30,10 +32,15 @@ struct RuntimeConfig {
     std::int64_t build_timeout_ms{300'000};
     bool rag_enabled{false};
     PythonRagConfig rag;
+    SessionContextSettings session_context;
+    MemoryPolicyConfig memory_policy{1024, {}};
     std::string system_prompt;
 };
 
 Result<RuntimeConfig> load_runtime_config(const Environment& environment);
 Result<void> load_explicit_env_file(const std::filesystem::path& path);
+Result<std::optional<std::filesystem::path>> discover_interactive_env_file(
+    const std::filesystem::path& executable_path,
+    const std::filesystem::path& current_directory);
 
 }  // namespace agent

@@ -101,6 +101,17 @@ struct ModelResponse {
     std::string provider_request_id;
 };
 
+inline bool response_text_blocks_are_valid(const ModelResponse& response) {
+    for (const auto& block : response.content) {
+        const auto* text = std::get_if<TextBlock>(&block);
+        if (text != nullptr && text->text.empty() &&
+            response.stop_reason != StopReason::MaxTokens) {
+            return false;
+        }
+    }
+    return true;
+}
+
 inline bool response_tool_uses_are_valid(const ModelResponse& response) {
     std::vector<std::string> tool_call_ids;
     for (const auto& block : response.content) {
@@ -120,6 +131,90 @@ inline bool response_tool_uses_are_valid(const ModelResponse& response) {
         tool_call_ids.push_back(call.id);
     }
     return true;
+}
+
+inline bool conversation_history_is_valid(
+    const std::vector<Message>& messages) {
+    if (messages.empty()) {
+        return true;
+    }
+
+    std::vector<std::string> pending_tool_ids;
+    Role expected_role = Role::User;
+    for (const auto& message : messages) {
+        if (message.role != expected_role || message.content.empty() ||
+            message.role == Role::System) {
+            return false;
+        }
+
+        if (message.role == Role::Assistant) {
+            if (!pending_tool_ids.empty()) {
+                return false;
+            }
+            for (const auto& block : message.content) {
+                if (const auto* text = std::get_if<TextBlock>(&block)) {
+                    if (text->text.empty()) {
+                        return false;
+                    }
+                    continue;
+                }
+                const auto* tool = std::get_if<ToolUseBlock>(&block);
+                if (tool == nullptr || tool->call.id.empty() ||
+                    tool->call.name.empty() ||
+                    !tool->call.arguments.is_object()) {
+                    return false;
+                }
+                for (const auto& accepted : pending_tool_ids) {
+                    if (accepted == tool->call.id) {
+                        return false;
+                    }
+                }
+                pending_tool_ids.push_back(tool->call.id);
+            }
+            expected_role = Role::User;
+            continue;
+        }
+
+        if (pending_tool_ids.empty()) {
+            for (const auto& block : message.content) {
+                const auto* text = std::get_if<TextBlock>(&block);
+                if (text == nullptr || text->text.empty()) {
+                    return false;
+                }
+            }
+        } else {
+            std::vector<std::string> returned_ids;
+            for (const auto& block : message.content) {
+                const auto* result = std::get_if<ToolResultBlock>(&block);
+                if (result == nullptr || result->result.tool_call_id.empty()) {
+                    return false;
+                }
+                bool matched = false;
+                for (const auto& pending : pending_tool_ids) {
+                    if (pending == result->result.tool_call_id) {
+                        matched = true;
+                        break;
+                    }
+                }
+                for (const auto& returned : returned_ids) {
+                    if (returned == result->result.tool_call_id) {
+                        return false;
+                    }
+                }
+                if (!matched) {
+                    return false;
+                }
+                returned_ids.push_back(result->result.tool_call_id);
+            }
+            if (returned_ids.size() != pending_tool_ids.size()) {
+                return false;
+            }
+            pending_tool_ids.clear();
+        }
+        expected_role = Role::Assistant;
+    }
+
+    return pending_tool_ids.empty() && expected_role == Role::User;
 }
 
 inline bool operator==(const TextBlock& left, const TextBlock& right) {

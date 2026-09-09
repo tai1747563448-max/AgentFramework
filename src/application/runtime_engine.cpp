@@ -148,11 +148,20 @@ RuntimeResult RuntimeEngine::run(
     RuntimeProgressObserver observer) {
     std::optional<TaskState> state;
     const std::int64_t started_at_ms = clock_.monotonic_ms();
-    const std::string task_id = ids_.next_task_id();
+    const std::string task_id = request.requested_task_id.has_value()
+                                    ? *request.requested_task_id
+                                    : ids_.next_task_id();
+    if (!is_valid_task_id(task_id)) {
+        return {std::nullopt,
+                RuntimeError{ErrorCode::InvalidInput,
+                             "requested task ID is invalid", false}};
+    }
 
     auto transition = append_event(
         state, task_id,
-        TaskStartedPayload{request.issue, request.workspace_utf8, request.budgets},
+        TaskStartedPayload{request.issue, request.workspace_utf8,
+                           request.budgets, request.initial_messages,
+                           request.session_link},
         observer);
     if (transition.fatal_error.has_value()) {
         return transition;
@@ -341,6 +350,10 @@ RuntimeResult RuntimeEngine::continue_task(
                     response.value().raw_stop_reason)) {
                 return protocol_failure(
                     "model stop reason fields do not match");
+            }
+            if (!response_text_blocks_are_valid(response.value())) {
+                return protocol_failure(
+                    "model response contains an empty text block");
             }
             if (!response_tool_uses_are_valid(response.value())) {
                 return protocol_failure(
