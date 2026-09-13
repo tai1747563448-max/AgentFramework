@@ -2,7 +2,7 @@
 
 日期：2026-09-14
 依据：当前工作区 `AgentFramework`，提交 `00a9af4`。
-状态：用户已通过“做吧”批准实施，代码已实现，正在完成验收。原方案保留作为设计依据；实际用法见 `docs/dynamic-cli.md`，验收记录见 `docs/dynamic-cli-validation.md`。
+状态：用户已通过“做吧”批准实施，代码已实现并完成本机验收。原方案保留作为设计依据；实际用法见 `docs/dynamic-cli.md`，验收记录见 `docs/dynamic-cli-validation.md`。
 
 ## 1. 推荐目标与用户看到的效果
 

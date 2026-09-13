@@ -99,8 +99,8 @@ Files: src/cli/*; src/main.cpp; tests/cli/*; new terminal presenter tests.
 - [x] Build Release and run focused tests after each component, then all CTest entries. Record all failures, distinguishing baseline.
 - [x] Independent review of streaming/protocol and terminal/runtime boundaries; fix and rerun relevant tests.
 - [x] Exercise a loopback delayed provider through the executable with two turns; verify first bytes before server completion, cancellation, no duplicate text and plain output.
-- [ ] Build a runnable Release result, preserve local configuration, verify Ready package contract, and integrate the reviewed feature into the user's checkout without overwriting new unrelated edits.
-- [ ] Report exact executable, use, tests and unverified live-provider limitations. Keep plan and evidence locally.
+- [x] Build a runnable Release result, preserve local configuration, verify Ready package contract, and integrate the reviewed feature into the user's checkout without overwriting new unrelated edits.
+- [x] Report exact executable, use, tests and unverified live-provider limitations. Keep plan and evidence locally.
 
 ## Progress ledger
 
@@ -110,3 +110,4 @@ Files: src/cli/*; src/main.cpp; tests/cli/*; new terminal presenter tests.
 
 - Final feature verification: Release build succeeded; 50/50 CTest entries passed (117.50s). Existing pytest venv selected explicitly; no dependency install. Independent reviews and observed MiniMax input-token accounting regression resolved.
 - PTY verified rotation, Chinese/emoji, tool completion, cancellation both before headers and after partial text, then successful next turns. Current MiniMax-M3 synthetic streaming request completed and persisted successfully in 2.0s.
+- Delivery: b37dc2b fast-forwarded into original main; original Release rebuild succeeded and 9/9 focused checks passed. Ready package verification passed with unchanged .env hash; packaged EXE live streaming smoke succeeded in 1.922s. Evidence copied into original out/dynamic-cli-validation and loopback stopped.

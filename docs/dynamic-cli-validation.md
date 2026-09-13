@@ -52,8 +52,14 @@ ctest --test-dir build/vs2022 -C Release --output-on-failure -j 2
 
 ## 交付与边界
 
-原 checkout 的集成、Release 重建和 Ready 包验证结果在交付时补充。
+代码提交 `b37dc2b` 已快进合入原 checkout 的本地 `main`。原位置完整 Release 重建成功，9 项相关 CTest 复测全部通过（20.67 秒）。
+
+运行 `cmake --build build/vs2022 --config Release --target agent_ready_package_verify --parallel 4` 成功：Ready 目录恰好包含原有四个受管文件；EXE 和两份 DLL 与本次构建的 SHA256 一致；包内程序的四个进程启动用例通过；打包前后 `.env` 哈希一致。
+
+最后直接使用 **Ready 包内的 EXE** 和现有模型配置，在新的隔离工作区再跑固定短句请求：**1.922 秒，真实流式预览与完成标记均出现，退出码 0，stderr 为空**。因此实际交付程序也完成了真实接口验证。
+
+可执行程序：`E:\desktop\How_to_build_a_agent\AgentFramework\out\AgentFramework-Ready\AgentFramework.exe`。用法见 `docs/dynamic-cli.md`。这是本机打包与运行验收，未进行全新 Windows 机器验收。
 
 本期实现动态状态行及流式正文。固定输入框、输入历史编辑、完整 Markdown 布局属于后续 TUI 工作。启动/退出或独立命令触发的记忆整理仍沿用同步流程。取消是协作式的；外部请求超时仍由已有 HTTP 超时控制，总任务时间预算不承诺硬实时抢占。
 
-原始验证记录保存在本地 `out/dynamic-cli-validation/`，该目录不进入 Git；配置内容和凭据不进入验收报告。
+原始验证记录保存在原项目的本地 `out/dynamic-cli-validation/`，feature 构建记录归档在其 `feature-evidence/` 子目录；该目录不进入 Git，配置内容和凭据不进入验收报告。临时 loopback 服务已停止。
