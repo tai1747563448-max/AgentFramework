@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,6 +27,11 @@ namespace test {
 class MemorySessionStore final : public agent::SessionStore {
 public:
     agent::Result<void> append(const agent::SessionEvent& event) override {
+        if (fail_commit &&
+            std::holds_alternative<agent::SessionTurnCommittedPayload>(event.payload)) {
+            return agent::Result<void>::failure(
+                {agent::ErrorCode::PersistenceFailure, "commit unavailable", true});
+        }
         if (fail_compaction &&
             std::holds_alternative<agent::SessionCompactedPayload>(event.payload)) {
             return agent::Result<void>::failure(
@@ -73,6 +79,7 @@ public:
 
     std::vector<agent::SessionEvent> events;
     bool fail_compaction{false};
+    bool fail_commit{false};
 };
 
 class SessionClock final : public agent::Clock {
@@ -971,4 +978,113 @@ TEST_CASE(session_engine_injected_memory_lines_fit_budget_including_separator) {
     const auto& prompt = fixture.requests[0].system_prompt;
     REQUIRE(prompt.find(first.value().memory_id) != std::string::npos);
     REQUIRE(prompt.find(second.value().memory_id) == std::string::npos);
+}
+
+TEST_CASE(session_presentation_forwards_stream_options_and_isolates_compaction_callback) {
+    context_engine_test::Fixture fixture;
+    fixture.seed_turns(4);
+    std::vector<std::string> phases;
+    std::size_t previews = 0;
+    agent::RuntimePresentationOptions presentation;
+    presentation.stream = true;
+    presentation.text_observer = [&](const agent::RuntimeTextUpdate&) { ++previews; };
+    presentation.phase_observer = [&](const std::string& phase) {
+        phases.push_back(phase);
+        throw std::runtime_error("presenter unavailable");
+    };
+    const auto result = fixture.engine(context_engine_test::settings(), true)
+        .submit_turn(fixture.session_id, "new question", {}, true, presentation);
+
+    REQUIRE(!result.error.has_value());
+    REQUIRE(result.compacted);
+    REQUIRE(!result.warning.has_value());
+    REQUIRE(phases == std::vector<std::string>{"Compacting context..."});
+    REQUIRE(previews == 0);
+    REQUIRE(fixture.requests.size() == 1);
+    REQUIRE(fixture.requests[0].presentation.stream);
+    REQUIRE(static_cast<bool>(fixture.requests[0].presentation.text_observer));
+    REQUIRE(!fixture.requests[0].presentation.phase_observer);
+}
+
+TEST_CASE(session_presentation_is_forwarded_for_both_pending_recovery_paths) {
+    for (const bool persisted_task : {false, true}) {
+        context_engine_test::Fixture fixture;
+        fixture.seed_turns(4, 20);
+        fixture.pending();
+        if (persisted_task) {
+            const auto state = agent::replay_session_events(fixture.sessions.events).value();
+            const std::string task_id = "task-ffffffffffffffffffffffffffffffff";
+            fixture.task_events = std::vector<agent::RuntimeEvent>{
+                test::task_event(task_id, 1, agent::TaskStartedPayload{
+                    "question", "E:/workspace", {4, 8, 60'000, 30'000},
+                    state.messages, agent::SessionTaskLink{fixture.session_id, 5}}),
+                test::task_event(task_id, 2, agent::ContextPreparationStartedPayload{}),
+                test::task_event(task_id, 3, agent::ContextPreparedPayload{agent::EvidencePack{}})};
+        }
+        agent::RuntimePresentationOptions presentation;
+        presentation.stream = true;
+        presentation.text_observer = [](const agent::RuntimeTextUpdate&) {};
+        const auto result = fixture.engine().recover_pending_turn(
+            fixture.session_id, {}, true, presentation);
+
+        REQUIRE(!result.error.has_value());
+        if (persisted_task) {
+            REQUIRE(fixture.resumes.size() == 1);
+            REQUIRE(fixture.resumes[0].presentation.stream);
+            REQUIRE(static_cast<bool>(fixture.resumes[0].presentation.text_observer));
+        } else {
+            REQUIRE(fixture.requests.size() == 1);
+            REQUIRE(fixture.requests[0].presentation.stream);
+            REQUIRE(static_cast<bool>(fixture.requests[0].presentation.text_observer));
+        }
+    }
+}
+
+TEST_CASE(session_preview_never_commits_failed_or_cancelled_turn_text) {
+    for (const auto status : {agent::TaskStatus::Failed, agent::TaskStatus::Cancelled}) {
+        test::MemorySessionStore store;
+        test::SessionClock clock;
+        test::SessionIds ids;
+        std::string preview;
+        agent::SessionEngine engine(store, clock, ids,
+            [&](const agent::RunRequest& request, const agent::RuntimeProgressObserver&) {
+                request.presentation.text_observer({*request.requested_task_id, 1,
+                    {agent::ModelStreamEventKind::TextDelta, 0, "unaccepted preview"}});
+                auto result = test::completed_task(request, "unaccepted preview");
+                result.state->status = status;
+                result.state->final_text.reset();
+                return result;
+            }, {}, {}, {"system", {}});
+        const auto created = engine.create_session("E:/workspace", "model");
+        REQUIRE(created.has_value());
+        agent::RuntimePresentationOptions presentation;
+        presentation.stream = true;
+        presentation.text_observer = [&](const agent::RuntimeTextUpdate& update) {
+            preview += update.event.text;
+        };
+        const auto result = engine.submit_turn(created.value().session_id, "question", {}, true, presentation);
+
+        REQUIRE(!result.error.has_value());
+        REQUIRE(preview == "unaccepted preview");
+        REQUIRE(result.session->messages.empty());
+        REQUIRE(result.session->committed_turns.empty());
+        REQUIRE(std::holds_alternative<agent::SessionTurnFailedPayload>(store.events.back().payload));
+        REQUIRE(std::get<agent::SessionTurnFailedPayload>(store.events.back().payload).status == status);
+    }
+}
+
+TEST_CASE(session_accepted_runtime_response_remains_pending_when_commit_fails) {
+    context_engine_test::Fixture fixture;
+    fixture.sessions.fail_commit = true;
+    agent::RuntimePresentationOptions presentation;
+    presentation.stream = true;
+    const auto result = fixture.engine().submit_turn(fixture.session_id, "question", {}, true, presentation);
+
+    REQUIRE(result.task.has_value());
+    REQUIRE(result.task->status == agent::TaskStatus::Completed);
+    REQUIRE(result.error.has_value());
+    REQUIRE(result.error->code == agent::ErrorCode::PersistenceFailure);
+    REQUIRE(result.session->pending_turn.has_value());
+    REQUIRE(result.session->messages.empty());
+    REQUIRE(std::holds_alternative<agent::SessionTurnStartedPayload>(fixture.sessions.events.back().payload));
 }

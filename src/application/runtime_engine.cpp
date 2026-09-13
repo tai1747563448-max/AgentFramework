@@ -22,6 +22,25 @@ RuntimeError persistence_failure(const RuntimeError& error) {
     return {ErrorCode::PersistenceFailure, error.message, error.retryable};
 }
 
+std::string progress_tool_name(const std::optional<TaskState>& state,
+                               const EventPayload& payload) {
+    if (const auto* started = std::get_if<ToolCallStartedPayload>(&payload)) {
+        return started->call.name;
+    }
+    std::string call_id;
+    if (const auto* succeeded = std::get_if<ToolCallSucceededPayload>(&payload)) {
+        call_id = succeeded->result.tool_call_id;
+    } else if (const auto* failed = std::get_if<ToolCallFailedPayload>(&payload)) {
+        call_id = failed->tool_call_id;
+    }
+    if (state && !call_id.empty()) {
+        for (const auto& call : state->pending_tool_calls) {
+            if (call.id == call_id) return call.name;
+        }
+    }
+    return {};
+}
+
 bool contains_tool_call(const ModelResponse& response) {
     for (const auto& block : response.content) {
         if (std::holds_alternative<ToolUseBlock>(block)) {
@@ -122,6 +141,8 @@ RuntimeResult RuntimeEngine::append_event(std::optional<TaskState>& state,
         state.has_value() ? state->last_sequence + 1 : 1;
     RuntimeEvent event{1, sequence, task_id, clock_.now_utc(),
                        ids_.next_correlation_id(), std::move(payload)};
+    const auto tool_name = observer ? progress_tool_name(state, event.payload)
+                                    : std::string{};
 
     auto reduced = reduce_event(state, event);
     if (!reduced.has_value()) {
@@ -137,7 +158,7 @@ RuntimeResult RuntimeEngine::append_event(std::optional<TaskState>& state,
     if (observer) {
         try {
             observer({state->task_id, state->last_sequence,
-                      event_kind(event.payload), state->status});
+                      event_kind(event.payload), state->status, tool_name});
         } catch (...) {
             observer = nullptr;
         }
@@ -211,7 +232,7 @@ RuntimeResult RuntimeEngine::run(
     }
 
     return continue_task(state, request.system_prompt, started_at_ms,
-                         observer);
+                         observer, request.presentation);
 }
 
 RuntimeResult RuntimeEngine::resume(
@@ -232,14 +253,16 @@ RuntimeResult RuntimeEngine::resume(
             ? state->last_model_request->system_prompt
             : request.fallback_system_prompt;
     const std::int64_t started_at_ms = clock_.monotonic_ms();
-    return continue_task(state, system_prompt, started_at_ms, observer);
+    return continue_task(state, system_prompt, started_at_ms, observer,
+                         request.presentation);
 }
 
 RuntimeResult RuntimeEngine::continue_task(
     std::optional<TaskState>& state,
     const std::string& system_prompt,
     std::int64_t started_at_ms,
-    RuntimeProgressObserver& observer) {
+    RuntimeProgressObserver& observer,
+    RuntimePresentationOptions presentation) {
     const auto invariant_failure = [&](const char* message) {
         return RuntimeResult{
             state,
@@ -387,7 +410,39 @@ RuntimeResult RuntimeEngine::continue_task(
                 }
             }
 
-            auto response = model_.complete(model_request);
+            ModelCallOptions options;
+            options.stream = presentation.stream;
+            options.cancellation = &cancellation_;
+            // Evidence-backed responses are released only by the caller after
+            // task completion and a successful session commit.
+            if (presentation.stream && presentation.text_observer &&
+                model_request.evidence.items.empty() &&
+                !model_request.evidence.tool_use_forbidden &&
+                !model_request.evidence.authoritative_no_match) {
+                const auto round = state->usage.model_rounds;
+                options.observer = [&, task_id, round](const ModelStreamEvent& event) {
+                    if (!presentation.text_observer) return;
+                    try {
+                        presentation.text_observer({task_id, round, event});
+                    } catch (...) {
+                        presentation.text_observer = nullptr;
+                    }
+                };
+            }
+            auto response = model_.complete(model_request, options);
+            // A transport may report cancellation without sharing this flag;
+            // preserve its classification even if the wall budget also expired.
+            if (!response.has_value() && response.error().code == ErrorCode::Cancelled) {
+                return append_event(
+                    state, task_id,
+                    TaskCancelledPayload{"model request cancelled", response.error()},
+                    observer);
+            }
+            auto after_model = guard_external_call(
+                state, task_id, started_at_ms, observer);
+            if (after_model.fatal_error.has_value() || is_terminal(state->status)) {
+                return after_model;
+            }
             if (!response.has_value()) {
                 return append_event(
                     state, task_id,
@@ -444,55 +499,41 @@ RuntimeResult RuntimeEngine::continue_task(
                         "terminal text stop requires nonempty text and no tools");
                 }
 
-                {
-                    auto transition = append_event(
-                        state, task_id,
-                        ModelCallSucceededPayload{
-                            std::move(response.value())},
-                        observer);
-                    if (transition.fatal_error.has_value()) {
-                        return transition;
-                    }
-                }
-                return append_event(
-                    state, task_id, TaskCompletedPayload{final_text},
-                    observer);
+                break;
             case StopReason::MaxTokens:
                 if (has_tool_call) {
                     return protocol_failure(
                         "max-tokens stop cannot contain tool-use blocks");
                 }
 
-                {
-                    auto transition = append_event(
-                        state, task_id,
-                        ModelCallSucceededPayload{
-                            std::move(response.value())},
-                        observer);
-                    if (transition.fatal_error.has_value()) {
-                        return transition;
-                    }
-                }
-                return append_event(
-                    state, task_id,
-                    TaskBudgetExceededPayload{
-                        "max_tokens",
-                        {ErrorCode::BudgetExceeded,
-                         "model output token budget exceeded", false}},
-                    observer);
+                break;
             }
 
-            if (!has_tool_call) {
-                return protocol_failure(
-                    "model returned no tool calls for a tool-use stop");
+            // The last cancellation/time check is the response acceptance
+            // point. Cancellation after the durable success does not roll it back.
+            auto transition = guard_external_call(
+                state, task_id, started_at_ms, observer);
+            if (transition.fatal_error.has_value() || is_terminal(state->status)) {
+                return transition;
             }
-
-            auto transition = append_event(
+            const auto stop_reason = response.value().stop_reason;
+            transition = append_event(
                 state, task_id,
                 ModelCallSucceededPayload{std::move(response.value())},
                 observer);
             if (transition.fatal_error.has_value()) {
                 return transition;
+            }
+            if (stop_reason == StopReason::EndTurn ||
+                stop_reason == StopReason::StopSequence) {
+                return append_event(state, task_id,
+                    TaskCompletedPayload{final_text}, observer);
+            }
+            if (stop_reason == StopReason::MaxTokens) {
+                return append_event(state, task_id,
+                    TaskBudgetExceededPayload{
+                        "max_tokens", {ErrorCode::BudgetExceeded,
+                        "model output token budget exceeded", false}}, observer);
             }
             continue;
         }

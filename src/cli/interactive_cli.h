@@ -26,6 +26,24 @@ struct InteractiveSessionCommands {
     std::function<Result<MemoryEntry>(const std::string&, const std::string&)> remember;
     std::function<Result<void>(const std::string&)> forget;
     std::function<Result<void>(const std::string&)> consolidate;
+    std::function<SessionTurnResult(
+        const std::string&, const std::string&,
+        const RuntimeProgressObserver&, bool,
+        const RuntimePresentationOptions&)> submit_presented;
+    std::function<SessionTurnResult(
+        const std::string&, const RuntimeProgressObserver&, bool,
+        const RuntimePresentationOptions&)> recover_presented;
+    std::function<void()> begin_turn;
+    std::function<void()> end_turn;
+    std::function<void()> cancel_turn;
+    std::function<bool()> cancellation_requested;
+    std::function<void(std::function<void(const std::string&)>)> set_phase_observer;
+};
+
+struct InteractiveUiOptions {
+    bool dynamic{false};
+    bool stream{true};
+    std::function<std::size_t()> columns;
 };
 
 class InteractiveCli {
@@ -36,12 +54,14 @@ public:
                    std::istream& input,
                    std::ostream& output,
                    std::ostream& error,
-                   bool memory_enabled = true);
+                   bool memory_enabled = true,
+                   InteractiveUiOptions ui = {});
 
     int run();
 
 private:
-    RuntimeProgressObserver progress_observer();
+    SessionTurnResult execute_turn(const std::string& session_id,
+                                  const std::string& text, bool recover);
     void show_header(const SessionState& session);
     void show_status(const SessionState& session);
     bool render_turn(const SessionTurnResult& result,
@@ -57,6 +77,7 @@ private:
     std::ostream& error_;
     bool memory_available_;
     bool memory_on_;
+    InteractiveUiOptions ui_;
 };
 
 }  // namespace agent

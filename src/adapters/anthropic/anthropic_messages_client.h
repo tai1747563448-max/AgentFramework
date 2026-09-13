@@ -24,6 +24,8 @@ public:
     AnthropicMessagesClient(AnthropicConfig config, HttpTransport& transport);
 
     Result<ModelResponse> complete(const ModelRequest& request) override;
+    Result<ModelResponse> complete(const ModelRequest& request,
+                                   const ModelCallOptions& options) override;
 
 private:
     AnthropicConfig config_;

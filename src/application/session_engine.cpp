@@ -21,6 +21,15 @@
 namespace agent {
 namespace {
 
+void notify_phase(RuntimePresentationOptions& presentation, const char* phase) noexcept {
+    if (!presentation.phase_observer) return;
+    try {
+        presentation.phase_observer(phase);
+    } catch (...) {
+        presentation.phase_observer = nullptr;
+    }
+}
+
 RuntimeError invalid(const char* message) {
     return {ErrorCode::InvalidInput, message, false};
 }
@@ -272,9 +281,11 @@ Result<SessionState> SessionEngine::append_event(
 }
 
 Result<std::string> SessionEngine::turn_system_prompt(
-    const SessionState& state, const std::string& user_text, bool use_memory) const {
+    const SessionState& state, const std::string& user_text, bool use_memory,
+    RuntimePresentationOptions& presentation) const {
     auto prompt = summary_prompt(defaults_.system_prompt, state);
     if (memory_ != nullptr && context_.memory_enabled && use_memory && !memory_opted_out(user_text)) {
+        notify_phase(presentation, "Retrieving memory");
         auto lines = memory_->retrieve(state.workspace_utf8, user_text,
                                         context_.memory_top_k, context_.memory_max_injected_bytes);
         if (!lines.has_value()) return Result<std::string>::failure(lines.error());
@@ -289,7 +300,8 @@ Result<std::string> SessionEngine::turn_system_prompt(
 }
 
 RunRequest SessionEngine::turn_request(const SessionState& state,
-                                        std::string system_prompt) const {
+                                        std::string system_prompt,
+                                        const RuntimePresentationOptions& presentation) const {
     const auto& pending = *state.pending_turn;
     return {pending.user_text,
             state.workspace_utf8,
@@ -297,7 +309,8 @@ RunRequest SessionEngine::turn_request(const SessionState& state,
             defaults_.budgets,
             state.messages,
             pending.task_id,
-            SessionTaskLink{state.session_id, pending.turn_index}};
+            SessionTaskLink{state.session_id, pending.turn_index},
+            presentation};
 }
 
 SessionTurnResult SessionEngine::finalize_turn(
@@ -372,7 +385,9 @@ SessionTurnResult SessionEngine::submit_turn(
     const std::string& session_id,
     const std::string& user_text,
     RuntimeProgressObserver observer,
-    bool use_memory) {
+    bool use_memory,
+    const RuntimePresentationOptions& requested_presentation) {
+    auto presentation = requested_presentation;
     if (const auto error = validate_context_settings(context_); error.has_value())
         return {std::nullopt, std::nullopt, error};
     auto loaded = load_session(session_id);
@@ -391,8 +406,15 @@ SessionTurnResult SessionEngine::submit_turn(
         const auto count = state.committed_turns.size() - context_.retain_turns;
         ContextCompactionInput input{state.summary,
             {state.committed_turns.begin(), state.committed_turns.begin() + static_cast<std::ptrdiff_t>(count)}};
+        notify_phase(presentation, "Compacting context...");
+        if (compaction_started_) {
+            try {
+                compaction_started_();
+            } catch (...) {
+                compaction_started_ = nullptr;
+            }
+        }
         try {
-            if (compaction_started_) compaction_started_();
             auto summary = compactor_ == nullptr ? Result<std::string>::failure(
                 {ErrorCode::DependencyUnavailable, "session compactor is unavailable", false}) :
                 compactor_->compact(input);
@@ -420,7 +442,7 @@ SessionTurnResult SessionEngine::submit_turn(
         prepared.error = hard_limit_error();
         return prepared;
     }
-    auto prompt = turn_system_prompt(state, user_text, use_memory);
+    auto prompt = turn_system_prompt(state, user_text, use_memory, presentation);
     if (!prompt.has_value()) {
         prepared.error = prompt.error();
         return prepared;
@@ -442,7 +464,7 @@ SessionTurnResult SessionEngine::submit_turn(
         prepared.error = pending.error();
         return prepared;
     }
-    auto runtime = run_task_(turn_request(pending.value(), std::move(prompt.value())), observer);
+    auto runtime = run_task_(turn_request(pending.value(), std::move(prompt.value()), presentation), observer);
     auto result = finalize_turn(std::move(pending.value()), std::move(runtime));
     result.compacted = prepared.compacted;
     result.warning = std::move(prepared.warning);
@@ -452,7 +474,9 @@ SessionTurnResult SessionEngine::submit_turn(
 SessionTurnResult SessionEngine::recover_pending_turn(
     const std::string& session_id,
     RuntimeProgressObserver observer,
-    bool use_memory) {
+    bool use_memory,
+    const RuntimePresentationOptions& requested_presentation) {
+    auto presentation = requested_presentation;
     if (const auto error = validate_context_settings(context_); error.has_value())
         return {std::nullopt, std::nullopt, error};
     auto loaded = load_session(session_id);
@@ -470,11 +494,11 @@ SessionTurnResult SessionEngine::recover_pending_turn(
     }
     if (!task_events.value().has_value()) {
         const auto& user_text = loaded.value().pending_turn->user_text;
-        auto prompt = turn_system_prompt(loaded.value(), user_text, use_memory);
+        auto prompt = turn_system_prompt(loaded.value(), user_text, use_memory, presentation);
         if (!prompt.has_value()) return {loaded.value(), std::nullopt, prompt.error()};
         if (context_bytes(loaded.value(), prompt.value(), user_text) >= context_.hard_limit_bytes)
             return {loaded.value(), std::nullopt, hard_limit_error()};
-        auto runtime = run_task_(turn_request(loaded.value(), std::move(prompt.value())), observer);
+        auto runtime = run_task_(turn_request(loaded.value(), std::move(prompt.value()), presentation), observer);
         return finalize_turn(std::move(loaded.value()), std::move(runtime));
     }
     auto replayed = replay_events(*task_events.value());
@@ -495,7 +519,7 @@ SessionTurnResult SessionEngine::recover_pending_turn(
     // Rebuild only if no persisted model prompt exists.
     auto prompt = replayed.value().last_model_request.has_value() ?
         Result<std::string>::success(replayed.value().last_model_request->system_prompt) :
-        turn_system_prompt(loaded.value(), loaded.value().pending_turn->user_text, use_memory);
+        turn_system_prompt(loaded.value(), loaded.value().pending_turn->user_text, use_memory, presentation);
     if (!prompt.has_value()) return {loaded.value(), replayed.value(), prompt.error()};
     if (!replayed.value().last_model_request.has_value() &&
         context_bytes(loaded.value(), prompt.value(), loaded.value().pending_turn->user_text) >=
@@ -503,7 +527,7 @@ SessionTurnResult SessionEngine::recover_pending_turn(
         return {loaded.value(), replayed.value(), hard_limit_error()};
     auto runtime = resume_task_(
         ResumeRequest{std::move(*task_events.value()),
-                      std::move(prompt.value())},
+                      std::move(prompt.value()), presentation},
         observer);
     return finalize_turn(std::move(loaded.value()), std::move(runtime));
 }

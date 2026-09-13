@@ -239,8 +239,25 @@ Result<StartupArguments> parse_startup_arguments(
         return invalid_startup_arguments("missing executable argument");
     }
     parsed.command_args.push_back(args.front());
-
+    bool ui_seen = false;
+    bool stream_seen = false;
     for (std::size_t index = 1; index < args.size(); ++index) {
+        if (parsed.command_args.size() == 1 &&
+            (args[index] == "--ui" || args[index] == "--stream")) {
+            const bool ui = args[index] == "--ui";
+            bool& seen = ui ? ui_seen : stream_seen;
+            if (seen || index + 1 >= args.size()) {
+                return invalid_startup_arguments("interactive display option requires exactly one value");
+            }
+            seen = true;
+            const auto& value = args[++index];
+            if (value != "auto" && value != (ui ? "plain" : "off")) {
+                return invalid_startup_arguments("use --ui auto|plain or --stream auto|off");
+            }
+            if (ui) parsed.plain_ui = value == "plain";
+            else parsed.stream_enabled = value != "off";
+            continue;
+        }
         if (args[index] != "--env-file") {
             parsed.command_args.push_back(args[index]);
             continue;
@@ -258,6 +275,9 @@ Result<StartupArguments> parse_startup_arguments(
                 "--env-file path could not be resolved");
         }
         parsed.env_file = path.lexically_normal();
+    }
+    if ((ui_seen || stream_seen) && parsed.command_args.size() > 1) {
+        return invalid_startup_arguments("--ui and --stream are available only in interactive mode");
     }
     if (parsed.env_file.has_value() && parsed.command_args.size() > 1 &&
         (parsed.command_args[1] == "verify-log" ||

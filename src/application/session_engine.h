@@ -71,20 +71,24 @@ public:
         const std::string& session_id,
         const std::string& user_text,
         RuntimeProgressObserver observer,
-        bool use_memory = true);
+        bool use_memory = true,
+        const RuntimePresentationOptions& presentation = {});
     SessionTurnResult recover_pending_turn(
         const std::string& session_id,
         RuntimeProgressObserver observer,
-        bool use_memory = true);
+        bool use_memory = true,
+        const RuntimePresentationOptions& presentation = {});
 
 private:
     Result<SessionState> append_event(SessionState state,
                                       SessionEventPayload payload);
     Result<std::string> turn_system_prompt(const SessionState& state,
                                            const std::string& user_text,
-                                           bool use_memory) const;
+                                           bool use_memory,
+                                           RuntimePresentationOptions& presentation) const;
     RunRequest turn_request(const SessionState& state,
-                             std::string system_prompt) const;
+                             std::string system_prompt,
+                             const RuntimePresentationOptions& presentation) const;
     SessionTurnResult finalize_turn(SessionState state,
                                     RuntimeResult runtime);
 

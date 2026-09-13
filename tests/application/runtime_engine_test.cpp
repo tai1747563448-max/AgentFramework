@@ -46,6 +46,17 @@ public:
 
     std::vector<agent::ModelRequest> requests;
 
+    agent::Result<agent::ModelResponse> complete(
+        const agent::ModelRequest& request,
+        const agent::ModelCallOptions& options) override {
+        stream_options.push_back(options);
+        if (on_stream) on_stream(options);
+        return complete(request);
+    }
+
+    std::vector<agent::ModelCallOptions> stream_options;
+    std::function<void(const agent::ModelCallOptions&)> on_stream;
+
 private:
     std::vector<agent::ModelResponse> responses_;
     std::optional<agent::RuntimeError> error_;
@@ -706,12 +717,12 @@ TEST_CASE(resume_applies_wall_budget_before_reissuing_each_in_flight_call) {
     }
 }
 
-TEST_CASE(runtime_progress_type_is_exactly_the_safe_four_field_projection) {
+TEST_CASE(runtime_progress_type_is_the_safe_projection_with_tool_name) {
     const agent::RuntimeProgress progress{
         "task-00000000000000000000000000000001", 7,
         agent::EventKind::ModelCallSucceeded,
         agent::TaskStatus::AwaitingModel};
-    const auto& [task_id, sequence, event_kind, status] = progress;
+    const auto& [task_id, sequence, event_kind, status, tool_name] = progress;
 
     static_assert(std::is_same_v<
                   decltype(agent::RuntimeProgress::task_id), std::string>);
@@ -727,6 +738,161 @@ TEST_CASE(runtime_progress_type_is_exactly_the_safe_four_field_projection) {
     REQUIRE(sequence == 7);
     REQUIRE(event_kind == agent::EventKind::ModelCallSucceeded);
     REQUIRE(status == agent::TaskStatus::AwaitingModel);
+    REQUIRE(tool_name.empty());
+}
+
+TEST_CASE(runtime_preview_arrives_before_acceptance_without_changing_durable_log) {
+    test::EngineFixture fixture(
+        test::FakeModel({fixtures::text_response("complete answer")}),
+        test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
+    auto request = fixtures::run_request("stream");
+    request.presentation.stream = true;
+    std::vector<agent::RuntimeTextUpdate> previews;
+    request.presentation.text_observer = [&](const agent::RuntimeTextUpdate& update) {
+        REQUIRE(fixture.events.kinds().back() == agent::EventKind::ModelCallStarted);
+        previews.push_back(update);
+    };
+    fixture.model.on_stream = [&](const agent::ModelCallOptions& options) {
+        REQUIRE(options.stream);
+        REQUIRE(options.cancellation == &fixture.cancel);
+        REQUIRE(static_cast<bool>(options.observer));
+        options.observer({agent::ModelStreamEventKind::TextDelta, 0, "complete "});
+        options.observer({agent::ModelStreamEventKind::TextDelta, 0, "answer"});
+        options.observer({agent::ModelStreamEventKind::TextBlockEnd, 0, {}});
+    };
+
+    const auto result = fixture.run(request);
+
+    REQUIRE(result.state->status == agent::TaskStatus::Completed);
+    REQUIRE(previews.size() == 3);
+    REQUIRE(previews[0].task_id == result.state->task_id);
+    REQUIRE(previews[0].model_round == 1);
+    REQUIRE(previews[1].event.text == "answer");
+    REQUIRE(fixture.events.events.size() == 6);
+    const auto replayed = agent::replay_events(fixture.events.events);
+    REQUIRE(replayed.has_value());
+    REQUIRE(replayed.value() == *result.state);
+}
+
+TEST_CASE(runtime_rag_streams_transport_but_never_releases_preview) {
+    for (const int mode : {0, 1, 2}) {
+        auto evidence = fixtures::evidence();
+        evidence.tool_use_forbidden = mode != 0;
+        if (mode == 1) evidence.items.clear();
+        test::EngineFixture fixture(
+            test::FakeModel({fixtures::text_response("checked answer")}),
+            test::FakeTools{}, test::FakeKnowledge(evidence));
+        auto request = fixtures::run_request("retrieve");
+        request.presentation.stream = true;
+        std::size_t previews = 0;
+        request.presentation.text_observer = [&](const agent::RuntimeTextUpdate&) { ++previews; };
+        fixture.model.on_stream = [&](const agent::ModelCallOptions& options) {
+            REQUIRE(options.stream);
+            REQUIRE(options.cancellation == &fixture.cancel);
+            REQUIRE(!options.observer);
+        };
+
+        const auto result = fixture.run(request);
+
+        REQUIRE(result.state->status == agent::TaskStatus::Completed);
+        REQUIRE(previews == 0);
+    }
+}
+
+TEST_CASE(runtime_failed_preview_never_accepts_response_or_executes_partial_tool) {
+    test::EngineFixture fixture(
+        test::FakeModel(agent::RuntimeError{agent::ErrorCode::ProtocolFailure, "unfinished tool JSON", false}),
+        test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
+    auto request = fixtures::run_request("stream tool");
+    request.presentation.stream = true;
+    std::string preview;
+    request.presentation.text_observer = [&](const agent::RuntimeTextUpdate& update) { preview += update.event.text; };
+    fixture.model.on_stream = [&](const agent::ModelCallOptions& options) {
+        options.observer({agent::ModelStreamEventKind::TextDelta, 0, "I will read"});
+        REQUIRE(fixture.tools.executed_calls.empty());
+    };
+
+    const auto result = fixture.run(request);
+
+    REQUIRE(result.state->status == agent::TaskStatus::Failed);
+    REQUIRE(preview == "I will read");
+    REQUIRE(fixture.tools.executed_calls.empty());
+    REQUIRE(fixture.events.count(agent::EventKind::ModelCallSucceeded) == 0);
+    REQUIRE(result.state->messages.size() == 1);
+}
+
+TEST_CASE(runtime_disables_throwing_preview_for_the_remaining_task) {
+    test::EngineFixture fixture(
+        test::FakeModel({fixtures::tool_response({fixtures::call("call-1", "read")}),
+                         fixtures::text_response("answer")}),
+        test::FakeTools({agent::ToolResult{"call-1", "contents", false}}),
+        test::FakeKnowledge(agent::EvidencePack{}));
+    auto request = fixtures::run_request("stream tool");
+    request.presentation.stream = true;
+    std::size_t attempts = 0;
+    request.presentation.text_observer = [&](const agent::RuntimeTextUpdate&) {
+        ++attempts;
+        throw std::runtime_error("closed presenter");
+    };
+    fixture.model.on_stream = [](const agent::ModelCallOptions& options) {
+        if (options.observer) {
+            options.observer({agent::ModelStreamEventKind::TextDelta, 0, "preview"});
+            options.observer({agent::ModelStreamEventKind::TextBlockEnd, 0, {}});
+        }
+    };
+
+    const auto result = fixture.run(request);
+
+    REQUIRE(result.state->status == agent::TaskStatus::Completed);
+    REQUIRE(attempts == 1);
+    REQUIRE(fixture.tools.executed_calls.size() == 1);
+}
+
+TEST_CASE(runtime_checks_cancel_and_wall_budget_after_model_before_accepting) {
+    for (const bool cancel : {false, true}) {
+        test::EngineFixture fixture(
+            test::FakeModel({fixtures::text_response("discarded")}),
+            test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
+        auto request = fixtures::run_request("late guard");
+        request.budgets.max_task_time_ms = 100;
+        fixture.model.on_stream = [&](const agent::ModelCallOptions& options) {
+            REQUIRE(options.cancellation == &fixture.cancel);
+            REQUIRE(!options.stream);
+            if (cancel) fixture.cancel = test::FakeCancellation(true);
+            else fixture.clock = test::FakeClock({1'100});
+        };
+
+        const auto result = fixture.run(request);
+
+        REQUIRE(result.state->status == (cancel ? agent::TaskStatus::Cancelled : agent::TaskStatus::BudgetExceeded));
+        REQUIRE(fixture.events.count(agent::EventKind::ModelCallSucceeded) == 0);
+        REQUIRE(fixture.events.count(agent::EventKind::ModelCallFailed) == 0);
+        REQUIRE(result.state->messages.size() == 1);
+    }
+}
+
+TEST_CASE(runtime_tool_names_come_from_durable_started_and_completed_calls) {
+    test::EngineFixture fixture(
+        test::FakeModel({fixtures::tool_response({fixtures::call("call-1", "read_file")}),
+                         fixtures::text_response("answer")}),
+        test::FakeTools({agent::ToolResult{"call-1", "contents", false}}),
+        test::FakeKnowledge(agent::EvidencePack{}));
+    std::vector<agent::RuntimeProgress> tool_progress;
+    const auto result = fixture.run(fixtures::run_request("tools"),
+        [&](const agent::RuntimeProgress& progress) {
+            if (progress.event_kind == agent::EventKind::ToolCallStarted ||
+                progress.event_kind == agent::EventKind::ToolCallSucceeded) {
+                REQUIRE(fixture.events.events.size() == progress.sequence);
+                tool_progress.push_back(progress);
+            } else {
+                REQUIRE(progress.tool_name.empty());
+            }
+        });
+
+    REQUIRE(result.state->status == agent::TaskStatus::Completed);
+    REQUIRE(tool_progress.size() == 2);
+    REQUIRE(tool_progress[0].tool_name == "read_file");
+    REQUIRE(tool_progress[1].tool_name == "read_file");
 }
 
 TEST_CASE(engine_reports_post_reduce_progress_only_after_each_durable_append) {
@@ -1202,6 +1368,62 @@ TEST_CASE(wall_time_budget_stops_before_knowledge_retrieval) {
     REQUIRE(exceeded->budget_name == "max_task_time_ms");
 }
 
+TEST_CASE(model_cancelled_error_produces_task_cancelled_without_model_failure) {
+    test::EngineFixture fixture(
+        test::FakeModel(agent::RuntimeError{
+            agent::ErrorCode::Cancelled, "request interrupted", false}),
+        test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
+
+    const auto result = fixture.run(fixtures::run_request("cancel model"));
+
+    REQUIRE(result.state.has_value());
+    REQUIRE(!result.fatal_error.has_value());
+    REQUIRE(result.state->status == agent::TaskStatus::Cancelled);
+    REQUIRE(fixture.events.count(agent::EventKind::TaskCancelled) == 1);
+    REQUIRE(fixture.events.count(agent::EventKind::ModelCallFailed) == 0);
+    REQUIRE(fixture.events.count(agent::EventKind::ModelCallSucceeded) == 0);
+}
+
+TEST_CASE(model_cancelled_error_retains_precedence_when_wall_budget_also_expires) {
+    test::EngineFixture fixture(
+        test::FakeModel(agent::RuntimeError{
+            agent::ErrorCode::Cancelled, "request interrupted", false}),
+        test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
+    fixture.model.on_stream = [&](const agent::ModelCallOptions&) {
+        fixture.clock = test::FakeClock({100'000});
+    };
+
+    const auto result = fixture.run(fixtures::run_request("cancel with elapsed budget"));
+
+    REQUIRE(result.state.has_value());
+    REQUIRE(!result.fatal_error.has_value());
+    REQUIRE(result.state->status == agent::TaskStatus::Cancelled);
+    REQUIRE(fixture.events.count(agent::EventKind::TaskCancelled) == 1);
+    REQUIRE(fixture.events.count(agent::EventKind::TaskBudgetExceeded) == 0);
+}
+
+TEST_CASE(runtime_cancellation_after_durable_response_keeps_accepted_text_but_blocks_tools) {
+    for (const bool has_tool : {false, true}) {
+        test::EngineFixture fixture(
+            test::FakeModel({has_tool ? fixtures::tool_response({fixtures::call("call-1", "read")})
+                                      : fixtures::text_response("accepted")}),
+            test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
+
+        const auto result = fixture.run(fixtures::run_request("acceptance boundary"),
+            [&](const agent::RuntimeProgress& progress) {
+                if (progress.event_kind == agent::EventKind::ModelCallSucceeded) {
+                    fixture.cancel = test::FakeCancellation(true);
+                }
+            });
+
+        REQUIRE(result.state.has_value());
+        REQUIRE(!result.fatal_error.has_value());
+        REQUIRE(result.state->status == (has_tool ? agent::TaskStatus::Cancelled : agent::TaskStatus::Completed));
+        REQUIRE(fixture.events.count(agent::EventKind::ModelCallSucceeded) == 1);
+        REQUIRE(fixture.tools.executed_calls.empty());
+    }
+}
+
 TEST_CASE(cancellation_wins_before_wall_time_and_count_guards) {
     test::EngineFixture fixture(
         test::FakeModel({fixtures::text_response("unused")}),
@@ -1231,14 +1453,18 @@ TEST_CASE(wall_time_guard_wins_before_model_round_limit) {
         test::FakeModel({fixtures::tool_response(
             {fixtures::call("call-1", "read")})}),
         test::FakeTools({agent::ToolResult{"call-1", "contents", false}}),
-        test::FakeKnowledge(agent::EvidencePack{}), test::MemoryEventStore{},
-        test::FakeClock({1'000, 1'000, 1'000, 1'000,
-                         1'000, 1'000, 1'000, 1'100}));
+        test::FakeKnowledge(agent::EvidencePack{}));
     auto request = fixtures::run_request("inspect code");
     request.budgets.max_task_time_ms = 100;
     request.budgets.max_model_rounds = 1;
 
-    const auto result = fixture.run(request);
+    const auto result = fixture.run(request,
+        [&](const agent::RuntimeProgress& progress) {
+            if (progress.event_kind == agent::EventKind::ContextPrepared &&
+                fixture.knowledge.retrieved_states.size() == 2) {
+                fixture.clock = test::FakeClock({1'100});
+            }
+        });
 
     REQUIRE(result.state.has_value());
     REQUIRE(result.state->status == agent::TaskStatus::BudgetExceeded);
@@ -1259,14 +1485,16 @@ TEST_CASE(cancellation_before_second_tool_wins_over_exhausted_tool_budget) {
              fixtures::call("call-2", "search")})}),
         test::FakeTools({agent::ToolResult{"call-1", "contents", false},
                          agent::ToolResult{"call-2", "matches", false}}),
-        test::FakeKnowledge(agent::EvidencePack{}), test::MemoryEventStore{},
-        test::FakeClock{},
-        test::FakeCancellation(
-            {false, false, false, false, false, true}));
+        test::FakeKnowledge(agent::EvidencePack{}));
     auto request = fixtures::run_request("inspect code");
     request.budgets.max_tool_calls = 1;
 
-    const auto result = fixture.run(request);
+    const auto result = fixture.run(request,
+        [&](const agent::RuntimeProgress& progress) {
+            if (progress.event_kind == agent::EventKind::ToolCallSucceeded) {
+                fixture.cancel = test::FakeCancellation(true);
+            }
+        });
 
     REQUIRE(result.state.has_value());
     REQUIRE(result.state->status == agent::TaskStatus::Cancelled);
@@ -1286,14 +1514,17 @@ TEST_CASE(wall_time_before_second_tool_wins_over_exhausted_tool_budget) {
              fixtures::call("call-2", "search")})}),
         test::FakeTools({agent::ToolResult{"call-1", "contents", false},
                          agent::ToolResult{"call-2", "matches", false}}),
-        test::FakeKnowledge(agent::EvidencePack{}), test::MemoryEventStore{},
-        test::FakeClock(
-            {1'000, 1'000, 1'000, 1'000, 1'000, 1'000, 1'100}));
+        test::FakeKnowledge(agent::EvidencePack{}));
     auto request = fixtures::run_request("inspect code");
     request.budgets.max_task_time_ms = 100;
     request.budgets.max_tool_calls = 1;
 
-    const auto result = fixture.run(request);
+    const auto result = fixture.run(request,
+        [&](const agent::RuntimeProgress& progress) {
+            if (progress.event_kind == agent::EventKind::ToolCallSucceeded) {
+                fixture.clock = test::FakeClock({1'100});
+            }
+        });
 
     REQUIRE(result.state.has_value());
     REQUIRE(result.state->status == agent::TaskStatus::BudgetExceeded);

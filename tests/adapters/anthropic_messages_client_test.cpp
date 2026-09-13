@@ -18,6 +18,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
@@ -265,6 +266,486 @@ agent::HttpResponse anthropic_tool_response() {
 }
 
 }  // namespace fixtures
+
+namespace streaming_fixtures {
+
+class AtomicCancellation final : public agent::Cancellation {
+public:
+    bool requested() const noexcept override { return cancelled.load(); }
+    std::atomic<bool> cancelled{false};
+};
+
+class FragmentedTransport final : public agent::HttpTransport {
+public:
+    explicit FragmentedTransport(std::string body, std::size_t fragment_size)
+        : body_(std::move(body)), fragment_size_(fragment_size) {}
+    agent::Result<agent::HttpResponse> post(const agent::HttpRequest&) override {
+        throw std::runtime_error("stream request must use the streaming transport");
+    }
+    agent::Result<agent::HttpResponse> post_stream(
+        const agent::HttpRequest&, const agent::HttpChunkObserver& observer,
+        const agent::Cancellation* cancellation) override {
+        for (std::size_t position = 0; position < body_.size(); position += fragment_size_) {
+            if (cancellation && cancellation->requested()) {
+                return agent::Result<agent::HttpResponse>::failure(
+                    {agent::ErrorCode::Cancelled, "cancelled", false});
+            }
+            if (!observer(std::string_view(body_).substr(position, fragment_size_))) {
+                return agent::Result<agent::HttpResponse>::failure(
+                    {agent::ErrorCode::ProtocolFailure, "rejected", false});
+            }
+        }
+        return agent::Result<agent::HttpResponse>::success(
+            {200, {}, {{"content-type", "text/event-stream"}}});
+    }
+private:
+    std::string body_;
+    std::size_t fragment_size_;
+};
+
+std::string event(const nlohmann::json& data, const std::string& newline = "\n") {
+    return "event: " + data.at("type").get<std::string>() + newline +
+           "data: " + data.dump() + newline + newline;
+}
+
+std::string beginning(std::int64_t input_tokens = 12) {
+    return event({{"type", "message_start"},
+                  {"message", {{"id", "stream-request"}, {"type", "message"},
+                               {"role", "assistant"}, {"content", nlohmann::json::array()},
+                               {"stop_reason", nullptr},
+                               {"usage", {{"input_tokens", input_tokens}, {"output_tokens", 0}}}}}}) +
+           event({{"type", "content_block_start"}, {"index", 0},
+                  {"content_block", {{"type", "text"}, {"text", ""}}}});
+}
+
+std::string text(const std::string& value) {
+    return event({{"type", "content_block_delta"}, {"index", 0},
+                  {"delta", {{"type", "text_delta"}, {"text", value}}}});
+}
+
+std::string ending(const std::string& stop = "end_turn") {
+    return event({{"type", "content_block_stop"}, {"index", 0}}) +
+           event({{"type", "message_delta"},
+                  {"delta", {{"stop_reason", stop}, {"stop_sequence", nullptr}}},
+                  {"usage", {{"output_tokens", 6}}}}) +
+           event({{"type", "message_stop"}});
+}
+
+}  // namespace streaming_fixtures
+
+TEST_CASE(anthropic_stream_delivers_fragmented_text_before_http_completes) {
+    test::SocketRuntime sockets;
+    std::uint16_t port = 0;
+    const auto listener = test::create_loopback_listener(port);
+    std::atomic<bool> observed{false};
+    bool observed_before_completion = false;
+    std::string sent_request;
+    const auto first = streaming_fixtures::beginning() +
+                       streaming_fixtures::text(u8"中文🙂");
+    const auto last = streaming_fixtures::ending();
+    std::thread server([&] {
+        if (test::wait_for_socket(listener, std::chrono::seconds(3)) == 1) {
+            const auto connection = accept(listener, nullptr, nullptr);
+            if (connection != test::kInvalidSocket) {
+                sent_request = test::receive_http_request(connection);
+                test::send_all(connection, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: " +
+                    std::to_string(first.size() + last.size()) + "\r\nConnection: close\r\n\r\n");
+                for (char byte : first) {
+                    test::send_all(connection, std::string(1, byte));
+                }
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+                while (!observed.load() && std::chrono::steady_clock::now() < deadline) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                observed_before_completion = observed.load();
+                test::send_all(connection, last);
+                test::close_socket(connection);
+            }
+        }
+        test::close_socket(listener);
+    });
+    agent::CprHttpTransport transport;
+    auto config = fixtures::config();
+    config.base_url = "http://127.0.0.1:" + std::to_string(port);
+    agent::AnthropicMessagesClient client(config, transport);
+    agent::ModelCallOptions options;
+    options.stream = true;
+    std::string preview;
+    options.observer = [&](const agent::ModelStreamEvent& update) {
+        if (update.kind == agent::ModelStreamEventKind::TextDelta) {
+            preview += update.text;
+            observed.store(true);
+        }
+    };
+    auto request = fixtures::simple_model_request();
+    request.timeout_ms = 5'000;
+    const auto result = client.complete(request, options);
+    server.join();
+    REQUIRE(result.has_value());
+    REQUIRE(observed_before_completion);
+    REQUIRE(preview == u8"中文🙂");
+    REQUIRE(std::get<agent::TextBlock>(result.value().content.at(0)).text == preview);
+    REQUIRE(sent_request.find("\"stream\":true") != std::string::npos);
+    REQUIRE(result.value().input_tokens == 12);
+    REQUIRE(result.value().output_tokens == 6);
+}
+
+TEST_CASE(anthropic_stream_rejects_eof_and_in_band_error_without_success) {
+    const std::vector<std::string> responses = {
+        streaming_fixtures::beginning() + streaming_fixtures::text("partial"),
+        streaming_fixtures::beginning() + streaming_fixtures::text("partial") +
+            streaming_fixtures::event({{"type", "error"},
+                                      {"error", {{"type", "overloaded_error"},
+                                                 {"message", "PROVIDER_SECRET"}}}})};
+    for (const auto& body : responses) {
+        test::FakeHttpTransport transport(agent::HttpResponse{200, body, {{"content-type", "text/event-stream"}}});
+        agent::AnthropicMessagesClient client(fixtures::config(), transport);
+        agent::ModelCallOptions options;
+        options.stream = true;
+        const auto result = client.complete(fixtures::simple_model_request(), options);
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().message.find("PROVIDER_SECRET") == std::string::npos);
+    }
+}
+
+TEST_CASE(anthropic_stream_rejects_invalid_lifecycle_usage_and_content) {
+    using namespace streaming_fixtures;
+    const auto begin = beginning();
+    const auto delta = text("answer");
+    const auto end = ending();
+    const std::vector<std::string> invalid = {
+        delta + end,
+        begin + begin + delta + end,
+        begin + delta + end + event({{"type", "message_stop"}}),
+        begin + event({{"type", "content_block_stop"}, {"index", 1}}) + end,
+        begin + delta + event({{"type", "message_stop"}}),
+        begin + event({{"type", "content_block_delta"}, {"index", 0},
+                       {"delta", {{"type", "thinking_delta"}, {"thinking", "hidden"}}}}) + end,
+        begin + delta + event({{"type", "content_block_stop"}, {"index", 0}}) +
+            event({{"type", "message_delta"}, {"delta", {{"stop_reason", "end_turn"}}},
+                   {"usage", {{"output_tokens", -1}}}}) + event({{"type", "message_stop"}}),
+        begin + delta + event({{"type", "content_block_stop"}, {"index", 0}}) +
+            event({{"type", "message_delta"}, {"delta", {{"stop_reason", "end_turn"}}}}) +
+            event({{"type", "message_stop"}}),
+        begin + delta + ending("future_stop"),
+        begin + "event: content_block_delta\ndata: broken JSON\n\n" + end,
+        begin + "event: message_stop\ndata: {\"type\":\"ping\"}\n\n" + delta + end,
+        begin + "data: " + std::string(1024 * 1024 + 1, 'x'),
+        begin + delta + end + "data: partial",
+    };
+    for (std::size_t index = 0; index < invalid.size(); ++index) {
+        test::FakeHttpTransport transport({200, invalid[index], {{"content-type", "text/event-stream"}}});
+        agent::AnthropicMessagesClient client(fixtures::config(), transport);
+        agent::ModelCallOptions options;
+        options.stream = true;
+        const auto result = client.complete(fixtures::simple_model_request(), options);
+        if (result.has_value()) {
+            throw std::runtime_error("invalid stream accepted at case " + std::to_string(index));
+        }
+        REQUIRE(result.error().code == agent::ErrorCode::ProtocolFailure);
+    }
+}
+
+TEST_CASE(anthropic_stream_assembles_tool_json_without_publishing_arguments) {
+    using namespace streaming_fixtures;
+    const auto wire = beginning() + text("Checking.") +
+        event({{"type", "content_block_stop"}, {"index", 0}}) +
+        event({{"type", "content_block_start"}, {"index", 1},
+               {"content_block", {{"type", "tool_use"}, {"id", "call-1"},
+                                  {"name", "read_file"}, {"input", nlohmann::json::object()}}}}) +
+        event({{"type", "content_block_delta"}, {"index", 1},
+               {"delta", {{"type", "input_json_delta"}, {"partial_json", "{\"path\":"}}}}) +
+        event({{"type", "content_block_delta"}, {"index", 1},
+               {"delta", {{"type", "input_json_delta"}, {"partial_json", "\"notes.txt\"}"}}}}) +
+        event({{"type", "content_block_stop"}, {"index", 1}}) +
+        event({{"type", "message_delta"}, {"delta", {{"stop_reason", "tool_use"}}},
+               {"usage", {{"output_tokens", 7}}}}) + event({{"type", "message_stop"}});
+    test::FakeHttpTransport transport({200, wire, {{"content-type", "text/event-stream"}}});
+    agent::AnthropicMessagesClient client(fixtures::config(), transport);
+    agent::ModelCallOptions options;
+    options.stream = true;
+    std::vector<agent::ModelStreamEvent> previews;
+    options.observer = [&](const agent::ModelStreamEvent& update) { previews.push_back(update); };
+    const auto result = client.complete(fixtures::simple_model_request(), options);
+    REQUIRE(result.has_value());
+    REQUIRE(result.value().stop_reason == agent::StopReason::ToolUse);
+    REQUIRE(result.value().content.size() == 2);
+    const auto& tool = std::get<agent::ToolUseBlock>(result.value().content.at(1)).call;
+    REQUIRE(tool.arguments == agent::Value::object({{"path", "notes.txt"}}));
+    REQUIRE(previews.size() == 2);
+    REQUIRE(previews[0].text == "Checking.");
+    REQUIRE(previews[1].kind == agent::ModelStreamEventKind::TextBlockEnd);
+}
+
+TEST_CASE(anthropic_stream_supports_crlf_multiline_auxiliary_events_and_throwing_preview) {
+    using namespace streaming_fixtures;
+    auto wire = std::string(": heartbeat\r\nevent: ping\r\ndata: {\"type\":\"ping\",\r\ndata: \"extra\":true}\r\n\r\n") +
+                event({{"type", "future_auxiliary"}, {"value", "ignored"}}, "\r\n") +
+                beginning() + text(u8"中文🙂") + text(" suffix") + ending();
+    test::FakeHttpTransport transport({200, wire, {{"Content-Type", "text/event-stream; charset=utf-8"}}});
+    agent::AnthropicMessagesClient client(fixtures::config(), transport);
+    agent::ModelCallOptions options;
+    options.stream = true;
+    int calls = 0;
+    options.observer = [&](const agent::ModelStreamEvent&) { ++calls; throw std::runtime_error("preview unavailable"); };
+    const auto result = client.complete(fixtures::simple_model_request(), options);
+    REQUIRE(result.has_value());
+    REQUIRE(calls == 1);
+    REQUIRE(std::get<agent::TextBlock>(result.value().content.at(0)).text == u8"中文🙂 suffix");
+}
+
+TEST_CASE(anthropic_stream_rejects_wrong_content_type_and_sanitizes_transport_cancel) {
+    using namespace streaming_fixtures;
+    test::FakeHttpTransport wrong_type({200, beginning() + text("answer") + ending(), {{"content-type", "application/json"}}});
+    agent::AnthropicMessagesClient wrong_client(fixtures::config(), wrong_type);
+    agent::ModelCallOptions options;
+    options.stream = true;
+    const auto wrong_result = wrong_client.complete(fixtures::simple_model_request(), options);
+    REQUIRE(!wrong_result.has_value());
+    REQUIRE(wrong_result.error().code == agent::ErrorCode::ProtocolFailure);
+    test::FakeHttpTransport cancelled(agent::RuntimeError{agent::ErrorCode::Cancelled, "CREDENTIAL_SECRET", false});
+    agent::AnthropicMessagesClient cancelled_client(fixtures::config(), cancelled);
+    const auto cancelled_result = cancelled_client.complete(fixtures::simple_model_request(), options);
+    REQUIRE(!cancelled_result.has_value());
+    REQUIRE(cancelled_result.error().code == agent::ErrorCode::Cancelled);
+    REQUIRE(cancelled_result.error().message.find("CREDENTIAL_SECRET") == std::string::npos);
+}
+
+TEST_CASE(anthropic_stream_handles_every_small_chunk_size_and_preserves_text_order) {
+    using namespace streaming_fixtures;
+    const auto wire = beginning() + text(u8"中文🙂") + text(" next") + ending();
+    for (std::size_t chunk_size = 1; chunk_size <= 16; ++chunk_size) {
+        FragmentedTransport transport(wire, chunk_size);
+        agent::AnthropicMessagesClient client(fixtures::config(), transport);
+        agent::ModelCallOptions options;
+        options.stream = true;
+        std::string preview;
+        int ends = 0;
+        options.observer = [&](const agent::ModelStreamEvent& update) {
+            REQUIRE(update.block_index == 0);
+            if (update.kind == agent::ModelStreamEventKind::TextDelta) preview += update.text;
+            else ++ends;
+        };
+        const auto result = client.complete(fixtures::simple_model_request(), options);
+        REQUIRE(result.has_value());
+        REQUIRE(preview == u8"中文🙂 next");
+        REQUIRE(ends == 1);
+    }
+}
+
+TEST_CASE(anthropic_stream_falls_back_to_buffered_json_without_invented_previews) {
+    test::FakeHttpTransport transport(fixtures::text_response());
+    agent::AnthropicMessagesClient client(fixtures::config(), transport);
+    agent::ModelCallOptions options;
+    options.stream = true;
+    int previews = 0;
+    options.observer = [&](const agent::ModelStreamEvent&) { ++previews; };
+    const auto result = client.complete(fixtures::simple_model_request(), options);
+    REQUIRE(result.has_value());
+    REQUIRE(previews == 0);
+    REQUIRE(std::get<agent::TextBlock>(result.value().content.at(0)).text == "Done");
+}
+
+TEST_CASE(anthropic_stream_rejects_deep_json_before_recursive_response_conversion) {
+    using namespace streaming_fixtures;
+    std::string nested;
+    for (int depth = 0; depth < 100; ++depth) nested += "{\"x\":";
+    nested += "0";
+    nested += std::string(100, '}');
+    const auto start = beginning();
+    const auto message_start = start.substr(0, start.find("event: content_block_start"));
+    const auto tool_wire = message_start +
+        event({{"type", "content_block_start"}, {"index", 0},
+               {"content_block", {{"type", "tool_use"}, {"id", "deep-call"},
+                                  {"name", "read_file"}, {"input", nlohmann::json::object()}}}}) +
+        event({{"type", "content_block_delta"}, {"index", 0},
+               {"delta", {{"type", "input_json_delta"}, {"partial_json", nested}}}}) +
+        ending("tool_use");
+    const std::vector<agent::HttpResponse> responses = {
+        {200, tool_wire, {{"content-type", "text/event-stream"}}},
+        {200, "event: future_auxiliary\ndata: {\"type\":\"future_auxiliary\",\"nested\":" +
+                   nested + "}\n\n" + beginning() + text("answer") + ending(),
+         {{"content-type", "text/event-stream"}}},
+        fixtures::response("[{\"type\":\"tool_use\",\"id\":\"deep-call\",\"name\":\"read_file\",\"input\":" + nested + "}]", "tool_use")};
+    for (std::size_t index = 0; index < responses.size(); ++index) {
+        test::FakeHttpTransport transport(responses[index]);
+        agent::AnthropicMessagesClient client(fixtures::config(), transport);
+        agent::ModelCallOptions options;
+        options.stream = true;
+        const auto result = client.complete(fixtures::simple_model_request(), options);
+        if (result.has_value()) {
+            throw std::runtime_error("deep stream JSON accepted at case " + std::to_string(index));
+        }
+        REQUIRE(result.error().code == agent::ErrorCode::ProtocolFailure);
+    }
+}
+
+TEST_CASE(anthropic_stream_rejects_content_after_message_delta_started) {
+    using namespace streaming_fixtures;
+    const auto start = beginning();
+    const auto message_start = start.substr(0, start.find("event: content_block_start"));
+    const auto wire = message_start +
+        event({{"type", "message_delta"}, {"delta", {{"stop_reason", nullptr}}},
+               {"usage", {{"output_tokens", 0}}}}) +
+        start.substr(message_start.size()) + text("out of order") + ending();
+    test::FakeHttpTransport transport({200, wire, {{"content-type", "text/event-stream"}}});
+    agent::AnthropicMessagesClient client(fixtures::config(), transport);
+    agent::ModelCallOptions options;
+    options.stream = true;
+    const auto result = client.complete(fixtures::simple_model_request(), options);
+    REQUIRE(!result.has_value());
+    REQUIRE(result.error().code == agent::ErrorCode::ProtocolFailure);
+}
+
+TEST_CASE(anthropic_stream_preserves_late_cumulative_input_token_accounting) {
+    // Observed compatible-provider stream: start reports zero input tokens;
+    // the terminal message_delta supplies the completed cumulative accounting.
+    using namespace streaming_fixtures;
+    const auto wire = beginning(0) + text("LIVE_STREAM_OK") +
+        event({{"type", "content_block_stop"}, {"index", 0}}) +
+        event({{"type", "message_delta"}, {"delta", {{"stop_reason", "end_turn"}}},
+               {"usage", {{"input_tokens", 174}, {"output_tokens", 4},
+                          {"service_tier", "standard"}}}}) + event({{"type", "message_stop"}});
+    test::FakeHttpTransport transport({200, wire, {{"content-type", "text/event-stream"}}});
+    agent::AnthropicMessagesClient client(fixtures::config(), transport);
+    agent::ModelCallOptions options;
+    options.stream = true;
+    const auto result = client.complete(fixtures::simple_model_request(), options);
+    REQUIRE(result.has_value());
+    REQUIRE(result.value().input_tokens == 174);
+    REQUIRE(result.value().output_tokens == 4);
+    REQUIRE(result.value().stop_reason == agent::StopReason::EndTurn);
+}
+
+TEST_CASE(anthropic_stream_rejects_decreasing_or_invalid_final_input_usage) {
+    using namespace streaming_fixtures;
+    const std::vector<std::string> invalid = {"11", "-1", "1.5", "\"174\"", "18446744073709551616"};
+    for (const auto& input_tokens : invalid) {
+        const auto wire = beginning(12) + text("answer") +
+            event({{"type", "content_block_stop"}, {"index", 0}}) +
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},"
+            "\"usage\":{\"output_tokens\":6,\"input_tokens\":" + input_tokens + "}}\n\n" +
+            event({{"type", "message_stop"}});
+        test::FakeHttpTransport transport({200, wire, {{"content-type", "text/event-stream"}}});
+        agent::AnthropicMessagesClient client(fixtures::config(), transport);
+        agent::ModelCallOptions options;
+        options.stream = true;
+        const auto result = client.complete(fixtures::simple_model_request(), options);
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == agent::ErrorCode::ProtocolFailure);
+    }
+}
+
+TEST_CASE(cpr_transport_cancels_before_bytes_after_headers_and_during_text) {
+    for (int phase = 0; phase < 4; ++phase) {
+        test::SocketRuntime sockets;
+        std::uint16_t port = 0;
+        const auto listener = test::create_loopback_listener(port);
+        streaming_fixtures::AtomicCancellation cancellation;
+        bool request_received = false;
+        bool peer_closed = false;
+        std::thread server([&] {
+            if (test::wait_for_socket(listener, std::chrono::seconds(3)) == 1) {
+                const auto connection = accept(listener, nullptr, nullptr);
+                if (connection != test::kInvalidSocket) {
+                    request_received = !test::receive_http_request(connection).empty();
+                    if (phase == 1 || phase == 2) {
+                        test::send_all(connection, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
+                    }
+                    if (phase == 2) {
+                        test::send_all(connection, streaming_fixtures::beginning() + streaming_fixtures::text("partial"));
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    cancellation.cancelled.store(true);
+                    if (test::wait_for_socket(connection, std::chrono::seconds(3)) == 1) {
+                        char byte{};
+                        peer_closed = recv(connection, &byte, 1, 0) <= 0;
+                    }
+                    test::close_socket(connection);
+                }
+            }
+            test::close_socket(listener);
+        });
+        agent::CprHttpTransport transport;
+        auto config = fixtures::config();
+        config.base_url = "http://127.0.0.1:" + std::to_string(port);
+        agent::AnthropicMessagesClient client(config, transport);
+        agent::ModelCallOptions options;
+        options.stream = phase != 3;  // Buffered calls are cancellable too.
+        options.cancellation = &cancellation;
+        auto request = fixtures::simple_model_request();
+        request.timeout_ms = 5'000;
+        const auto started = std::chrono::steady_clock::now();
+        const auto result = client.complete(request, options);
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        server.join();
+        REQUIRE(request_received);
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == agent::ErrorCode::Cancelled);
+        REQUIRE(!result.error().retryable);
+        REQUIRE(elapsed < std::chrono::seconds(3));
+        REQUIRE(peer_closed);
+    }
+}
+
+TEST_CASE(cpr_stream_timeout_without_any_response_bytes_remains_timeout) {
+    test::SocketRuntime sockets;
+    std::uint16_t port = 0;
+    const auto listener = test::create_loopback_listener(port);
+    std::thread server([&] {
+        if (test::wait_for_socket(listener, std::chrono::seconds(3)) == 1) {
+            const auto connection = accept(listener, nullptr, nullptr);
+            if (connection != test::kInvalidSocket) {
+                test::receive_http_request(connection);
+                test::wait_for_socket(connection, std::chrono::seconds(2));
+                test::close_socket(connection);
+            }
+        }
+        test::close_socket(listener);
+    });
+    agent::CprHttpTransport transport;
+    auto config = fixtures::config();
+    config.base_url = "http://127.0.0.1:" + std::to_string(port);
+    agent::AnthropicMessagesClient client(config, transport);
+    agent::ModelCallOptions options;
+    options.stream = true;
+    auto request = fixtures::simple_model_request();
+    request.timeout_ms = 150;
+    const auto result = client.complete(request, options);
+    server.join();
+    REQUIRE(!result.has_value());
+    REQUIRE(result.error().code == agent::ErrorCode::RequestTimeout);
+    REQUIRE(result.error().retryable);
+}
+
+TEST_CASE(model_compatibility_overload_checks_cancellation_before_and_after_legacy_call) {
+    streaming_fixtures::AtomicCancellation cancellation;
+    class LegacyModel final : public agent::ModelClient {
+    public:
+        explicit LegacyModel(streaming_fixtures::AtomicCancellation& source) : source_(source) {}
+        agent::Result<agent::ModelResponse> complete(const agent::ModelRequest&) override {
+            ++calls;
+            source_.cancelled.store(true);
+            return agent::Result<agent::ModelResponse>::success({});
+        }
+        int calls{0};
+    private:
+        streaming_fixtures::AtomicCancellation& source_;
+    } model(cancellation);
+    agent::ModelClient& compatible = model;
+    agent::ModelCallOptions options;
+    options.cancellation = &cancellation;
+    cancellation.cancelled.store(true);
+    const auto before = compatible.complete(fixtures::simple_model_request(), options);
+    REQUIRE(!before.has_value());
+    REQUIRE(before.error().code == agent::ErrorCode::Cancelled);
+    REQUIRE(model.calls == 0);
+    cancellation.cancelled.store(false);
+    const auto after = compatible.complete(fixtures::simple_model_request(), options);
+    REQUIRE(!after.has_value());
+    REQUIRE(after.error().code == agent::ErrorCode::Cancelled);
+    REQUIRE(model.calls == 1);
+}
 
 TEST_CASE(cpr_transport_returns_redirect_without_contacting_redirect_target) {
     test::SocketRuntime sockets;

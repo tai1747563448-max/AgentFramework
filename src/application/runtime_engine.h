@@ -2,6 +2,7 @@
 
 #include "domain/runtime_error.h"
 #include "domain/runtime_event.h"
+#include "domain/model_stream_event.h"
 #include "domain/task_state.h"
 
 #include <cstddef>
@@ -21,6 +22,19 @@ class KnowledgeProvider;
 class ModelClient;
 class ToolGateway;
 
+struct RuntimeTextUpdate {
+    std::string task_id;
+    std::size_t model_round{0};
+    ModelStreamEvent event;
+};
+
+// Presentation is transient and is never part of persisted task state.
+struct RuntimePresentationOptions {
+    bool stream{false};
+    std::function<void(const RuntimeTextUpdate&)> text_observer;
+    std::function<void(const std::string&)> phase_observer;
+};
+
 struct RunRequest {
     std::string issue;
     std::string workspace_utf8;
@@ -29,11 +43,13 @@ struct RunRequest {
     std::vector<Message> initial_messages;
     std::optional<std::string> requested_task_id;
     std::optional<SessionTaskLink> session_link;
+    RuntimePresentationOptions presentation;
 };
 
 struct ResumeRequest {
     std::vector<RuntimeEvent> durable_events;
     std::string fallback_system_prompt;
+    RuntimePresentationOptions presentation;
 };
 
 struct RuntimeResult {
@@ -46,6 +62,7 @@ struct RuntimeProgress {
     std::uint64_t sequence;
     EventKind event_kind;
     TaskStatus status;
+    std::string tool_name;
 };
 
 using RuntimeProgressObserver =
@@ -81,7 +98,8 @@ private:
     RuntimeResult continue_task(std::optional<TaskState>& state,
                                 const std::string& system_prompt,
                                 std::int64_t started_at_ms,
-                                RuntimeProgressObserver& observer);
+                                RuntimeProgressObserver& observer,
+                                RuntimePresentationOptions presentation);
 
     ModelClient& model_;
     ToolGateway& tools_;

@@ -25,6 +25,7 @@
 #include "cli/cli_app.h"
 #include "cli/interactive_cli.h"
 #include "cli/terminal_text.h"
+#include "cli/terminal_capabilities.h"
 #include "config/runtime_config.h"
 
 #include <exception>
@@ -32,12 +33,37 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace {
+
+class DiagnosticRouter {
+public:
+    void observe(std::function<void(const std::string&)> observer) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        observer_ = std::move(observer);
+    }
+    void emit(const std::string& message) {
+        std::function<void(const std::string&)> observer;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            observer = observer_;
+        }
+        if (observer) {
+            observer(message);
+        } else {
+            std::cerr << agent::render_terminal_text(message) << '\n';
+            std::cerr.flush();
+        }
+    }
+private:
+    std::mutex mutex_;
+    std::function<void(const std::string&)> observer_;
+};
 
 int run_agent(std::vector<std::string> args) {
     try {
@@ -145,14 +171,14 @@ int run_agent(std::vector<std::string> args) {
             gateways.push_back(std::ref(build_tools));
         }
         agent::CompositeToolGateway tools(std::move(gateways));
+        DiagnosticRouter diagnostics;
         std::unique_ptr<agent::JsonlProcess> rag_process;
         std::unique_ptr<agent::RagPackVerifier> rag_pack_verifier;
         // Destroy the provider before the process and verifier it references.
         std::unique_ptr<agent::KnowledgeProvider> knowledge;
         if (config.value().rag_enabled) {
-            const auto rag_progress = [](const std::string& message) {
-                std::cerr << message << '\n';
-                std::cerr.flush();
+            const auto rag_progress = [&](const std::string& message) {
+                diagnostics.emit(message);
             };
             rag_process =
                 std::make_unique<agent::ReprocJsonlProcess>(rag_progress);
@@ -264,20 +290,24 @@ int run_agent(std::vector<std::string> args) {
             sessions, clock, ids, std::move(run_session), std::move(resume_session),
             std::move(load_task),
             {config.value().system_prompt, config.value().budgets},
-            &compactor, memory_engine.get(), config.value().session_context,
-            startup.value().command_args.size() == 1
-                ? std::function<void()>{[] {
-                      std::cout << "Compacting context...\n";
-                      std::cout.flush();
-                  }}
-                : std::function<void()>{});
+            &compactor, memory_engine.get(), config.value().session_context);
 
         if (startup.value().command_args.size() == 1) {
-            if (!agent::configure_interactive_terminal_utf8()) {
+            agent::TerminalCapabilities terminal(
+                std::cin, std::cout, startup.value().plain_ui);
+            if (!terminal.utf8_ready()) {
                 std::cerr << "interactive UTF-8 console setup failed\n";
                 return agent::ExitCode::InvalidInputOrConfig;
             }
             agent::InteractiveSessionCommands commands;
+            cancellation.end_turn();
+            commands.begin_turn = [&] { cancellation.begin_turn(); };
+            commands.end_turn = [&] { cancellation.end_turn(); };
+            commands.cancel_turn = [&] { cancellation.request_cancel(); };
+            commands.cancellation_requested = [&] { return cancellation.requested(); };
+            commands.set_phase_observer = [&](std::function<void(const std::string&)> observer) {
+                diagnostics.observe(std::move(observer));
+            };
             commands.list = [&] { return session_engine.list_sessions(); };
             commands.create = [&](const std::string& workspace) {
                 return session_engine.create_session(
@@ -300,6 +330,20 @@ int run_agent(std::vector<std::string> args) {
                  bool use_memory) {
                 return session_engine.recover_pending_turn(
                     session_id, observer, use_memory);
+            };
+            commands.submit_presented = [&]
+                (const std::string& session_id, const std::string& text,
+                 const agent::RuntimeProgressObserver& observer, bool use_memory,
+                 const agent::RuntimePresentationOptions& presentation) {
+                return session_engine.submit_turn(
+                    session_id, text, observer, use_memory, presentation);
+            };
+            commands.recover_presented = [&]
+                (const std::string& session_id,
+                 const agent::RuntimeProgressObserver& observer, bool use_memory,
+                 const agent::RuntimePresentationOptions& presentation) {
+                return session_engine.recover_pending_turn(
+                    session_id, observer, use_memory, presentation);
             };
             if (memory_engine) {
                 commands.memories = [&](const std::string& workspace) {
@@ -326,7 +370,9 @@ int run_agent(std::vector<std::string> args) {
             agent::InteractiveCli interactive(
                 std::move(commands), config.value().anthropic.model,
                 cwd.generic_u8string(), std::cin, std::cout, std::cerr,
-                config.value().session_context.memory_enabled);
+                config.value().session_context.memory_enabled,
+                {terminal.dynamic(), startup.value().stream_enabled,
+                 [&terminal] { return terminal.columns(); }});
             return interactive.run();
         }
 

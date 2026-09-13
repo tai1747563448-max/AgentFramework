@@ -36,6 +36,8 @@ enum ExitCode : int {
 struct StartupArguments {
     std::vector<std::string> command_args;
     std::optional<std::filesystem::path> env_file;
+    bool plain_ui{false};
+    bool stream_enabled{true};
 };
 
 Result<StartupArguments> parse_startup_arguments(

@@ -1,6 +1,7 @@
 #include "cli/interactive_cli.h"
 
 #include "cli/terminal_text.h"
+#include "cli/terminal_presenter.h"
 #include "domain/memory_event.h"
 
 #include <algorithm>
@@ -10,6 +11,12 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <thread>
 
 namespace agent {
 namespace {
@@ -59,6 +66,83 @@ const char* memory_category_name(MemoryCategory category) {
     return "unknown";
 }
 
+struct PresentationEvent {
+    enum class Kind { Text, Progress, Phase } kind;
+    RuntimeTextUpdate text;
+    RuntimeProgress progress{};
+    std::string phase;
+    std::size_t bytes() const {
+        return text.event.text.size() + phase.size() + progress.tool_name.size();
+    }
+};
+
+// Completion is independent of the bounded event queue: a throwing worker or
+// failed session commit cannot leave the consumer waiting for a final event.
+struct TurnChannel {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::deque<PresentationEvent> events;
+    std::size_t queued_bytes{0};
+    bool closed{false};
+    bool done{false};
+    SessionTurnResult result;
+
+    void push(PresentationEvent event) {
+        const auto bytes = event.bytes();
+        std::unique_lock<std::mutex> lock(mutex);
+        changed.wait(lock, [&] {
+            return closed || (events.size() < 256 && queued_bytes + bytes <= 262144);
+        });
+        if (closed) return;
+        if (!events.empty() && event.kind == PresentationEvent::Kind::Text &&
+            event.text.event.kind == ModelStreamEventKind::TextDelta) {
+            auto& last = events.back();
+            if (last.kind == event.kind && last.text.model_round == event.text.model_round &&
+                last.text.event.kind == ModelStreamEventKind::TextDelta &&
+                last.text.event.block_index == event.text.event.block_index &&
+                last.text.event.text.size() + bytes <= 16384) {
+                last.text.event.text += event.text.event.text;
+                queued_bytes += bytes;
+                lock.unlock();
+                changed.notify_all();
+                return;
+            }
+        }
+        if (!events.empty() && event.kind == PresentationEvent::Kind::Phase &&
+            events.back().kind == event.kind) {
+            queued_bytes -= events.back().bytes();
+            events.pop_back();
+        }
+        queued_bytes += bytes;
+        events.push_back(std::move(event));
+        lock.unlock();
+        changed.notify_all();
+    }
+
+    void close() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            closed = true;
+            events.clear();
+            queued_bytes = 0;
+        }
+        changed.notify_all();
+    }
+};
+
+class TurnLifecycle {
+public:
+    explicit TurnLifecycle(InteractiveSessionCommands& commands) : commands_(commands) {
+        if (commands_.begin_turn) commands_.begin_turn();
+    }
+    ~TurnLifecycle() {
+        try { if (commands_.set_phase_observer) commands_.set_phase_observer({}); } catch (...) {}
+        try { if (commands_.end_turn) commands_.end_turn(); } catch (...) {}
+    }
+private:
+    InteractiveSessionCommands& commands_;
+};
+
 }  // namespace
 
 InteractiveCli::InteractiveCli(InteractiveSessionCommands commands,
@@ -67,7 +151,8 @@ InteractiveCli::InteractiveCli(InteractiveSessionCommands commands,
                                std::istream& input,
                                std::ostream& output,
                                std::ostream& error,
-                               bool memory_enabled)
+                               bool memory_enabled,
+                               InteractiveUiOptions ui)
     : commands_(std::move(commands)),
       model_(std::move(model)),
       default_workspace_(std::move(default_workspace)),
@@ -76,29 +161,122 @@ InteractiveCli::InteractiveCli(InteractiveSessionCommands commands,
       error_(error),
       memory_available_(memory_enabled && commands_.memories && commands_.remember &&
                         commands_.forget && commands_.consolidate),
-      memory_on_(memory_available_) {}
+      memory_on_(memory_available_), ui_(std::move(ui)) {}
 
-RuntimeProgressObserver InteractiveCli::progress_observer() {
-    return [this](const RuntimeProgress& progress) {
-        const char* message = nullptr;
-        switch (progress.event_kind) {
-        case EventKind::ContextPreparationStarted:
-            message = "Preparing context...";
-            break;
-        case EventKind::ModelCallStarted:
-            message = "Thinking...";
-            break;
-        case EventKind::ToolCallStarted:
-            message = "Running tool...";
-            break;
-        default:
-            break;
+SessionTurnResult InteractiveCli::execute_turn(const std::string& session_id,
+                                               const std::string& text,
+                                               bool recover) {
+    TurnLifecycle lifecycle(commands_);
+    const auto channel = std::make_shared<TurnChannel>();
+    RuntimePresentationOptions presentation;
+    presentation.stream = ui_.stream;
+    presentation.phase_observer = [channel](const std::string& phase) {
+        PresentationEvent event{};
+        event.kind = PresentationEvent::Kind::Phase;
+        event.phase = phase.substr(0, 8192);
+        channel->push(std::move(event));
+    };
+    presentation.text_observer = [channel](const RuntimeTextUpdate& update) {
+        if (update.event.kind == ModelStreamEventKind::TextBlockEnd) {
+            PresentationEvent event{};
+            event.kind = PresentationEvent::Kind::Text;
+            event.text = update;
+            event.text.event.text.clear();
+            channel->push(std::move(event));
+            return;
         }
-        if (message != nullptr) {
-            output_ << message << '\n';
-            output_.flush();
+        for (std::size_t offset = 0; offset < update.event.text.size(); offset += 4096) {
+            PresentationEvent event{};
+            event.kind = PresentationEvent::Kind::Text;
+            event.text.task_id = update.task_id;
+            event.text.model_round = update.model_round;
+            event.text.event.kind = update.event.kind;
+            event.text.event.block_index = update.event.block_index;
+            event.text.event.text = update.event.text.substr(offset, 4096);
+            channel->push(std::move(event));
         }
     };
+    RuntimeProgressObserver observer = [channel](const RuntimeProgress& progress) {
+        PresentationEvent event{};
+        event.kind = PresentationEvent::Kind::Progress;
+        event.progress = progress;
+        event.progress.tool_name.resize(std::min<std::size_t>(event.progress.tool_name.size(), 8192));
+        channel->push(std::move(event));
+    };
+    if (commands_.set_phase_observer) commands_.set_phase_observer(presentation.phase_observer);
+    TerminalPresenter presenter(output_, ui_.dynamic, ui_.columns);
+    const auto started = std::chrono::steady_clock::now();
+    std::thread worker([&, channel, presentation, observer] {
+        SessionTurnResult result;
+        try {
+            if (recover) {
+                result = commands_.recover_presented
+                    ? commands_.recover_presented(session_id, observer, memory_on_, presentation)
+                    : commands_.recover(session_id, observer, memory_on_);
+            } else {
+                result = commands_.submit_presented
+                    ? commands_.submit_presented(session_id, text, observer, memory_on_, presentation)
+                    : commands_.submit(session_id, text, observer, memory_on_);
+            }
+        } catch (...) {
+            result.error = RuntimeError{ErrorCode::DependencyUnavailable,
+                "session worker failed", false};
+        }
+        {
+            std::lock_guard<std::mutex> lock(channel->mutex);
+            channel->result = std::move(result);
+            channel->done = true;
+        }
+        channel->changed.notify_all();
+    });
+    // All display work lives here. On display failure, close before join to
+    // release any producer blocked by backpressure, then retain its real result.
+    try {
+        presenter.begin();
+        auto next_frame = started;
+        bool done = false;
+        while (!done) {
+            std::deque<PresentationEvent> events;
+            {
+                std::unique_lock<std::mutex> lock(channel->mutex);
+                channel->changed.wait_until(lock, next_frame, [&] {
+                    return channel->done || !channel->events.empty();
+                });
+                events.swap(channel->events);
+                channel->queued_bytes = 0;
+                done = channel->done;
+            }
+            channel->changed.notify_all();
+            for (const auto& event : events) {
+                switch (event.kind) {
+                case PresentationEvent::Kind::Text: presenter.text(event.text); break;
+                case PresentationEvent::Kind::Progress: presenter.progress(event.progress); break;
+                case PresentationEvent::Kind::Phase: presenter.phase(event.phase); break;
+                }
+            }
+            if (commands_.cancellation_requested && commands_.cancellation_requested()) {
+                presenter.phase("Cancelling...");
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= next_frame && !done) {
+                presenter.tick(std::chrono::duration_cast<std::chrono::milliseconds>(now - started));
+                next_frame = now + std::chrono::milliseconds(100);
+            }
+            if (!output_) throw std::ios_base::failure("terminal output unavailable");
+        }
+    } catch (...) {
+        channel->close();
+        try { if (commands_.cancel_turn) commands_.cancel_turn(); } catch (...) {}
+    }
+    worker.join();
+    channel->close();
+    const auto& result = channel->result;
+    const bool success = !result.error && result.task &&
+        result.task->status == TaskStatus::Completed && result.task->final_text;
+    try {
+        presenter.finish(success, success ? *result.task->final_text : std::string{});
+    } catch (...) { /* Persistence and task status are independent of display. */ }
+    return std::move(channel->result);
 }
 
 void InteractiveCli::show_header(const SessionState& session) {
@@ -174,6 +352,10 @@ bool InteractiveCli::render_turn(const SessionTurnResult& result,
         error_ << '\n';
     }
     if (result.error.has_value()) {
+        if (result.error->code == ErrorCode::Cancelled) {
+            error_ << "turn cancelled; ready for the next input\n";
+            return false;
+        }
         if (result.error->code == ErrorCode::BudgetExceeded) {
             error_ << "context limit reached; turn was not started\n";
             return false;
@@ -187,10 +369,13 @@ bool InteractiveCli::render_turn(const SessionTurnResult& result,
     }
     if (result.task->status == TaskStatus::Completed &&
         result.task->final_text.has_value()) {
-        output_ << render_terminal_text(*result.task->final_text) << '\n';
         return true;
     }
-    error_ << "task ended without a completed answer; inspect local task log\n";
+    if (result.task->status == TaskStatus::Cancelled) {
+        error_ << "turn cancelled; ready for the next input\n";
+    } else {
+        error_ << "task ended without a completed answer; inspect local task log\n";
+    }
     return false;
 }
 
@@ -229,8 +414,7 @@ int InteractiveCli::run() {
     show_header(current);
     if (current.pending_turn.has_value()) {
         output_ << "Recovering pending turn...\n";
-        const auto recovered = commands_.recover(
-            current.session_id, progress_observer(), memory_on_);
+        const auto recovered = execute_turn(current.session_id, {}, true);
         render_turn(recovered, current);
     }
 
@@ -350,8 +534,7 @@ int InteractiveCli::run() {
             current = std::move(loaded.value());
             show_header(current);
             if (current.pending_turn.has_value()) {
-                const auto recovered = commands_.recover(
-                    current.session_id, progress_observer(), memory_on_);
+                const auto recovered = execute_turn(current.session_id, {}, true);
                 render_turn(recovered, current);
             }
             continue;
@@ -361,8 +544,7 @@ int InteractiveCli::run() {
             continue;
         }
 
-        const auto result = commands_.submit(
-            current.session_id, line, progress_observer(), memory_on_);
+        const auto result = execute_turn(current.session_id, line, false);
         render_turn(result, current);
     }
 }

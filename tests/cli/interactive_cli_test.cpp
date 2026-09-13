@@ -16,6 +16,10 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <stdexcept>
 
 namespace fixtures {
 
@@ -51,6 +55,158 @@ agent::SessionTurnResult completed(agent::SessionState session,
 }
 
 }  // namespace fixtures
+
+TEST_CASE(interactive_cli_streams_on_the_main_thread_and_survives_worker_failure) {
+    const auto main_thread = std::this_thread::get_id();
+    struct WriterGuard : std::stringbuf {
+        std::thread::id owner;
+        bool wrong_thread{false};
+        explicit WriterGuard(std::thread::id id) : owner(id) {}
+        std::streamsize xsputn(const char* text, std::streamsize size) override {
+            wrong_thread = wrong_thread || owner != std::this_thread::get_id();
+            return std::stringbuf::xsputn(text, size);
+        }
+        int overflow(int character) override {
+            wrong_thread = wrong_thread || owner != std::this_thread::get_id();
+            return std::stringbuf::overflow(character);
+        }
+    } buffer(main_thread);
+    std::ostream output(&buffer);
+    std::ostringstream error;
+    std::istringstream input("first\nsecond\n/exit\n");
+    auto session = fixtures::state(fixtures::kFirstSession, "E:/workspace");
+    int calls = 0;
+    agent::InteractiveSessionCommands commands;
+    commands.list = [session] {
+        return agent::Result<std::vector<agent::SessionState>>::success({session});
+    };
+    commands.submit_presented = [&](const std::string&, const std::string& question,
+        const agent::RuntimeProgressObserver& observer, bool,
+        const agent::RuntimePresentationOptions& presentation) {
+        REQUIRE(std::this_thread::get_id() != main_thread);
+        REQUIRE(presentation.stream);
+        observer({"task", 1, agent::EventKind::ModelCallStarted,
+                  agent::TaskStatus::AwaitingModel});
+        presentation.text_observer({"task", 1,
+            {agent::ModelStreamEventKind::TextDelta, 0, calls++ == 0 ? "partial" : "answer"}});
+        if (calls == 1) throw std::runtime_error("private failure payload");
+        return fixtures::completed(session, question, "answer");
+    };
+    agent::InteractiveCli cli(std::move(commands), "model", "E:/workspace",
+                              input, output, error);
+    REQUIRE(cli.run() == agent::ExitCode::Success);
+    REQUIRE(calls == 2);
+    REQUIRE(!buffer.wrong_thread);
+    REQUIRE(buffer.str().find("[Incomplete; turn was not committed]") != std::string::npos);
+    REQUIRE(buffer.str().find("answer") == buffer.str().rfind("answer"));
+    REQUIRE(error.str().find("private failure payload") == std::string::npos);
+}
+
+TEST_CASE(interactive_cli_stream_off_preserves_complete_answer_and_statuses) {
+    auto session = fixtures::state(fixtures::kFirstSession, "E:/workspace");
+    agent::InteractiveSessionCommands commands;
+    commands.list = [session] {
+        return agent::Result<std::vector<agent::SessionState>>::success({session});
+    };
+    commands.submit_presented = [session](const std::string&, const std::string& text,
+        const agent::RuntimeProgressObserver&, bool,
+        const agent::RuntimePresentationOptions& presentation) {
+        REQUIRE(!presentation.stream);
+        return fixtures::completed(session, text, "buffered answer");
+    };
+    std::istringstream input("question\n/exit\n");
+    std::ostringstream output, error;
+    agent::InteractiveUiOptions ui;
+    ui.stream = false;
+    agent::InteractiveCli cli(std::move(commands), "model", "E:/workspace",
+                              input, output, error, true, ui);
+    REQUIRE(cli.run() == agent::ExitCode::Success);
+    REQUIRE(output.str().find("buffered answer\n") != std::string::npos);
+    REQUIRE(output.str().find("[Generating") == std::string::npos);
+}
+
+TEST_CASE(interactive_cli_presents_first_bytes_before_worker_completes) {
+    std::atomic<bool> displayed{false};
+    struct ObservedBuffer : std::stringbuf {
+        std::atomic<bool>& displayed;
+        explicit ObservedBuffer(std::atomic<bool>& value) : displayed(value) {}
+        std::streamsize xsputn(const char* data, std::streamsize size) override {
+            const auto count = std::stringbuf::xsputn(data, size);
+            if (str().find("first-byte") != std::string::npos) displayed.store(true);
+            return count;
+        }
+    } buffer(displayed);
+    std::ostream output(&buffer);
+    std::ostringstream error;
+    std::istringstream input("question\n/exit\n");
+    const auto session = fixtures::state(fixtures::kFirstSession, "E:/workspace");
+    bool observed_before_completion = false;
+    agent::InteractiveSessionCommands commands;
+    commands.list = [session] {
+        return agent::Result<std::vector<agent::SessionState>>::success({session});
+    };
+    commands.submit_presented = [&](const std::string&, const std::string& text,
+        const agent::RuntimeProgressObserver&, bool,
+        const agent::RuntimePresentationOptions& presentation) {
+        presentation.text_observer({"task", 1,
+            {agent::ModelStreamEventKind::TextDelta, 0, "first-byte"}});
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!displayed.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        observed_before_completion = displayed.load();
+        return fixtures::completed(session, text, "first-byte then done");
+    };
+    agent::InteractiveCli cli(std::move(commands), "model", "E:/workspace",
+                              input, output, error);
+    REQUIRE(cli.run() == agent::ExitCode::Success);
+    REQUIRE(observed_before_completion);
+    REQUIRE(buffer.str().find("first-byte then done") != std::string::npos);
+    REQUIRE(buffer.str().find("first-byte") == buffer.str().rfind("first-byte"));
+}
+
+TEST_CASE(interactive_cli_closes_full_queue_on_output_failure_and_joins_worker) {
+    struct FailedBuffer : std::stringbuf {
+        std::streamsize xsputn(const char* data, std::streamsize size) override {
+            if (std::string(data, static_cast<std::size_t>(size)).find("[Generating") != std::string::npos)
+                return 0;
+            return std::stringbuf::xsputn(data, size);
+        }
+    } buffer;
+    std::ostream output(&buffer);
+    std::ostringstream error;
+    std::istringstream input("question\n/exit\n");
+    const auto session = fixtures::state(fixtures::kFirstSession, "E:/workspace");
+    std::atomic<bool> cancelled{false}, exited{false};
+    int lifecycle_ends = 0;
+    agent::InteractiveSessionCommands commands;
+    commands.list = [session] {
+        return agent::Result<std::vector<agent::SessionState>>::success({session});
+    };
+    commands.cancel_turn = [&] { cancelled = true; };
+    commands.end_turn = [&] { ++lifecycle_ends; };
+    commands.submit_presented = [&](const std::string&, const std::string&,
+        const agent::RuntimeProgressObserver&, bool,
+        const agent::RuntimePresentationOptions& presentation) {
+        for (int index = 0; index < 2048; ++index) {
+            presentation.text_observer({"task", 1,
+                {agent::ModelStreamEventKind::TextDelta, 0, std::string(4096, 'a')}});
+        }
+        exited = true;
+        agent::SessionTurnResult result;
+        result.error = agent::RuntimeError{agent::ErrorCode::PersistenceFailure,
+            "private persistence failure", false};
+        return result;
+    };
+    agent::InteractiveCli cli(std::move(commands), "model", "E:/workspace",
+                              input, output, error);
+    REQUIRE(cli.run() == agent::ExitCode::Success);
+    REQUIRE(cancelled.load());
+    REQUIRE(exited.load());
+    REQUIRE(lifecycle_ends == 1);
+    REQUIRE(error.str().find("session turn failed") != std::string::npos);
+    REQUIRE(error.str().find("private persistence failure") == std::string::npos);
+}
 
 TEST_CASE(interactive_cli_creates_session_and_keeps_two_turns) {
     std::optional<agent::SessionState> current;

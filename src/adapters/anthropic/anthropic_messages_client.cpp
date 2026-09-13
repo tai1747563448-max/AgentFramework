@@ -1,4 +1,6 @@
 #include "adapters/anthropic/anthropic_messages_client.h"
+#include "adapters/anthropic/anthropic_stream_assembler.h"
+#include "adapters/anthropic/bounded_stream_json.h"
 
 #include "adapters/json/value_json.h"
 
@@ -124,7 +126,8 @@ std::string isolated_evidence_json(const EvidencePack& evidence) {
 }
 
 Result<HttpRequest> make_request(const AnthropicConfig& config,
-                                 const ModelRequest& request) {
+                                 const ModelRequest& request,
+                                 bool stream) {
     if (request.timeout_ms <= 0) {
         return failure<HttpRequest>(ErrorCode::InvalidInput,
                                     "model request timeout must be positive");
@@ -133,6 +136,7 @@ Result<HttpRequest> make_request(const AnthropicConfig& config,
     try {
         nlohmann::json body = {{"model", config.model},
                                {"max_tokens", config.max_tokens}};
+        if (stream) body["stream"] = true;
         if (!request.system_prompt.empty() || !request.evidence.items.empty()) {
             std::string system = request.system_prompt;
             if (!request.evidence.items.empty()) {
@@ -215,14 +219,17 @@ std::size_t token_count(const nlohmann::json& value) {
     return static_cast<std::size_t>(signed_value);
 }
 
-Result<ModelResponse> decode_response(const HttpResponse& response) {
+Result<ModelResponse> decode_response(const HttpResponse& response,
+                                     bool streamed_request = false) {
     if (response.body.empty()) {
         return failure<ModelResponse>(ErrorCode::ProtocolFailure,
                                       "provider returned an empty response");
     }
 
     try {
-        const auto json = nlohmann::json::parse(response.body);
+        const auto json = streamed_request
+            ? parse_bounded_stream_json(response.body)
+            : nlohmann::json::parse(response.body);
         if (!json.is_object() || !json.contains("content") ||
             !json.at("content").is_array()) {
             return failure<ModelResponse>(ErrorCode::ProtocolFailure,
@@ -334,21 +341,48 @@ AnthropicMessagesClient::AnthropicMessagesClient(AnthropicConfig config,
 
 Result<ModelResponse> AnthropicMessagesClient::complete(
     const ModelRequest& request) {
+    return complete(request, {});
+}
+
+Result<ModelResponse> AnthropicMessagesClient::complete(
+    const ModelRequest& request, const ModelCallOptions& options) {
+    const auto cancelled = [&] { return options.cancellation && options.cancellation->requested(); };
+    if (cancelled()) {
+        return failure<ModelResponse>(ErrorCode::Cancelled, "provider request cancelled");
+    }
     if (!valid_config(config_)) {
         return failure<ModelResponse>(ErrorCode::InvalidConfiguration,
                                       "Anthropic adapter configuration is invalid");
     }
 
-    auto encoded = make_request(config_, request);
+    auto encoded = make_request(config_, request, options.stream);
     if (!encoded.has_value()) {
         return Result<ModelResponse>::failure(encoded.error());
     }
 
-    auto response = transport_.post(encoded.value());
+    AnthropicStreamAssembler assembler(options.observer);
+    SseDecoder decoder([&](const SseEvent& event) { return assembler.consume(event); });
+    std::optional<RuntimeError> stream_error;
+    const HttpChunkObserver consume = [&](std::string_view bytes) {
+        if (cancelled()) return false;
+        const auto result = decoder.feed(bytes);
+        if (!result.has_value()) stream_error = result.error();
+        return result.has_value();
+    };
+    auto response = options.stream
+        ? transport_.post_stream(encoded.value(), consume, options.cancellation)
+        : transport_.post(encoded.value(), options.cancellation);
+    if (cancelled() || (!response.has_value() && response.error().code == ErrorCode::Cancelled)) {
+        return failure<ModelResponse>(ErrorCode::Cancelled, "provider request cancelled");
+    }
+    if (stream_error) return Result<ModelResponse>::failure(*stream_error);
     if (!response.has_value()) {
         if (response.error().code == ErrorCode::RequestTimeout) {
             return failure<ModelResponse>(ErrorCode::RequestTimeout,
                                           "provider request timed out", true);
+        }
+        if (response.error().code == ErrorCode::ProtocolFailure) {
+            return failure<ModelResponse>(ErrorCode::ProtocolFailure, "provider stream is invalid");
         }
         return failure<ModelResponse>(ErrorCode::TransportFailure,
                                       "provider transport failed", true);
@@ -359,7 +393,14 @@ Result<ModelResponse> AnthropicMessagesClient::complete(
                                       "provider returned a non-success status",
                                       response.value().status >= 500);
     }
-    return decode_response(response.value());
+    if (options.stream && http_response_is_event_stream(response.value())) {
+        const auto framed = decoder.finish();
+        if (!framed.has_value()) return Result<ModelResponse>::failure(framed.error());
+        const auto assembled = assembler.finish();
+        if (!assembled.has_value()) return Result<ModelResponse>::failure(assembled.error());
+        response.value().body = assembled.value();
+    }
+    return decode_response(response.value(), options.stream);
 }
 
 }  // namespace agent

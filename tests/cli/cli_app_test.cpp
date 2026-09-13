@@ -8,6 +8,29 @@
 #include "config/runtime_config.h"
 #include "test_support.h"
 
+TEST_CASE(startup_parses_independent_interactive_ui_and_stream_options) {
+    const auto parsed = agent::parse_startup_arguments(
+        {"agent", "--ui", "plain", "--stream", "off"});
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed.value().command_args == std::vector<std::string>({"agent"}));
+    REQUIRE(parsed.value().plain_ui);
+    REQUIRE(!parsed.value().stream_enabled);
+    REQUIRE(!agent::parse_startup_arguments({"agent", "--ui", "bad"}).has_value());
+    REQUIRE(!agent::parse_startup_arguments({"agent", "--stream"}).has_value());
+    REQUIRE(!agent::parse_startup_arguments({"agent", "--ui", "auto", "--ui", "plain"}).has_value());
+    REQUIRE(!agent::parse_startup_arguments({"agent", "--stream", "off", "run"}).has_value());
+}
+
+TEST_CASE(startup_ui_options_do_not_consume_noninteractive_issue_text) {
+    for (const auto* issue : {"--stream", "--ui"}) {
+        const std::vector<std::string> args{
+            "agent", "run", "--workspace", "E:/workspace", "--issue", issue};
+        const auto parsed = agent::parse_startup_arguments(args);
+        REQUIRE(parsed.has_value());
+        REQUIRE(parsed.value().command_args == args);
+    }
+}
+
 #include <algorithm>
 #include <cstdint>
 #include <csignal>
