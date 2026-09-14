@@ -13,7 +13,7 @@ from typing import Callable, Iterable, Sequence
 import numpy as np
 
 from .embedding import EmbeddingBackend, EmbeddingError, encode_normalized, tokenizer_fingerprint
-from .retriever import tokenize
+from .tokenizer import tokenize
 
 
 class HybridRetrievalError(RuntimeError):

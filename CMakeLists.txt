@@ -88,7 +88,6 @@ add_library(agent_runtime STATIC
     src/adapters/workspace/workspace_tool_gateway.cpp
     src/adapters/process/direct_process_runner.cpp
     src/adapters/process/reproc_jsonl_process.cpp
-    src/adapters/rag/python_rag_knowledge_provider.cpp
     src/adapters/rag/rag_protocol.cpp
     src/adapters/rag/native_rag_pack_verifier.cpp
     src/adapters/rag/persistent_rag_knowledge_provider.cpp
@@ -211,9 +210,6 @@ target_link_libraries(anthropic_adapter_tests PRIVATE Threads::Threads)
 if(WIN32)
     target_link_libraries(anthropic_adapter_tests PRIVATE ws2_32)
 endif()
-add_agent_test(python_rag_adapter_tests
-    tests/adapters/python_rag_knowledge_provider_test.cpp)
-target_link_libraries(python_rag_adapter_tests PRIVATE agent_runtime)
 add_agent_test(cli_tests tests/cli/cli_app_test.cpp)
 target_link_libraries(cli_tests PRIVATE agent_runtime)
 add_agent_test(rag_runtime_config_tests tests/config/rag_runtime_config_test.cpp)
@@ -335,19 +331,16 @@ add_test(
         "-DPROVENANCE_SCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/cmake/write_benchmark_provenance.cmake"
         "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/benchmark-provenance"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark/benchmark_provenance_test.cmake")
+add_agent_test(autonomous_issue_workflow_tests
+    tests/integration/autonomous_issue_workflow_test.cpp)
+target_link_libraries(autonomous_issue_workflow_tests PRIVATE agent_runtime)
 if(Python3_Interpreter_FOUND)
     add_agent_test(rag_integration_tests
         tests/integration/rag_integration_test.cpp)
     target_link_libraries(rag_integration_tests PRIVATE agent_runtime)
     target_compile_definitions(rag_integration_tests PRIVATE
         AGENT_RAG_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
-        AGENT_RAG_SCRIPT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/rag/agent_rag_cli.py")
-    add_agent_test(autonomous_issue_workflow_tests
-        tests/integration/autonomous_issue_workflow_test.cpp)
-    target_link_libraries(autonomous_issue_workflow_tests PRIVATE agent_runtime)
-    target_compile_definitions(autonomous_issue_workflow_tests PRIVATE
-        AGENT_RAG_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
-        AGENT_RAG_SCRIPT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/rag/agent_rag_cli.py")
+        AGENT_RAG_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/rag/tests/persistent_rag_integration_fixture.py")
     add_test(
         NAME python_rag_tests
         COMMAND "${Python3_EXECUTABLE}" -E -s -X utf8 -m pytest

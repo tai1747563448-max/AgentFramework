@@ -24,7 +24,7 @@ from .embedding import (
     encode_normalized,
     tokenizer_fingerprint,
 )
-from .retriever import tokenize
+from .tokenizer import tokenize
 
 
 class HybridIndexError(RuntimeError):

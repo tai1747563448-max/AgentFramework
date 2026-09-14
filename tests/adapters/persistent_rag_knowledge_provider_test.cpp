@@ -266,3 +266,38 @@ TEST_CASE(persistent_rag_provider_never_starts_unverified_payload) {
     REQUIRE(verifier.verify_count == 1);
     REQUIRE(process.start_count == 0);
 }
+
+TEST_CASE(persistent_rag_provider_rejects_invalid_inputs_before_starting) {
+    for (const auto& issue : {std::string{}, std::string(16'385, 'x'),
+                              std::string("a\0b", 3), std::string("\xff")}) {
+        fixtures::FakeJsonlProcess process;
+        fixtures::FakeRagPackVerifier verifier;
+        agent::PersistentRagKnowledgeProvider provider(
+            process, verifier, fixtures::config());
+        const auto result = provider.retrieve(fixtures::state(issue));
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == agent::ErrorCode::InvalidInput);
+        REQUIRE(process.start_count == 0);
+        REQUIRE(verifier.verify_count == 0);
+    }
+    for (int mutation = 0; mutation != 7; ++mutation) {
+        auto config = fixtures::config();
+        switch (mutation) {
+        case 0: config.pack_root = "relative"; break;
+        case 1: config.mode = "unknown"; break;
+        case 2: config.top_k = 0; break;
+        case 3: config.max_total_bytes = 32'769; break;
+        case 4: config.startup_timeout_ms = 0; break;
+        case 5: config.query_timeout_ms = 600'001; break;
+        case 6: config.device = "unknown"; break;
+        }
+        fixtures::FakeJsonlProcess process;
+        fixtures::FakeRagPackVerifier verifier;
+        agent::PersistentRagKnowledgeProvider provider(process, verifier, config);
+        const auto result = provider.retrieve(fixtures::state());
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == agent::ErrorCode::InvalidConfiguration);
+        REQUIRE(process.start_count == 0);
+        REQUIRE(verifier.verify_count == 0);
+    }
+}

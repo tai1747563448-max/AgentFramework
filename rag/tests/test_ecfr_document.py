@@ -154,7 +154,10 @@ def test_write_corpus_streams_candidates_and_writes_exact_manifest(tmp_path: Pat
     assert not (root / "manifest" / "candidates.sqlite3").exists()
 
 
-def test_build_corpus_consumes_all_49_download_manifest_titles(tmp_path: Path) -> None:
+@pytest.mark.parametrize("through_cli", [False, True])
+def test_build_corpus_consumes_all_49_download_manifest_titles(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], through_cli: bool
+) -> None:
     root = tmp_path / "staging"
     raw = root / "raw"
     raw.mkdir(parents=True)
@@ -188,7 +191,17 @@ def test_build_corpus_consumes_all_49_download_manifest_titles(tmp_path: Path) -
         newline="",
     )
 
-    summary = build_corpus_from_downloads(root, snapshot_date="2026-09-03", count=2)
+    if through_cli:
+        from agent_rag.cli import main
 
-    assert summary.candidates == 49
-    assert summary.selected == 2
+        assert main([
+            "build-corpus", "--snapshot", "2026-09-03",
+            "--staging-root", str(root), "--count", "2",
+        ]) == 0
+        output = json.loads(capsys.readouterr().out)
+        assert output["candidates"] == 49
+        assert output["selected"] == 2
+    else:
+        summary = build_corpus_from_downloads(root, snapshot_date="2026-09-03", count=2)
+        assert summary.candidates == 49
+        assert summary.selected == 2

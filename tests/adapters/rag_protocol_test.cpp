@@ -208,3 +208,32 @@ TEST_CASE(rag_protocol_rejects_duplicate_keys_and_nonfinite_numbers) {
         nonfinite, fixtures::kRequestId,
         fixtures::kRetrievalRevision, 6, 32'768));
 }
+
+TEST_CASE(rag_protocol_rejects_duplicate_sources_and_content) {
+    for (const bool duplicate_source : {false, true}) {
+        auto response = fixtures::query();
+        auto second = fixtures::evidence(duplicate_source ? "Different text" : "Legal evidence");
+        if (!duplicate_source) {
+            second["source_id"] = "doc-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-chunk-0000000000000002";
+        }
+        response["payload"]["items"].push_back(second);
+        fixtures::require_protocol_failure(agent::rag::decode_query_result(
+            response.dump(), fixtures::kRequestId,
+            fixtures::kRetrievalRevision, 6, 32'768));
+    }
+}
+
+TEST_CASE(rag_protocol_rejects_empty_oversized_and_non_utf8_content) {
+    for (const auto& content : {std::string{}, std::string(8'193, 'x')}) {
+        fixtures::require_protocol_failure(agent::rag::decode_query_result(
+            fixtures::query(fixtures::evidence(content)).dump(),
+            fixtures::kRequestId, fixtures::kRetrievalRevision, 6, 32'768));
+    }
+    auto raw = fixtures::query().dump();
+    raw.replace(raw.find("Legal evidence"), 1, 1, '\xff');
+    fixtures::require_protocol_failure(agent::rag::decode_query_result(
+        raw, fixtures::kRequestId, fixtures::kRetrievalRevision, 6, 32'768));
+    REQUIRE(agent::rag::decode_query_result(
+        fixtures::query(fixtures::evidence(std::string(8'192, 'x'))).dump(),
+        fixtures::kRequestId, fixtures::kRetrievalRevision, 6, 32'768).has_value());
+}

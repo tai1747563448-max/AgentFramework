@@ -1,3 +1,1 @@
-"""Deterministic local knowledge indexing for AgentFramework."""
-
-SCHEMA_VERSION = 1
+"""Knowledge-pack indexing and persistent RAG for AgentFramework."""

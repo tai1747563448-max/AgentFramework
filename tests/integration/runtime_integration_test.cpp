@@ -4,7 +4,6 @@
 #include "adapters/empty/empty_knowledge_provider.h"
 #include "adapters/empty/empty_tool_gateway.h"
 #include "adapters/persistence/jsonl_event_store.h"
-#include "adapters/rag/python_rag_knowledge_provider.h"
 #include "adapters/tools/composite_tool_gateway.h"
 #include "adapters/workspace/workspace_text.h"
 #include "adapters/workspace/workspace_tool_gateway.h"
@@ -471,42 +470,26 @@ TEST_CASE(production_equivalent_composition_exposes_five_or_eight_tools) {
     test::ScriptedProcessRunner process({});
     agent::CMakeToolGateway builds(process, 300'000);
 
-    for (const bool rag_enabled : {false, true}) {
-        std::unique_ptr<agent::KnowledgeProvider> knowledge;
-        if (rag_enabled) {
-            knowledge = std::make_unique<agent::PythonRagKnowledgeProvider>(
-                process, agent::PythonRagConfig{
-                             "python", "C:/trusted/agent_rag_cli.py",
-                             "C:/trusted/knowledge.sqlite3", 5, 10});
-        } else {
-            knowledge = std::make_unique<agent::EmptyKnowledgeProvider>();
-            const auto empty = knowledge->retrieve(agent::TaskState{});
-            REQUIRE(empty.has_value());
-            REQUIRE(empty.value().items.empty());
+    for (const bool build_enabled : {false, true}) {
+        std::vector<std::reference_wrapper<agent::ToolGateway>> gateways{
+            files};
+        if (build_enabled) {
+            gateways.push_back(builds);
         }
-        REQUIRE(process.requests.empty());
-
-        for (const bool build_enabled : {false, true}) {
-            std::vector<std::reference_wrapper<agent::ToolGateway>> gateways{
-                files};
-            if (build_enabled) {
-                gateways.push_back(builds);
-            }
-            agent::CompositeToolGateway composite(std::move(gateways));
-            const auto definitions = composite.definitions();
-            const std::vector<std::string> expected =
-                build_enabled
-                    ? std::vector<std::string>{
-                          "list_files", "read_file", "search_text",
-                          "replace_text", "write_file", "configure_project",
-                          "build_project", "run_tests"}
-                    : std::vector<std::string>{
-                          "list_files", "read_file", "search_text",
-                          "replace_text", "write_file"};
-            REQUIRE(definitions.size() == expected.size());
-            for (std::size_t index = 0; index < expected.size(); ++index) {
-                REQUIRE(definitions.at(index).name == expected.at(index));
-            }
+        agent::CompositeToolGateway composite(std::move(gateways));
+        const auto definitions = composite.definitions();
+        const std::vector<std::string> expected =
+            build_enabled
+                ? std::vector<std::string>{
+                      "list_files", "read_file", "search_text",
+                      "replace_text", "write_file", "configure_project",
+                      "build_project", "run_tests"}
+                : std::vector<std::string>{
+                      "list_files", "read_file", "search_text",
+                      "replace_text", "write_file"};
+        REQUIRE(definitions.size() == expected.size());
+        for (std::size_t index = 0; index < expected.size(); ++index) {
+            REQUIRE(definitions.at(index).name == expected.at(index));
         }
     }
 }

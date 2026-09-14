@@ -1,7 +1,7 @@
 #include "adapters/build/cmake_tool_gateway.h"
 #include "adapters/persistence/jsonl_event_store.h"
 #include "adapters/process/direct_process_runner.h"
-#include "adapters/rag/python_rag_knowledge_provider.h"
+#include "adapters/empty/empty_knowledge_provider.h"
 #include "adapters/tools/composite_tool_gateway.h"
 #include "adapters/workspace/workspace_text.h"
 #include "adapters/workspace/workspace_tool_gateway.h"
@@ -27,14 +27,6 @@
 #include <utility>
 #include <variant>
 #include <vector>
-
-#ifndef AGENT_RAG_PYTHON_EXECUTABLE
-#error "AGENT_RAG_PYTHON_EXECUTABLE is required"
-#endif
-
-#ifndef AGENT_RAG_SCRIPT_PATH
-#error "AGENT_RAG_SCRIPT_PATH is required"
-#endif
 
 namespace test {
 
@@ -109,7 +101,7 @@ public:
     agent::Result<agent::ModelResponse> complete(
         const agent::ModelRequest& request) override {
         requests.push_back(request);
-        REQUIRE(!request.evidence.items.empty());
+        REQUIRE(request.evidence.items.empty());
         REQUIRE(request.tools.size() == 8);
 
         switch (step_++) {
@@ -284,23 +276,6 @@ std::string read_all(const std::filesystem::path& path) {
             std::istreambuf_iterator<char>()};
 }
 
-agent::ProcessRequest rag_build_request(
-    const std::filesystem::path& script,
-    const std::filesystem::path& corpus,
-    const std::filesystem::path& index) {
-    agent::ProcessRequest request;
-    request.program = AGENT_RAG_PYTHON_EXECUTABLE;
-    request.arguments = {
-        "-E", "-s", "-X", "utf8", script.generic_u8string(), "build",
-        "--source", corpus.generic_u8string(), "--index",
-        index.generic_u8string()};
-    request.working_directory = script.parent_path();
-    request.timeout_ms = 30'000;
-    request.max_stdout_bytes = 64 * 1024;
-    request.max_stderr_bytes = 4 * 1024;
-    return request;
-}
-
 agent::ToolCall build_tool_call(std::string id,
                                 std::string name,
                                 agent::Value::Object arguments) {
@@ -326,12 +301,9 @@ TEST_CASE(real_issue_workflow_recovers_after_a_post_edit_persistence_crash) {
         std::filesystem::u8path(u8"agent-自主工作流"));
     const auto workspace = root.path() / std::filesystem::u8path(u8"工作区");
     const auto runtime_root = root.path() / "runtime";
-    const auto corpus = root.path() / "trusted-corpus";
-    const auto index = root.path() / "knowledge" / "knowledge.sqlite3";
     const auto outside = root.path() / "outside-sentinel.txt";
     std::filesystem::create_directories(workspace / ".git");
     std::filesystem::create_directories(runtime_root);
-    std::filesystem::create_directories(corpus / "docs");
 
     root.write_text(
         std::filesystem::relative(workspace / "CMakeLists.txt", root.path()),
@@ -361,25 +333,7 @@ TEST_CASE(real_issue_workflow_recovers_after_a_post_edit_persistence_crash) {
         std::filesystem::relative(runtime_root / "sentinel", root.path()),
         "runtime-sentinel\n");
     root.write_text("outside-sentinel.txt", "outside-sentinel\n");
-    root.write_text(
-        std::filesystem::relative(corpus / "docs/calculator-guide.md",
-                                  root.path()),
-        "Calculator add must return the sum of left and right.\n"
-        "After editing calculator.cpp, configure CMake, build calculator_tests, "
-        "and run the exact CTest calculator.correct.\n"
-        "A hash conflict after recovery means reread the file before "
-        "continuing.\n");
-
     agent::DirectProcessRunner process;
-    const auto script = std::filesystem::canonical(
-        std::filesystem::u8path(AGENT_RAG_SCRIPT_PATH));
-    const auto rag_build =
-        process.run(fixtures::rag_build_request(script, corpus, index));
-    REQUIRE(rag_build.has_value());
-    REQUIRE(!rag_build.value().timed_out);
-    REQUIRE(rag_build.value().exit_code == 0);
-    REQUIRE(rag_build.value().stderr_utf8.empty());
-    const auto canonical_index = std::filesystem::canonical(index);
 
     agent::CMakeToolGateway baseline_build(process, 120'000);
     const agent::ToolExecutionContext context{workspace.generic_u8string()};
@@ -410,8 +364,7 @@ TEST_CASE(real_issue_workflow_recovers_after_a_post_edit_persistence_crash) {
     agent::WorkspaceToolGateway file_tools(runtime_root);
     agent::CMakeToolGateway build_tools(process, 120'000);
     agent::CompositeToolGateway tools({file_tools, build_tools});
-    agent::PythonRagKnowledgeProvider knowledge(
-        process, {AGENT_RAG_PYTHON_EXECUTABLE, script, canonical_index, 3, 10});
+    agent::EmptyKnowledgeProvider knowledge;
     test::ScriptedCodingModel first_model(0, original_hash);
     test::FakeClock first_clock;
     test::FixedIds first_ids(fixtures::kTaskId);
@@ -451,8 +404,7 @@ TEST_CASE(real_issue_workflow_recovers_after_a_post_edit_persistence_crash) {
     agent::CMakeToolGateway resumed_build_tools(process, 120'000);
     agent::CompositeToolGateway resumed_tools(
         {resumed_file_tools, resumed_build_tools});
-    agent::PythonRagKnowledgeProvider resumed_knowledge(
-        process, {AGENT_RAG_PYTHON_EXECUTABLE, script, canonical_index, 3, 10});
+    agent::EmptyKnowledgeProvider resumed_knowledge;
     test::ScriptedCodingModel resumed_model(2, original_hash);
     test::FakeClock resumed_clock;
     test::FixedIds resumed_ids(
@@ -478,10 +430,10 @@ TEST_CASE(real_issue_workflow_recovers_after_a_post_edit_persistence_crash) {
     REQUIRE(resumed_model.saw_passing_test);
     REQUIRE(resumed_model.requests.size() == 5);
     for (const auto& model_request : first_model.requests) {
-        REQUIRE(!model_request.evidence.items.empty());
+        REQUIRE(model_request.evidence.items.empty());
     }
     for (const auto& model_request : resumed_model.requests) {
-        REQUIRE(!model_request.evidence.items.empty());
+        REQUIRE(model_request.evidence.items.empty());
         REQUIRE(model_request.system_prompt ==
                 "You are a careful coding agent.");
     }
@@ -510,7 +462,8 @@ TEST_CASE(real_issue_workflow_recovers_after_a_post_edit_persistence_crash) {
     REQUIRE(evaluation.value().model_rounds == 7);
     REQUIRE(evaluation.value().tool_calls == 6);
     REQUIRE(evaluation.value().evidence_rounds == 7);
-    REQUIRE(evaluation.value().model_requests_with_evidence == 7);
+    REQUIRE(evaluation.value().evidence_items == 0);
+    REQUIRE(evaluation.value().model_requests_with_evidence == 0);
     REQUIRE(evaluation.value().tool_error_results == 1);
 
     REQUIRE(fixtures::read_all(workspace / "calculator.cpp") ==
