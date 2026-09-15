@@ -14,7 +14,7 @@ public:
     explicit NativeRagPackVerifier(
         std::function<void(const std::string&)> progress_observer = {},
         std::string trusted_manifest_sha256 =
-            "5a355a489550451498317ae2245ce6cd29468f48ee98303d9bb9094c9e49707a");
+            "e3f13d34ef0e6958df56f114690afcfb21b34d6803df0957cff8c44ac9555ad0");
     ~NativeRagPackVerifier() override;
 
     NativeRagPackVerifier(const NativeRagPackVerifier&) = delete;

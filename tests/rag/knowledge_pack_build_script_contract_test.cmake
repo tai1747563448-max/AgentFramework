@@ -27,7 +27,7 @@ endfunction()
 
 expect_preflight_failure("a relative root" "KnowledgeRoot must be absolute"
     -KnowledgeRoot relative-pack -Snapshot 2026-09-03 -DocumentCount 30000)
-expect_preflight_failure("a repository-local root" "KnowledgeRoot must be outside"
+expect_preflight_failure("an unrelated repository-local root" "KnowledgeRoot must be the knowledge directory"
     -KnowledgeRoot "${SOURCE_DIR}/pack" -Snapshot 2026-09-03
     -DocumentCount 30000)
 expect_preflight_failure("the wrong snapshot" "ValidateSet"
@@ -45,6 +45,7 @@ foreach(required_text
         "runtime.lock.json"
         "model.lock.json"
         "active-pack.json"
+        "To activate it for AgentFramework, set AGENT_RAG_PACK_ROOT="
         "verify_complete_pack"
         "finalize-pack-files"
         "ProgressReporter"

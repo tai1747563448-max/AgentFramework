@@ -196,3 +196,44 @@ TEST_CASE(rag_pack_discovery_is_executable_relative_not_cwd_relative) {
     REQUIRE(discovered.value().has_value());
     REQUIRE(discovered.value().value() == pack);
 }
+
+TEST_CASE(rag_pack_discovery_supports_portable_project_layouts) {
+    for (const auto& exe_relative : {"AgentFramework.exe",
+                                     "build/Release/AgentFramework.exe",
+                                     "build/vs2022/Release/AgentFramework.exe",
+                                     "out/AgentFramework-Ready/AgentFramework.exe"}) {
+        test::ScopedTempDir temp("rag-portable-layout");
+        const auto pack = fixtures::make_pack(temp, "knowledge/ecfr-fixture");
+        temp.write_text("knowledge/active-pack.json",
+                        R"({"schema_version":1,"pack_root":"ecfr-fixture"})");
+        const auto executable = temp.write_text(exe_relative, "fixture");
+        const auto discovered = agent::discover_rag_pack_root(executable);
+        REQUIRE(discovered.has_value());
+        REQUIRE(discovered.value().has_value());
+        REQUIRE(discovered.value().value() == pack);
+    }
+}
+
+TEST_CASE(rag_pack_discovery_rejects_relative_escape_and_empty_root) {
+    for (const auto& root : {"../external-pack", "", "ecfr-fixture/../ecfr-fixture"}) {
+        test::ScopedTempDir temp("rag-pointer-escape");
+        fixtures::make_pack(temp, "external-pack");
+        fixtures::make_pack(temp, "knowledge/ecfr-fixture");
+        temp.write_text("knowledge/active-pack.json",
+                        nlohmann::json({{"schema_version", 1}, {"pack_root", root}}).dump());
+        const auto executable = temp.write_text("AgentFramework.exe", "fixture");
+        const auto discovered = agent::discover_rag_pack_root(executable);
+        REQUIRE(!discovered.has_value());
+    }
+}
+
+TEST_CASE(rag_pack_discovery_does_not_hide_a_broken_nearer_pointer) {
+    test::ScopedTempDir temp("rag-pointer-precedence");
+    fixtures::make_pack(temp, "knowledge/ecfr-fixture");
+    temp.write_text("knowledge/active-pack.json",
+                    R"({"schema_version":1,"pack_root":"ecfr-fixture"})");
+    temp.write_text("out/knowledge/active-pack.json", "{}");
+    const auto executable = temp.write_text(
+        "out/AgentFramework-Ready/AgentFramework.exe", "fixture");
+    REQUIRE(!agent::discover_rag_pack_root(executable).has_value());
+}

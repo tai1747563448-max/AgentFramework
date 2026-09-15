@@ -724,8 +724,26 @@ Result<std::optional<std::filesystem::path>> discover_rag_pack_root(
                 {ErrorCode::InvalidConfiguration,
                  "rag active pack pointer is invalid", false});
         }
-        const auto pointer = executable.parent_path().parent_path() /
-                             "AgentFramework-Knowledge" / "active-pack.json";
+        std::filesystem::path pointer;
+        auto directory = executable.parent_path();
+        for (int level = 0; level < 4; ++level) {
+            const auto candidate = directory / "knowledge" / "active-pack.json";
+            const bool present = std::filesystem::exists(candidate, error);
+            if (error) {
+                return Result<std::optional<std::filesystem::path>>::failure(
+                    {ErrorCode::InvalidConfiguration,
+                     "rag active pack pointer is invalid", false});
+            }
+            if (present) {
+                pointer = candidate;
+                break;
+            }
+            directory = directory.parent_path();
+        }
+        if (pointer.empty()) {
+            pointer = executable.parent_path().parent_path() /
+                      "AgentFramework-Knowledge" / "active-pack.json";
+        }
         if (!std::filesystem::exists(pointer, error)) {
             if (error) {
                 return Result<std::optional<std::filesystem::path>>::failure(
@@ -746,12 +764,22 @@ Result<std::optional<std::filesystem::path>> discover_rag_pack_root(
                 {ErrorCode::InvalidConfiguration,
                  "rag active pack pointer is invalid", false});
         }
-        const auto supplied =
+        auto supplied =
             std::filesystem::u8path(value->at("pack_root").get<std::string>());
         if (!supplied.is_absolute()) {
-            return Result<std::optional<std::filesystem::path>>::failure(
-                {ErrorCode::InvalidConfiguration,
-                 "rag active pack pointer is invalid", false});
+            if (supplied.empty() || supplied.has_root_path()) {
+                return Result<std::optional<std::filesystem::path>>::failure(
+                    {ErrorCode::InvalidConfiguration,
+                     "rag active pack pointer is invalid", false});
+            }
+            for (const auto& component : supplied) {
+                if (component == ".." || component == ".") {
+                    return Result<std::optional<std::filesystem::path>>::failure(
+                        {ErrorCode::InvalidConfiguration,
+                         "rag active pack pointer is invalid", false});
+                }
+            }
+            supplied = pointer.parent_path() / supplied;
         }
         const auto trusted = trusted_pack_root(supplied);
         if (!trusted.has_value() || inside_ready_directory(*trusted)) {

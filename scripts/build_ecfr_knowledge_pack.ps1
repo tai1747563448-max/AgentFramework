@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$KnowledgeRoot,
+    [string]$KnowledgeRoot = [System.IO.Path]::GetFullPath(
+        (Join-Path $PSScriptRoot "..\knowledge")),
 
     [Parameter(Mandatory = $true)]
     [ValidateSet("2026-09-03")]
@@ -175,8 +175,9 @@ if (-not (Test-IsFullyQualified $KnowledgeRoot)) {
 
 $SourceRoot = Get-FullPath (Join-Path $PSScriptRoot "..")
 $KnowledgeRoot = Get-FullPath $KnowledgeRoot
-if (Test-IsSameOrChild $SourceRoot $KnowledgeRoot) {
-    throw "KnowledgeRoot must be outside the source repository"
+if ((Test-IsSameOrChild $SourceRoot $KnowledgeRoot) -and
+        $KnowledgeRoot -ne (Join-Path $SourceRoot "knowledge")) {
+    throw "repository-local KnowledgeRoot must be the knowledge directory"
 }
 if ($KnowledgeRoot -match '(?i)[\\/]out[\\/]AgentFramework-Ready(?:[\\/]|$)') {
     throw "KnowledgeRoot must be outside Ready"
@@ -738,7 +739,7 @@ function Publish-ActivePointer([string]$PointerPath, [string]$PackRoot) {
     $temporary = "$PointerPath.partial-$([Guid]::NewGuid().ToString('N'))"
     $pointer = [ordered]@{
         schema_version = 1
-        pack_root = $PackRoot
+        pack_root = Split-Path -Leaf $PackRoot
     }
     Write-JsonUtf8NoBom $temporary $pointer
     if (Test-Path -LiteralPath $PointerPath -PathType Leaf) {
@@ -748,12 +749,12 @@ function Publish-ActivePointer([string]$PointerPath, [string]$PackRoot) {
     }
 }
 
-# External-root pointer: recovery. EXE-relative pointer: Ready discovery.
+# One portable pointer next to the published pack.
 Publish-ActivePointer (Join-Path $KnowledgeRoot "active-pack.json") $PublishedRoot
-$ReadyPointer = Join-Path $SourceRoot "out\AgentFramework-Knowledge\active-pack.json"
-if ($ReadyPointer -match '(?i)[\\/]AgentFramework-Ready[\\/]') {
-    throw "active pack pointer must remain outside Ready"
-}
-Publish-ActivePointer $ReadyPointer $PublishedRoot
 
-Write-Host "Knowledge Pack published and active pointer updated."
+if ($KnowledgeRoot -eq (Join-Path $SourceRoot "knowledge")) {
+    Write-Host "Knowledge Pack published and project active pointer updated."
+} else {
+    Write-Host "Knowledge Pack published to the external root."
+    Write-Host "To activate it for AgentFramework, set AGENT_RAG_PACK_ROOT=$PublishedRoot"
+}

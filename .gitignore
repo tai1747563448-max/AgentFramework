@@ -42,6 +42,7 @@ __pycache__/
 .cache/
 vector_store/
 runtime_data/
+knowledge/
 *.db
 *.sqlite
 *.sqlite3
