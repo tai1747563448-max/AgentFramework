@@ -42,6 +42,8 @@ class KeywordEmbedding:
     revision = "retrieval-fixture"
     dimensions = 3
     tokenizer = WordTokenizer()
+    backend = "sentence_transformers"
+    precision = "float32"
 
     def __init__(self) -> None:
         self.calls = 0

@@ -230,10 +230,15 @@ def _read_vector_metadata(index_root: Path) -> dict[str, object]:
             "tokenizer_sha256",
             "matrix_sha256",
             "database_sha256",
+            # T6: optional backend identity written by the index builder.
+            # Old vectors.json without these keys is still accepted; new ones
+            # must be either both present (string) or both absent so a
+            # partially-updated pack is rejected on read.
         }
+        optional = {"backend", "precision"}
         if (
             type(schema_version) is not int
-            or set(value) != keys
+            or set(value) - optional != keys
             or value["dtype"] != "<f2"
             or type(value["rows"]) is not int
             or value["rows"] <= 0
@@ -249,6 +254,8 @@ def _read_vector_metadata(index_root: Path) -> dict[str, object]:
                 for name in keys
                 - {"schema_version", "rows", "row_count", "sum_token_count", "dimensions"}
             )
+            or ("backend" in value and "precision" not in value)
+            or ("precision" in value and "backend" not in value)
         ):
             raise HybridRetrievalError("index artifacts are invalid")
         return value

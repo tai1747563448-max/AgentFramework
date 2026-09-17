@@ -21,6 +21,7 @@ from .embedding import (
     EMBEDDING_DIMENSIONS,
     EmbeddingBackend,
     EmbeddingError,
+    backend_identity,
     encode_normalized,
     tokenizer_fingerprint,
 )
@@ -46,6 +47,8 @@ class IndexBuildSummary:
     revision: str
     dimensions: int
     tokenizer_sha256: str
+    backend: str | None = None
+    precision: str | None = None
 
 
 # Schema version constants.  Schema 2 is the legacy published format
@@ -54,7 +57,10 @@ class IndexBuildSummary:
 # both the SQLite metadata and vectors.json, creates the
 # chunks_vector_row_cover covering index, and lets the runtime derive the BM25
 # average length from sum_token_count / row_count instead of an AVG full-table
-# scan.
+# scan.  Schema 3 also carries the optional ``backend`` and ``precision``
+# strings (T6) so retrieval_revision and per-task caches can invalidate when
+# the encoding backend identity changes without bumping the on-disk schema
+# version that the C++ pack verifier consumes.
 INDEX_SCHEMA_VERSION_LEGACY = 2
 INDEX_SCHEMA_VERSION = 3
 CHUNKS_VECTOR_ROW_COVER = "chunks_vector_row_cover"
@@ -75,26 +81,18 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _embedding_identity(embedding: EmbeddingBackend) -> tuple[str, str, int, str]:
-    model = getattr(embedding, "model", None)
-    revision = getattr(embedding, "revision", None)
-    dimensions = getattr(embedding, "dimensions", None)
+def _embedding_identity(
+    embedding: EmbeddingBackend,
+) -> tuple[str, str, int, str, str, str]:
+    """Return the (model, revision, dimensions, tokenizer_sha256, backend,
+    precision) tuple used to gate index reuse and the retrieval_revision."""
     tokenizer = getattr(embedding, "tokenizer", None)
-    if (
-        type(model) is not str
-        or not model
-        or type(revision) is not str
-        or not revision
-        or type(dimensions) is not int
-        or dimensions <= 0
-        or tokenizer is None
-    ):
-        raise HybridIndexError("embedding backend identity is invalid")
     try:
-        fingerprint = tokenizer_fingerprint(tokenizer)
+        identity = backend_identity(embedding, tokenizer=tokenizer)
     except EmbeddingError as error:
-        raise HybridIndexError("embedding tokenizer is invalid") from error
-    return model, revision, dimensions, fingerprint
+        raise HybridIndexError("embedding backend identity is invalid") from error
+    model, revision, backend, precision, dimensions, fingerprint = identity
+    return model, revision, dimensions, fingerprint, backend, precision
 
 
 def _validate_inputs(
@@ -148,6 +146,8 @@ def _load_reusable_vectors(
     revision: str,
     dimensions: int,
     tokenizer_sha256: str,
+    backend: str | None = None,
+    precision: str | None = None,
 ) -> dict[str, tuple[str, np.ndarray]]:
     database = root / "metadata.sqlite3"
     matrix_path = root / "vectors.f16"
@@ -157,7 +157,10 @@ def _load_reusable_vectors(
     try:
         vector_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         schema_version = vector_metadata.get("schema_version")
-        if schema_version not in (INDEX_SCHEMA_VERSION_LEGACY, INDEX_SCHEMA_VERSION):
+        if schema_version not in (
+            INDEX_SCHEMA_VERSION_LEGACY,
+            INDEX_SCHEMA_VERSION,
+        ):
             return {}
         if (
             type(vector_metadata) is not dict
@@ -170,6 +173,17 @@ def _load_reusable_vectors(
             or vector_metadata.get("database_sha256") != _sha256_file(database)
         ):
             return {}
+        if schema_version == INDEX_SCHEMA_VERSION:
+            stored_backend = vector_metadata.get("backend")
+            stored_precision = vector_metadata.get("precision")
+            if (
+                stored_backend is not None
+                and stored_backend != backend
+            ) or (
+                stored_precision is not None
+                and stored_precision != precision
+            ):
+                return {}
         rows = vector_metadata.get("rows")
         if type(rows) is not int or rows <= 0 or matrix_path.stat().st_size != rows * dimensions * 2:
             return {}
@@ -185,6 +199,17 @@ def _load_reusable_vectors(
                 or connection.execute("PRAGMA quick_check").fetchone() != ("ok",)
             ):
                 return {}
+            if schema_version == INDEX_SCHEMA_VERSION:
+                stored_backend = _metadata_value(connection, "backend")
+                stored_precision = _metadata_value(connection, "precision")
+                if (
+                    stored_backend is not None
+                    and stored_backend != backend
+                ) or (
+                    stored_precision is not None
+                    and stored_precision != precision
+                ):
+                    return {}
             stored = connection.execute(
                 "SELECT chunk_id, embedding_sha256, vector_row FROM chunks"
             ).fetchall()
@@ -213,10 +238,23 @@ def _write_database(
     revision: str,
     dimensions: int,
     tokenizer_sha256: str,
+    backend: str | None = None,
+    precision: str | None = None,
     schema_version: int = INDEX_SCHEMA_VERSION,
 ) -> None:
-    if schema_version not in (INDEX_SCHEMA_VERSION_LEGACY, INDEX_SCHEMA_VERSION):
+    if schema_version not in (
+        INDEX_SCHEMA_VERSION_LEGACY,
+        INDEX_SCHEMA_VERSION,
+    ):
         raise HybridIndexError("schema version is invalid")
+    if schema_version == INDEX_SCHEMA_VERSION:
+        if (
+            type(backend) is not str
+            or not backend
+            or type(precision) is not str
+            or not precision
+        ):
+            raise HybridIndexError("backend identity is missing")
     sum_token_count = 0
     for chunk in chunks:
         if chunk.token_count <= 0:
@@ -291,6 +329,8 @@ def _write_database(
         if schema_version == INDEX_SCHEMA_VERSION:
             metadata_rows.extend(
                 (
+                    ("backend", backend or ""),
+                    ("precision", precision or ""),
                     ("row_count", str(len(chunks))),
                     ("sum_token_count", str(sum_token_count)),
                 )
@@ -401,7 +441,14 @@ def build_index_from_chunks(
     if not root.is_absolute() or type(batch_size) is not int or batch_size <= 0:
         raise HybridIndexError("index build configuration is invalid")
     _validate_inputs(documents, chunks)
-    model, revision, dimensions, tokenizer_sha256 = _embedding_identity(embedding)
+    (
+        model,
+        revision,
+        dimensions,
+        tokenizer_sha256,
+        backend,
+        precision,
+    ) = _embedding_identity(embedding)
     ordered = sorted(chunks, key=lambda item: item.chunk_id)
     reusable = _load_reusable_vectors(
         root,
@@ -409,6 +456,8 @@ def build_index_from_chunks(
         revision=revision,
         dimensions=dimensions,
         tokenizer_sha256=tokenizer_sha256,
+        backend=backend,
+        precision=precision,
     )
     vectors = np.empty((len(ordered), dimensions), dtype=np.float32)
     pending_positions: list[int] = []
@@ -471,6 +520,8 @@ def build_index_from_chunks(
             revision=revision,
             dimensions=dimensions,
             tokenizer_sha256=tokenizer_sha256,
+            backend=backend,
+            precision=precision,
             schema_version=INDEX_SCHEMA_VERSION,
         )
         if progress is not None:
@@ -498,6 +549,8 @@ def build_index_from_chunks(
             "tokenizer_sha256": tokenizer_sha256,
             "matrix_sha256": _sha256_file(matrix_path),
             "database_sha256": _sha256_file(database),
+            "backend": backend,
+            "precision": precision,
         }
         with metadata_path.open("x", encoding="utf-8", newline="") as stream:
             json.dump(metadata, stream, sort_keys=True, separators=(",", ":"))
@@ -523,6 +576,8 @@ def build_index_from_chunks(
         revision,
         dimensions,
         tokenizer_sha256,
+        backend,
+        precision,
     )
 
 

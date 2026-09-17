@@ -17,7 +17,16 @@ BGE_M3_REVISION = "5617a9f61b028005a4858fdac845db406aefb181"
 PACK_SCHEMA_VERSION = 2
 INDEX_LEGACY_SCHEMA_VERSION = 2
 INDEX_SCHEMA_VERSION = 3
+INDEX_SCHEMA_VERSION_BACKEND = 4
 EMBEDDING_DIMENSIONS = 1024
+
+# T6 embedding backend identity.  ``pack.json`` does not yet publish these
+# fields so the C++ verifier can stay on its strict key set; the dataclass
+# defaults below match the only currently supported backend so the
+# retrieval_revision hash seed and the index metadata remain consistent
+# without a manifest schema bump.
+DEFAULT_EMBEDDING_BACKEND = "sentence_transformers"
+DEFAULT_EMBEDDING_PRECISION = "float32"
 
 _PACK_KEYS = {
     "schema_version",
@@ -127,6 +136,8 @@ class PackManifest:
     relevance_dense_min: float
     complete: bool
     files: tuple[FileDigest, ...]
+    embedding_backend: str = DEFAULT_EMBEDDING_BACKEND
+    embedding_precision: str = DEFAULT_EMBEDDING_PRECISION
 
 
 def _reject_constant(_: str) -> None:
@@ -637,6 +648,10 @@ def retrieval_revision(manifest: PackManifest) -> str:
     ``pack_id`` deliberately identifies knowledge content.  This separate
     revision binds the executable runtime, sidecar build, fitted relevance
     policy, and frozen evaluation inputs/results used with that content.
+    The seed also embeds the embedding backend identity (T6) so swapping
+    ``sentence_transformers``/``float32`` for an evaluated alternative
+    invalidates every cache key and per-task evidence derived from the
+    previous revision.
     """
     records = {record.path: record for record in manifest.files}
     required = (
@@ -657,6 +672,8 @@ def retrieval_revision(manifest: PackManifest) -> str:
         "evaluation_report_sha256": records[
             "reports/retrieval-eval.json"
         ].sha256,
+        "embedding_backend": manifest.embedding_backend,
+        "embedding_precision": manifest.embedding_precision,
     }
     try:
         encoded = json.dumps(

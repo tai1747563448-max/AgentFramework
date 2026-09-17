@@ -9,10 +9,42 @@ from typing import Any, Protocol, Sequence
 
 import numpy as np
 
-from .pack import BGE_M3_MODEL, BGE_M3_REVISION, EMBEDDING_DIMENSIONS
+from .pack import (
+    BGE_M3_MODEL,
+    BGE_M3_REVISION,
+    DEFAULT_EMBEDDING_BACKEND,
+    DEFAULT_EMBEDDING_PRECISION,
+    EMBEDDING_DIMENSIONS,
+)
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+# Backend/precision identity used for retrieval_revision and cache keys.
+# Adding a new value requires regenerating the index, rebuilding the pack,
+# and refreshing every retrieval_revision consumer. The BGE-M3 baseline
+# uses sentence-transformers on float32 weights; alternative values below
+# are reserved for measured candidates only.
+BACKEND_SENTENCE_TRANSFORMERS = DEFAULT_EMBEDDING_BACKEND
+BACKEND_REMOTE_HTTP = "remote_http"
+BACKEND_ONNX_RUNTIME = "onnx_runtime"
+BACKEND_LIBTORCH = "libtorch"
+SUPPORTED_BACKENDS = frozenset(
+    {
+        BACKEND_SENTENCE_TRANSFORMERS,
+        BACKEND_REMOTE_HTTP,
+        BACKEND_ONNX_RUNTIME,
+        BACKEND_LIBTORCH,
+    }
+)
+
+PRECISION_FLOAT32 = DEFAULT_EMBEDDING_PRECISION
+PRECISION_FLOAT16 = "float16"
+PRECISION_INT8 = "int8"
+SUPPORTED_PRECISIONS = frozenset(
+    {PRECISION_FLOAT32, PRECISION_FLOAT16, PRECISION_INT8}
+)
 
 
 class EmbeddingError(RuntimeError):
@@ -23,6 +55,8 @@ class EmbeddingBackend(Protocol):
     model: str
     revision: str
     dimensions: int
+    backend: str
+    precision: str
 
     def encode(
         self, texts: Sequence[str], *, batch_size: int = 16
@@ -129,6 +163,66 @@ def tokenizer_fingerprint(tokenizer: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def backend_identity(
+    embedding: EmbeddingBackend, *, tokenizer: Any | None = None
+) -> tuple[str, str, str, str, int, str]:
+    """Return the six-tuple identity used to gate index reuse and cache keys.
+
+    The components are: (model, revision, backend, precision, dimensions,
+    tokenizer_sha256).  Any mismatch across these six values must invalidate
+    reusable vectors, the retrieval_revision hash, and the per-task cache so
+    a different backend cannot silently satisfy a retrieval that was
+    optimised for a different precision or tokeniser.
+    """
+    if not hasattr(embedding, "encode"):
+        raise EmbeddingError("embedding backend is invalid")
+    model = getattr(embedding, "model", None)
+    revision = getattr(embedding, "revision", None)
+    backend = getattr(embedding, "backend", None)
+    precision = getattr(embedding, "precision", None)
+    dimensions = getattr(embedding, "dimensions", None)
+    if (
+        type(model) is not str
+        or not model
+        or type(revision) is not str
+        or not revision
+        or type(backend) is not str
+        or backend not in SUPPORTED_BACKENDS
+        or type(precision) is not str
+        or precision not in SUPPORTED_PRECISIONS
+        or type(dimensions) is not int
+        or dimensions <= 0
+    ):
+        raise EmbeddingError(
+            "embedding backend identity is invalid (model, revision, "
+            "backend, precision, dimensions)"
+        )
+    tokenizer_obj = tokenizer if tokenizer is not None else getattr(
+        embedding, "tokenizer", None
+    )
+    if tokenizer_obj is None:
+        raise EmbeddingError("embedding tokenizer is missing")
+    try:
+        fingerprint = tokenizer_fingerprint(tokenizer_obj)
+    except EmbeddingError as error:
+        raise EmbeddingError("embedding tokenizer is invalid") from error
+    return (model, revision, backend, precision, dimensions, fingerprint)
+
+
+def backend_identity_string(identity: tuple[str, str, str, str, int, str]) -> str:
+    """Return the canonical ``model@revision+backend/precision/dims`` string."""
+    model, revision, backend, precision, dimensions, _ = identity
+    return f"{model}@{revision}+{backend}/{precision}/{dimensions}"
+
+
+def backend_identity_digest(
+    identity: tuple[str, str, str, str, int, str],
+) -> str:
+    """Return the SHA-256 digest of the canonical identity string."""
+    payload = backend_identity_string(identity).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     try:
@@ -211,6 +305,8 @@ def _verify_model_lock(
 
 class BgeM3Embedding:
     model = BGE_M3_MODEL
+    backend = BACKEND_SENTENCE_TRANSFORMERS
+    precision = PRECISION_FLOAT32
 
     def __init__(
         self,
@@ -253,6 +349,10 @@ class BgeM3Embedding:
         self.device = device
         self._implementation = implementation
         self.tokenizer = implementation.tokenizer
+
+    @property
+    def tokenizer_sha256(self) -> str:
+        return tokenizer_fingerprint(self.tokenizer)
 
     def encode(
         self, texts: Sequence[str], *, batch_size: int = 16

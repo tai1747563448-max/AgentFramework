@@ -15,7 +15,11 @@ RAG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(RAG_ROOT))
 
 from agent_rag.chunker import ChunkRecord, DocumentSource  # type: ignore[import-not-found]
-from agent_rag.embedding import BGE_M3_MODEL  # type: ignore[import-not-found]
+from agent_rag.embedding import (  # type: ignore[import-not-found]
+    BACKEND_SENTENCE_TRANSFORMERS,
+    BGE_M3_MODEL,
+    PRECISION_FLOAT32,
+)
 from agent_rag.hybrid_index import (  # type: ignore[import-not-found]
     HybridIndexError,
     build_index_from_chunks,
@@ -37,9 +41,19 @@ class DeterministicEmbedding:
     model = BGE_M3_MODEL
     dimensions = 4
     tokenizer = WordTokenizer()
+    backend = BACKEND_SENTENCE_TRANSFORMERS
+    precision = PRECISION_FLOAT32
 
-    def __init__(self, revision: str = "revision-a") -> None:
+    def __init__(
+        self,
+        revision: str = "revision-a",
+        *,
+        backend: str = BACKEND_SENTENCE_TRANSFORMERS,
+        precision: str = PRECISION_FLOAT32,
+    ) -> None:
         self.revision = revision
+        self.backend = backend
+        self.precision = precision
         self.calls: list[list[str]] = []
 
     def encode(self, texts: list[str], *, batch_size: int = 16) -> np.ndarray:
