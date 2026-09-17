@@ -4,6 +4,7 @@
 #include "domain/evidence_validation.h"
 #include "domain/latency_trace.h"
 #include "ports/cancellation.h"
+#include "ports/operation_context.h"
 #include "ports/clock.h"
 #include "ports/event_store.h"
 #include "ports/id_generator.h"
@@ -13,6 +14,7 @@
 
 #include <string>
 #include <cstdint>
+#include <chrono>
 #include <utility>
 #include <variant>
 
@@ -294,7 +296,16 @@ RuntimeResult RuntimeEngine::continue_task(
             // turn's evidence retrieval is about to start. The task id is
             // used as the request id so all four canonical samples line up.
             emit_latency_sample(task_id, kStageSubmit);
-            auto evidence = knowledge_.retrieve(*state);
+            // T2: build an OperationContext that combines the runtime
+            // cancellation token with a deadline derived from the task
+            // budget. The provider uses both to short-circuit long-running
+            // retrieval and stop spinning while the user already pressed
+            // Ctrl+C.
+            const OperationContext context{
+                &cancellation_,
+                std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(state->budgets.max_task_time_ms)};
+            auto evidence = knowledge_.retrieve(*state, context);
             if (!evidence.has_value()) {
                 return append_event(
                     state, task_id,

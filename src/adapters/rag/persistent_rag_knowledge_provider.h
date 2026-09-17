@@ -34,7 +34,8 @@ public:
     PersistentRagKnowledgeProvider& operator=(
         const PersistentRagKnowledgeProvider&) = delete;
 
-    Result<EvidencePack> retrieve(const TaskState& state) override;
+    Result<EvidencePack> retrieve(const TaskState& state,
+                                 const OperationContext& context) override;
 
 private:
     enum class State { Stopped, Starting, Ready, Broken };

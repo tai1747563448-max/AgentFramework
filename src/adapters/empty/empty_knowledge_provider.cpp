@@ -2,7 +2,8 @@
 
 namespace agent {
 
-Result<EvidencePack> EmptyKnowledgeProvider::retrieve(const TaskState&) {
+Result<EvidencePack> EmptyKnowledgeProvider::retrieve(const TaskState&,
+                                                  const OperationContext&) {
     return Result<EvidencePack>::success({});
 }
 

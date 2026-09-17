@@ -6,7 +6,8 @@ namespace agent {
 
 class EmptyKnowledgeProvider final : public KnowledgeProvider {
 public:
-    Result<EvidencePack> retrieve(const TaskState& state) override;
+    Result<EvidencePack> retrieve(const TaskState& state,
+                                 const OperationContext& context) override;
 };
 
 }  // namespace agent

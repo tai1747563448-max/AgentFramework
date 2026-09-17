@@ -146,8 +146,12 @@ void PersistentRagKnowledgeProvider::break_process() noexcept {
 }
 
 Result<EvidencePack> PersistentRagKnowledgeProvider::retrieve(
-    const TaskState& state) {
+    const TaskState& state, const OperationContext& context) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (context.cancelled()) {
+        return Result<EvidencePack>::failure(
+            {ErrorCode::Cancelled, "RAG retrieval cancelled", false});
+    }
     try {
         if (!config_.enabled || should_skip(state.issue)) {
             return Result<EvidencePack>::success({});

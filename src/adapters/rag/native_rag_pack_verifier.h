@@ -4,6 +4,7 @@
 
 #include <functional>
 #include <cstdint>
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -21,7 +22,8 @@ public:
     NativeRagPackVerifier& operator=(const NativeRagPackVerifier&) = delete;
 
     Result<void> verify_executable_payload(
-        const std::filesystem::path& pack_root) override;
+        const std::filesystem::path& pack_root,
+        const OperationContext& context) override;
 
 private:
     void release_locks() noexcept;

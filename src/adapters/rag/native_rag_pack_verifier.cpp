@@ -433,8 +433,12 @@ void NativeRagPackVerifier::release_locks() noexcept {
 }
 
 Result<void> NativeRagPackVerifier::verify_executable_payload(
-    const std::filesystem::path& pack_root) {
+    const std::filesystem::path& pack_root, const OperationContext& context) {
     release_locks();
+    if (context.cancelled()) {
+        return Result<void>::failure(
+            {ErrorCode::Cancelled, "RAG pack verification cancelled", false});
+    }
     std::vector<std::uintptr_t> pending_handles;
     std::size_t completed = 0;
     std::size_t total = 1;
@@ -603,6 +607,12 @@ Result<void> NativeRagPackVerifier::verify_executable_payload(
         total = executable_records.size();
         emit("running", true);
         for (const auto& record : executable_records) {
+            // T2: short-circuit the verification loop on cancellation or
+            // deadline expiry. The completion counter still advances so the
+            // progress observer can publish the cancellation reason.
+            if (context.cancelled()) {
+                return fail();
+            }
             if (!hold_read_lock(root / std::filesystem::u8path(record.path),
                                 pending_handles) ||
                 !verify_record(root, record)) {
@@ -611,6 +621,9 @@ Result<void> NativeRagPackVerifier::verify_executable_payload(
             ++completed;
             emit(completed == total ? "completed" : "running",
                  completed == total);
+        }
+        if (context.cancelled()) {
+            return fail();
         }
         locked_handles_ = std::move(pending_handles);
         return Result<void>::success();
