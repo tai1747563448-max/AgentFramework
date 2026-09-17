@@ -729,6 +729,30 @@ reporter.update("publish-pack-command", 1, 1)
     Invoke-PythonSource -Python $script:PackPython -Source $publishPack `
         -ScriptArguments @($StagingRoot, $Destination) `
         -Failure "Knowledge Pack publication failed"
+    # T4: stamp the canonical backend identity the native lease will seal
+    # against. Recording it here gives the operator a side-by-side compare
+    # against the C++ verifier's emit_progress message so a rotation of the
+    # embedding model is visible without re-running verification.
+    $leaseIdentityReport = @'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+manifest = json.loads((root / "pack.json").read_text(encoding="utf-8"))
+identity = "{0}@{1}/{2}".format(
+    manifest["embedding_model"], manifest["embedding_revision"],
+    manifest["embedding_dimensions"])
+report = {
+    "schema_version": 2,
+    "backend_identity": identity,
+    "manifest_sha256_path": str(root / "pack.json"),
+}
+pathlib.Path(sys.argv[2]).write_text(
+    json.dumps(report, sort_keys=True, separators=(",", ":")),
+    encoding="utf-8")
+'@
+    $leaseIdentityPath = Join-Path $ReportsRoot "lease-identity.json"
+    Invoke-PythonSource -Python $script:PackPython -Source $leaseIdentityReport `
+        -ScriptArguments @($Destination, $leaseIdentityPath) `
+        -Failure "Knowledge Pack lease identity stamping failed"
     $PublishedRoot = Get-FullPath $Destination
 }
 

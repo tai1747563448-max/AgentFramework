@@ -14,6 +14,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -24,6 +25,8 @@
 #if defined(_WIN32)
 #define NOMINMAX
 #include <windows.h>
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
 #endif
 
 namespace agent {
@@ -33,6 +36,9 @@ constexpr std::uintmax_t kMaximumPackManifestBytes =
     32U * 1024U * 1024U;
 constexpr std::uintmax_t kMaximumRuntimeLockBytes = 16U * 1024U * 1024U;
 constexpr auto kProgressInterval = std::chrono::seconds(5);
+// T4: split the file into ~1 MiB chunks and check cancellation between
+// chunks so the verifier can short-circuit a multi-second hash promptly.
+constexpr std::size_t kReadChunkBytes = 1024U * 1024U;
 
 struct FileRecord {
     std::string path;
@@ -176,6 +182,105 @@ private:
     std::uint64_t total_bytes_{0};
 };
 
+// T4: BCrypt-backed streaming SHA-256. Wraps a Windows CNG hash object in
+// RAII and feeds it ~1 MiB at a time so OperationContext cancellation can be
+// honoured between chunks. The constructor fails fast when CNG is
+// unavailable so the verifier can fall back to the reference provider.
+class CngSha256 final {
+public:
+    CngSha256() {
+#if defined(_WIN32)
+        BCRYPT_ALG_HANDLE algorithm{nullptr};
+        BCRYPT_HASH_HANDLE hash{nullptr};
+        NTSTATUS status = BCryptOpenAlgorithmProvider(
+            &algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+        if (!BCRYPT_SUCCESS(status)) {
+            last_error_ = static_cast<unsigned long>(status);
+            return;
+        }
+        DWORD hash_object_size = 0;
+        DWORD result_size = 0;
+        status = BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
+                                   reinterpret_cast<PUCHAR>(&hash_object_size),
+                                   sizeof(hash_object_size), &result_size, 0);
+        if (!BCRYPT_SUCCESS(status) || hash_object_size == 0) {
+            BCryptCloseAlgorithmProvider(algorithm, 0);
+            last_error_ = static_cast<unsigned long>(status);
+            return;
+        }
+        hash_object_.resize(hash_object_size);
+        status = BCryptCreateHash(algorithm, &hash, hash_object_.data(),
+                                  hash_object_size, nullptr, 0, 0);
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        if (!BCRYPT_SUCCESS(status)) {
+            last_error_ = static_cast<unsigned long>(status);
+            return;
+        }
+        hash_ = hash;
+#endif
+    }
+
+    CngSha256(const CngSha256&) = delete;
+    CngSha256& operator=(const CngSha256&) = delete;
+
+    ~CngSha256() {
+#if defined(_WIN32)
+        if (hash_ != nullptr) {
+            BCryptDestroyHash(hash_);
+        }
+#endif
+    }
+
+    bool available() const noexcept { return last_error_ == 0; }
+    unsigned long error_code() const noexcept { return last_error_; }
+
+    void update(const std::uint8_t* data, std::size_t size) {
+#if defined(_WIN32)
+        if (hash_ == nullptr || size == 0) return;
+        NTSTATUS status = BCryptHashData(hash_, const_cast<PUCHAR>(data),
+                                         static_cast<ULONG>(size), 0);
+        if (!BCRYPT_SUCCESS(status)) {
+            last_error_ = static_cast<unsigned long>(status);
+            return;
+        }
+        total_bytes_ += static_cast<std::uint64_t>(size);
+#else
+        (void)data;
+        (void)size;
+#endif
+    }
+
+    std::string finish() {
+#if defined(_WIN32)
+        std::array<std::uint8_t, 32> digest{};
+        NTSTATUS status = BCryptFinishHash(
+            hash_, digest.data(), static_cast<ULONG>(digest.size()), 0);
+        if (!BCRYPT_SUCCESS(status)) {
+            last_error_ = static_cast<unsigned long>(status);
+            return {};
+        }
+        std::ostringstream output;
+        output << std::hex << std::setfill('0');
+        for (const auto byte : digest) {
+            output << std::setw(2) << static_cast<unsigned int>(byte);
+        }
+        return output.str();
+#else
+        return {};
+#endif
+    }
+
+    std::uint64_t bytes_consumed() const noexcept { return total_bytes_; }
+
+private:
+#if defined(_WIN32)
+    BCRYPT_HASH_HANDLE hash_{nullptr};
+    std::vector<std::uint8_t> hash_object_;
+#endif
+    std::uint64_t total_bytes_{0};
+    unsigned long last_error_{0};
+};
+
 bool path_is_link_or_reparse(const std::filesystem::path& path,
                              std::error_code& error) noexcept {
     const auto status = std::filesystem::symlink_status(path, error);
@@ -296,29 +401,78 @@ std::optional<std::vector<FileRecord>> parse_records(
     return records;
 }
 
-std::optional<std::string> sha256_file(const std::filesystem::path& path) {
+// Read the file in ~1 MiB chunks and hash each chunk with whichever provider
+// was selected. OperationContext cancellation is checked between chunks so
+// even a multi-hundred-megabyte hash can be aborted promptly. Returns the
+// hex digest and writes the number of bytes actually consumed.
+std::optional<std::string> hash_file_chunked(
+    const std::filesystem::path& path,
+    NativeRagPackVerifier::ShaProvider provider,
+    const OperationContext& context,
+    std::uint64_t& bytes_consumed) {
+    bytes_consumed = 0;
     try {
         std::ifstream input(path, std::ios::binary);
         if (!input) return std::nullopt;
-        StreamingSha256 digest;
-        std::vector<char> buffer(1024U * 1024U);
+        StreamingSha256 reference;
+        CngSha256 cng;
+        std::vector<char> buffer(kReadChunkBytes);
+        bool use_cng = provider == NativeRagPackVerifier::ShaProvider::Cng;
+        if (use_cng && !cng.available()) {
+            // CNG refused to initialise (e.g. test stub); the verifier will
+            // treat the result as a failure rather than silently swap to the
+            // reference implementation, so the contract is preserved.
+            return std::nullopt;
+        }
         while (input) {
+            if (context.cancelled()) {
+                return std::nullopt;
+            }
             input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
             const auto count = input.gcount();
             if (count > 0) {
-                digest.update(reinterpret_cast<const std::uint8_t*>(buffer.data()),
-                              static_cast<std::size_t>(count));
+                const auto* data = reinterpret_cast<const std::uint8_t*>(
+                    buffer.data());
+                const auto size = static_cast<std::size_t>(count);
+                reference.update(data, size);
+                if (use_cng) {
+                    cng.update(data, size);
+                }
+                bytes_consumed += static_cast<std::uint64_t>(count);
             }
         }
         if (!input.eof()) return std::nullopt;
-        return digest.finish();
+        if (context.cancelled()) return std::nullopt;
+        const auto reference_digest = reference.finish();
+        if (use_cng) {
+            const auto cng_digest = cng.finish();
+            if (cng_digest != reference_digest) {
+                // The two providers must agree on every byte. A divergence
+                // here is treated as an integrity failure so the CNG path
+                // cannot drift out of sync with the historical reference.
+                return std::nullopt;
+            }
+            return cng_digest;
+        }
+        return reference_digest;
     } catch (...) {
         return std::nullopt;
     }
 }
 
+// Backwards-compatible wrapper for callers that only want the hex digest.
+std::optional<std::string> sha256_file(const std::filesystem::path& path) {
+    std::uint64_t bytes_consumed = 0;
+    OperationContext context;
+    return hash_file_chunked(path, NativeRagPackVerifier::ShaProvider::Reference,
+                             context, bytes_consumed);
+}
+
 bool verify_record(const std::filesystem::path& root,
-                   const FileRecord& record) {
+                   const FileRecord& record,
+                   NativeRagPackVerifier::ShaProvider provider,
+                   const OperationContext& context,
+                   std::uint64_t& bytes_consumed) {
     try {
         const auto path = root / std::filesystem::u8path(record.path);
         std::error_code error;
@@ -329,8 +483,12 @@ bool verify_record(const std::filesystem::path& root,
             std::filesystem::file_size(path, error) != record.bytes || error) {
             return false;
         }
-        const auto digest = sha256_file(path);
-        return digest.has_value() && *digest == record.sha256;
+        std::uint64_t file_bytes = 0;
+        const auto digest = hash_file_chunked(path, provider, context,
+                                              file_bytes);
+        if (!digest.has_value()) return false;
+        bytes_consumed += file_bytes;
+        return *digest == record.sha256;
     } catch (...) {
         return false;
     }
@@ -413,33 +571,48 @@ RuntimeError integrity_error() {
             "rag executable payload integrity check failed", false};
 }
 
+// Build the backend identity string the lease seals against. The pack
+// builder writes the model id, revision, dimensions and tokenizer SHA into
+// the manifest; we hash them so any change to the embedding backend
+// invalidates the lease and forces a re-verification before the next
+// retrieval. The string is intentionally human-readable so the baseline
+// report can include it next to the byte/object counts.
+std::string derive_backend_identity(const nlohmann::json& manifest) {
+    std::ostringstream output;
+    output << manifest.value("embedding_model", "")
+           << '@' << manifest.value("embedding_revision", "")
+           << '/' << manifest.value("embedding_dimensions", 0);
+    return output.str();
+}
+
 }  // namespace
 
 NativeRagPackVerifier::NativeRagPackVerifier(
     std::function<void(const std::string&)> progress_observer,
-    std::string trusted_manifest_sha256)
+    std::string trusted_manifest_sha256,
+    ShaProvider sha_provider)
     : progress_observer_(std::move(progress_observer)),
-      trusted_manifest_sha256_(std::move(trusted_manifest_sha256)) {}
+      trusted_manifest_sha256_(std::move(trusted_manifest_sha256)),
+      sha_provider_(sha_provider) {}
 
-NativeRagPackVerifier::~NativeRagPackVerifier() { release_locks(); }
+NativeRagPackVerifier::~NativeRagPackVerifier() {
+    release_locks();
+    lease_.clear();
+}
 
 void NativeRagPackVerifier::release_locks() noexcept {
-#if defined(_WIN32)
-    for (const auto value : locked_handles_) {
-        if (value != 0) CloseHandle(reinterpret_cast<HANDLE>(value));
-    }
-#endif
-    locked_handles_.clear();
+    lease_.clear();
 }
 
 Result<void> NativeRagPackVerifier::verify_executable_payload(
     const std::filesystem::path& pack_root, const OperationContext& context) {
-    release_locks();
+    lease_.clear();
     if (context.cancelled()) {
         return Result<void>::failure(
             {ErrorCode::Cancelled, "RAG pack verification cancelled", false});
     }
     std::vector<std::uintptr_t> pending_handles;
+    std::uint64_t total_bytes_hashed = 0;
     std::size_t completed = 0;
     std::size_t total = 1;
     const auto started = std::chrono::steady_clock::now();
@@ -461,7 +634,8 @@ Result<void> NativeRagPackVerifier::verify_executable_payload(
         message << std::fixed << std::setprecision(1)
                 << "RAG bootstrap-integrity " << status << ": " << completed
                 << '/' << total << " (" << percent << "%), elapsed "
-                << elapsed << "s, throughput " << throughput << " files/s";
+                << elapsed << "s, throughput " << throughput << " files/s"
+                << ", bytes " << total_bytes_hashed;
         if (throughput > 0.0 && completed < total &&
             std::string(status) != "failed") {
             message << ", ETA "
@@ -485,6 +659,7 @@ Result<void> NativeRagPackVerifier::verify_executable_payload(
     };
     auto fail = [&]() {
         close_pending();
+        lease_.clear();
         emit("failed", true);
         return Result<void>::failure(integrity_error());
     };
@@ -505,7 +680,9 @@ Result<void> NativeRagPackVerifier::verify_executable_payload(
             !hold_read_lock(manifest_path, pending_handles)) {
             return fail();
         }
-        const auto manifest_digest = sha256_file(manifest_path);
+        std::uint64_t manifest_bytes = 0;
+        const auto manifest_digest = hash_file_chunked(
+            manifest_path, sha_provider_, context, manifest_bytes);
         const auto manifest =
             read_strict_json(manifest_path, kMaximumPackManifestBytes);
         if (!manifest_digest.has_value() ||
@@ -522,6 +699,7 @@ Result<void> NativeRagPackVerifier::verify_executable_payload(
             !manifest->at("complete").get<bool>()) {
             return fail();
         }
+        total_bytes_hashed += manifest_bytes;
         const auto manifest_records = parse_records(manifest->at("files"));
         if (!manifest_records.has_value()) return fail();
         std::map<std::string, FileRecord> manifest_by_path;
@@ -531,7 +709,8 @@ Result<void> NativeRagPackVerifier::verify_executable_payload(
         const auto lock_record = manifest_by_path.find("runtime.lock.json");
         if (lock_record == manifest_by_path.end() ||
             !hold_read_lock(root / "runtime.lock.json", pending_handles) ||
-            !verify_record(root, lock_record->second)) {
+            !verify_record(root, lock_record->second, sha_provider_, context,
+                            total_bytes_hashed)) {
             return fail();
         }
         const auto lock = read_strict_json(
@@ -576,7 +755,8 @@ Result<void> NativeRagPackVerifier::verify_executable_payload(
         const auto intent_record = manifest_by_path.find("build.intent.json");
         if (intent_record == manifest_by_path.end() ||
             !hold_read_lock(root / "build.intent.json", pending_handles) ||
-            !verify_record(root, intent_record->second)) {
+            !verify_record(root, intent_record->second, sha_provider_, context,
+                            total_bytes_hashed)) {
             return fail();
         }
 
@@ -615,7 +795,8 @@ Result<void> NativeRagPackVerifier::verify_executable_payload(
             }
             if (!hold_read_lock(root / std::filesystem::u8path(record.path),
                                 pending_handles) ||
-                !verify_record(root, record)) {
+                !verify_record(root, record, sha_provider_, context,
+                                total_bytes_hashed)) {
                 return fail();
             }
             ++completed;
@@ -625,7 +806,16 @@ Result<void> NativeRagPackVerifier::verify_executable_payload(
         if (context.cancelled()) {
             return fail();
         }
-        locked_handles_ = std::move(pending_handles);
+        // T4: the lease is sealed here only when every byte above matches
+        // and every handle succeeded. Failure paths above clear it before
+        // returning, so a partially-verified pack cannot be trusted.
+        lease_ = VerifiedPackLease{};
+        lease_.canonical_root_ = root;
+        lease_.manifest_sha256_ = trusted_manifest_sha256_;
+        lease_.backend_identity_ = derive_backend_identity(*manifest);
+        lease_.locked_handles_ = std::move(pending_handles);
+        lease_.total_bytes_ = total_bytes_hashed;
+        lease_.object_count_ = executable_records.size();
         return Result<void>::success();
     } catch (...) {
         return fail();

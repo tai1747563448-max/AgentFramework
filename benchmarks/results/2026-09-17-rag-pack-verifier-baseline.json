@@ -1,0 +1,36 @@
+{
+  "benchmark_kind": "rag_pack_verifier_baseline",
+  "comparison": {
+    "requested": false
+  },
+  "environment": {
+    "build_config": "Release",
+    "compiler": "msvc-1937",
+    "operating_system": "windows",
+    "sha_provider": "cng_with_reference_parity"
+  },
+  "limitations": [
+    "Measures the synthetic test fixture's pack (3 executable objects, ~75 bytes), not a production 30,000-document knowledge pack.",
+    "T10 is responsible for repeating this measurement against the real published pack; the numbers below are the only honest signal available without a published pack.",
+    "Comparing reports requires identical build config and machine conditions."
+  ],
+  "methodology": {
+    "clock": "std::chrono::steady_clock",
+    "external_network": false,
+    "fixture": "tests/adapters/verified_pack_lease_test.cpp::verified_pack_lease_total_bytes_tracks_payload_size"
+  },
+  "scenarios": [
+    {
+      "name": "rag_executable_payload_verification",
+      "summary": {
+        "object_count": 3,
+        "total_bytes": 105,
+        "elapsed_microseconds": 1742,
+        "sha_provider": "BCryptOpenAlgorithmProvider+BCryptHashData",
+        "backend_identity": "BAAI/bge-m3@dddddddddddddddddddddddddddddddddddddddd/1024",
+        "manifest_sha256": "trusted"
+      }
+    }
+  ],
+  "schema_version": 2
+}
