@@ -190,3 +190,46 @@ TEST_CASE(terminal_presenter_tool_completion_is_durable_without_animation_ticks)
         }
     }
 }
+
+TEST_CASE(terminal_presenter_first_text_delta_is_rendered_without_buffering_delay) {
+    // The first-text-to-terminal hop must add no observable delay beyond the
+    // time the caller spends inside text(). Anything larger would indicate
+    // the presenter is holding bytes back from the terminal, defeating the
+    // first_text_rendered measurement that benchmarks rely on.
+    std::ostringstream output;
+    agent::TerminalPresenter presenter(output, false);
+    presenter.begin();
+    const auto before = std::chrono::steady_clock::now();
+    presenter.text({"task", 1,
+                    {agent::ModelStreamEventKind::TextDelta, 0, "hello"}});
+    const auto after = std::chrono::steady_clock::now();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        after - before);
+    // The presenter must not introduce sleep-based throttling. Allow a
+    // generous upper bound to absorb CI jitter; the value is well above the
+    // flush cost of an ostringstream but well below the human-visible
+    // streaming latency budget.
+    REQUIRE(elapsed < std::chrono::milliseconds(50));
+    REQUIRE(output.str().find("[Generating; provisional]\nhello") != std::string::npos);
+    presenter.finish(true, "hello");
+}
+
+TEST_CASE(terminal_presenter_incomplete_stream_with_partial_preview_is_never_committed) {
+    // Stream text arrived during the call but the consumer eventually failed.
+    // The presenter must treat the partial preview as provisional: never
+    // reconcile it with the success path's final-answer code path and never
+    // emit the [Turn complete] marker that signals a committed answer.
+    std::ostringstream output;
+    agent::TerminalPresenter presenter(output, true, [] { return 60U; });
+    presenter.begin();
+    presenter.text({"task", 1,
+                    {agent::ModelStreamEventKind::TextDelta, 0, "partial "}});
+    presenter.text({"task", 1,
+                    {agent::ModelStreamEventKind::TextDelta, 0, "preview"}});
+    presenter.finish(false, "");
+    const auto rendered = output.str();
+    REQUIRE(rendered.find("partial preview") != std::string::npos);
+    REQUIRE(rendered.find("[Incomplete; turn was not committed]") != std::string::npos);
+    REQUIRE(rendered.find("[Turn complete]") == std::string::npos);
+    REQUIRE(rendered.find("[Final answer]") == std::string::npos);
+}
