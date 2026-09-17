@@ -160,7 +160,7 @@ InteractiveCli::InteractiveCli(InteractiveSessionCommands commands,
       output_(output),
       error_(error),
       memory_available_(memory_enabled && commands_.memories && commands_.remember &&
-                        commands_.forget && commands_.consolidate),
+                        commands_.forget && commands_.request_maintenance),
       memory_on_(memory_available_), ui_(std::move(ui)) {}
 
 SessionTurnResult InteractiveCli::execute_turn(const std::string& session_id,
@@ -331,13 +331,13 @@ Result<std::vector<MemoryEntry>> InteractiveCli::eligible_memories(const Session
 }
 
 void InteractiveCli::consolidate(const SessionState& session) {
-    if (!memory_on_) return;
+    if (!memory_on_ || !commands_.request_maintenance) return;
     try {
-        if (commands_.consolidate(session.session_id).has_value()) return;
+        commands_.request_maintenance(session.session_id,
+                                     session.completed_turns);
     } catch (...) {
-        // Consolidation failure must not block session changes.
+        // Maintenance scheduling must never block session changes.
     }
-    error_ << "warning: memory consolidation failed; it will be retried\n";
 }
 
 bool InteractiveCli::render_turn(const SessionTurnResult& result,
@@ -425,6 +425,8 @@ int InteractiveCli::run() {
         if (!std::getline(input_, line)) {
             output_ << '\n';
             consolidate(current);
+            if (commands_.drain_for_exit)
+                commands_.drain_for_exit(std::chrono::milliseconds(0));
             return ExitCode::Success;
         }
         line = trim(std::move(line));
@@ -433,6 +435,8 @@ int InteractiveCli::run() {
         }
         if (line == "/exit") {
             consolidate(current);
+            if (commands_.drain_for_exit)
+                commands_.drain_for_exit(std::chrono::milliseconds(0));
             return ExitCode::Success;
         }
         if (line == "/status") {

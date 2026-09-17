@@ -57,6 +57,7 @@ add_library(agent_kernel STATIC
     src/application/memory_policy.cpp
     src/application/memory_retriever.cpp
     src/application/memory_engine.cpp
+    src/application/memory_maintenance_scheduler.cpp
     src/application/model_context_compactor.cpp
     src/application/model_memory_consolidator.cpp
     src/application/session_engine.cpp
@@ -77,7 +78,8 @@ add_library(agent_kernel STATIC
     src/adapters/persistence/jsonl_event_store.cpp
     src/adapters/persistence/jsonl_session_store.cpp)
 target_include_directories(agent_kernel PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_link_libraries(agent_kernel PUBLIC nlohmann_json::nlohmann_json PRIVATE cpr::cpr)
+target_link_libraries(agent_kernel PUBLIC nlohmann_json::nlohmann_json
+    Threads::Threads PRIVATE cpr::cpr)
 if(MSVC)
     target_compile_options(agent_kernel PRIVATE /W4 /permissive- /utf-8)
 endif()
@@ -195,6 +197,8 @@ add_agent_test(memory_reducer_tests tests/application/memory_reducer_test.cpp)
 add_agent_test(memory_policy_tests tests/application/memory_policy_test.cpp)
 add_agent_test(memory_retriever_tests tests/application/memory_retriever_test.cpp)
 add_agent_test(memory_engine_tests tests/application/memory_engine_test.cpp)
+add_agent_test(memory_maintenance_scheduler_tests
+    tests/application/memory_maintenance_scheduler_test.cpp)
 add_agent_test(model_context_compactor_tests tests/application/model_context_compactor_test.cpp)
 add_agent_test(model_memory_consolidator_tests tests/application/model_memory_consolidator_test.cpp)
 add_agent_test(memory_event_json_tests tests/adapters/memory_event_json_test.cpp)

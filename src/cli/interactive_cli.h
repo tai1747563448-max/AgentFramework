@@ -4,8 +4,11 @@
 #include "cli/cli_app.h"
 #include "domain/memory_state.h"
 
+#include <chrono>
+#include <cstdint>
 #include <functional>
 #include <iosfwd>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -25,7 +28,14 @@ struct InteractiveSessionCommands {
     std::function<Result<std::vector<MemoryEntry>>(const std::string&)> memories;
     std::function<Result<MemoryEntry>(const std::string&, const std::string&)> remember;
     std::function<Result<void>(const std::string&)> forget;
-    std::function<Result<void>(const std::string&)> consolidate;
+    // request_maintenance is the non-blocking foreground entry point. It
+    // accepts the session id and the highest committed through_sequence the
+    // CLI has observed. The scheduler may discard older requests.
+    std::function<void(const std::string&, std::uint64_t)> request_maintenance;
+    // drain_for_exit is called once during CLI shutdown. It must never block
+    // longer than the timeout it is given.
+    std::function<void(std::chrono::milliseconds)> drain_for_exit;
+    std::function<std::optional<std::uint64_t>(const std::string&)> pending_through;
     std::function<SessionTurnResult(
         const std::string&, const std::string&,
         const RuntimeProgressObserver&, bool,

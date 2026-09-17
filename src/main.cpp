@@ -16,6 +16,7 @@
 #include "adapters/workspace/workspace_tool_gateway.h"
 #include "application/runtime_engine.h"
 #include "application/memory_engine.h"
+#include "application/memory_maintenance_scheduler.h"
 #include "application/memory_policy.h"
 #include "application/memory_retriever.h"
 #include "application/model_context_compactor.h"
@@ -306,17 +307,40 @@ int run_agent(std::vector<std::string> args) {
         agent::ModelContextCompactor compactor(model,
             {config.value().session_context.max_summary_bytes,
              config.value().budgets.model_timeout_ms});
+        // Two independent ModelClient instances are required: the foreground
+        // chat client and the extraction client used by the maintenance
+        // scheduler. Sharing one would couple cancellable maintenance work to
+        // the foreground request path, which is exactly what T8 forbids.
+        agent::CprHttpTransport maintenance_transport;
+        agent::AnthropicMessagesClient maintenance_model(config.value().anthropic,
+                                                         maintenance_transport);
         agent::ModelMemoryConsolidator consolidator(model,
+            {config.value().budgets.model_timeout_ms});
+        agent::ModelMemoryConsolidator maintenance_consolidator(maintenance_model,
             {config.value().budgets.model_timeout_ms});
         agent::MemoryPolicy memory_policy(config.value().memory_policy);
         agent::MemoryRetriever memory_retriever;
         std::unique_ptr<agent::JsonlMemoryStore> memories;
         std::unique_ptr<agent::MemoryEngine> memory_engine;
+        std::unique_ptr<agent::MemoryMaintenanceScheduler> maintenance_scheduler;
         if (config.value().session_context.memory_enabled) {
             memories = std::make_unique<agent::JsonlMemoryStore>(config.value().runtime_root);
             memory_engine = std::make_unique<agent::MemoryEngine>(
                 *memories, sessions, consolidator, memory_retriever,
                 memory_policy, clock, ids);
+            // The scheduler owns its own consolidator with its own ModelClient.
+            // The foreground request path never touches this consolidator.
+            auto consolidator_for_scheduler =
+                std::make_unique<agent::ModelMemoryConsolidator>(
+                    maintenance_model,
+                    agent::ModelMemoryConsolidatorConfig{
+                        config.value().budgets.model_timeout_ms});
+            maintenance_scheduler =
+                std::make_unique<agent::MemoryMaintenanceScheduler>(
+                    *memory_engine, std::move(consolidator_for_scheduler),
+                    agent::MemoryMaintenanceScheduler::Config{2,
+                        std::chrono::milliseconds(
+                            config.value().budgets.model_timeout_ms)});
         }
         agent::SessionLoadTask load_task = [&](const std::string& task_id) {
             const auto path = events.event_path(task_id);
@@ -371,6 +395,12 @@ int run_agent(std::vector<std::string> args) {
                 return agent::ExitCode::InvalidInputOrConfig;
             }
             agent::InteractiveSessionCommands commands;
+            // Track the currently active session id so the foreground forget
+            // command can invalidate any in-flight scheduler work that was
+            // derived from the same session. The pointer is captured by the
+            // forget closure below.
+            std::string current_session_holder;
+            std::string* current_session_id = &current_session_holder;
             cancellation.end_turn();
             commands.begin_turn = [&] { cancellation.begin_turn(); };
             commands.end_turn = [&] { cancellation.end_turn(); };
@@ -381,38 +411,50 @@ int run_agent(std::vector<std::string> args) {
             };
             commands.list = [&] { return session_engine.list_sessions(); };
             commands.create = [&](const std::string& workspace) {
-                return session_engine.create_session(
+                auto created = session_engine.create_session(
                     workspace, config.value().anthropic.model);
+                if (created.has_value()) {
+                    current_session_holder = created.value().session_id;
+                }
+                return created;
             };
             commands.load = [&](const std::string& session_id) {
-                return session_engine.load_session(session_id);
+                auto loaded = session_engine.load_session(session_id);
+                if (loaded.has_value()) {
+                    current_session_holder = loaded.value().session_id;
+                }
+                return loaded;
             };
-            commands.submit = [&]
+            commands.submit = [&, current_session_id]
                 (const std::string& session_id,
                  const std::string& text,
                  const agent::RuntimeProgressObserver& observer,
                  bool use_memory) {
+                *current_session_id = session_id;
                 return session_engine.submit_turn(
                     session_id, text, observer, use_memory);
             };
-            commands.recover = [&]
+            commands.recover = [&, current_session_id]
                 (const std::string& session_id,
                  const agent::RuntimeProgressObserver& observer,
                  bool use_memory) {
+                *current_session_id = session_id;
                 return session_engine.recover_pending_turn(
                     session_id, observer, use_memory);
             };
-            commands.submit_presented = [&]
+            commands.submit_presented = [&, current_session_id]
                 (const std::string& session_id, const std::string& text,
                  const agent::RuntimeProgressObserver& observer, bool use_memory,
                  const agent::RuntimePresentationOptions& presentation) {
+                *current_session_id = session_id;
                 return session_engine.submit_turn(
                     session_id, text, observer, use_memory, presentation);
             };
-            commands.recover_presented = [&]
+            commands.recover_presented = [&, current_session_id]
                 (const std::string& session_id,
                  const agent::RuntimeProgressObserver& observer, bool use_memory,
                  const agent::RuntimePresentationOptions& presentation) {
+                *current_session_id = session_id;
                 return session_engine.recover_pending_turn(
                     session_id, observer, use_memory, presentation);
             };
@@ -424,12 +466,30 @@ int run_agent(std::vector<std::string> args) {
                     return memory_engine->remember(session_id, text);
                 };
                 commands.forget = [&](const std::string& memory_id) {
-                    return memory_engine->forget(memory_id);
+                    const auto result = memory_engine->forget(memory_id);
+                    // The forget call already mutated the persisted log; tell
+                    // the scheduler that any pending maintenance for the
+                    // current session must be invalidated before commit.
+                    if (result.has_value() && maintenance_scheduler &&
+                        current_session_id != nullptr) {
+                        maintenance_scheduler->forget(*current_session_id,
+                                                      memory_id);
+                    }
+                    return result;
                 };
-                commands.consolidate = [&](const std::string& session_id) {
-                    const auto result = memory_engine->consolidate(session_id);
-                    return result.has_value() ? agent::Result<void>::success() :
-                        agent::Result<void>::failure(result.error());
+                commands.request_maintenance = [&](const std::string& session_id,
+                                                  std::uint64_t through) {
+                    if (maintenance_scheduler)
+                        maintenance_scheduler->request_maintenance(session_id, through);
+                };
+                commands.drain_for_exit = [&](std::chrono::milliseconds timeout) {
+                    if (maintenance_scheduler)
+                        maintenance_scheduler->drain_for_exit(timeout);
+                };
+                commands.pending_through = [&](const std::string& session_id)
+                    -> std::optional<std::uint64_t> {
+                    if (!maintenance_scheduler) return std::nullopt;
+                    return maintenance_scheduler->pending_through(session_id);
                 };
             }
             std::error_code error;
