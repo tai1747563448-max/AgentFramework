@@ -22,7 +22,12 @@ namespace agent {
 //     the optional Cancellation pointer when one is provided.
 struct OperationContext {
     const Cancellation* cancellation{nullptr};
-    std::chrono::steady_clock::time_point deadline{};
+    // Default deadline is "infinity": a default-constructed context bounds no
+    // work, which is what callers using the legacy 1-argument forwarders
+    // expect. Production call sites always set a real deadline via
+    // make_operation_context.
+    std::chrono::steady_clock::time_point deadline{
+        std::chrono::steady_clock::time_point::max()};
 
     bool cancelled() const noexcept {
         return (cancellation && cancellation->requested()) ||

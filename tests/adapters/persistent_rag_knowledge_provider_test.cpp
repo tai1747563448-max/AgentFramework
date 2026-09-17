@@ -2,6 +2,7 @@
 #include "adapters/rag/rag_protocol.h"
 #include "adapters/workspace/workspace_text.h"
 #include "ports/jsonl_process.h"
+#include "ports/operation_context.h"
 #include "ports/rag_pack_verifier.h"
 #include "test_support.h"
 
@@ -120,7 +121,8 @@ public:
 class FakeRagPackVerifier final : public agent::RagPackVerifier {
 public:
     agent::Result<void> verify_executable_payload(
-        const std::filesystem::path& root) override {
+        const std::filesystem::path& root,
+        const agent::OperationContext& /*context*/) override {
         ++verify_count;
         roots.push_back(root);
         if (error.has_value()) {

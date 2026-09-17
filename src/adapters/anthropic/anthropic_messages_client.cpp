@@ -367,13 +367,13 @@ Result<ModelResponse> AnthropicMessagesClient::complete(
     // first TextDelta produced by the assembler emits first_text_received
     // against the same request id RuntimeEngine used to mark the turn. The
     // flag is per-call and threadsafe for the single-consumer streaming path
-    // we own here.
+    // we own here. When the caller did not request tracing we leave the
+    // original observer untouched.
     const std::string trace_id = options.latency_request_id;
-    const ModelStreamObserver user_observer = options.observer;
     ModelCallOptions trace_options = options;
-    trace_options.observer = nullptr;
-    auto first_text = std::make_shared<std::atomic_bool>(false);
-    if (!trace_id.empty() && user_observer) {
+    if (!trace_id.empty() && trace_options.observer) {
+        const ModelStreamObserver user_observer = trace_options.observer;
+        auto first_text = std::make_shared<std::atomic_bool>(false);
         trace_options.observer = [user_observer, trace_id, first_text](
             const ModelStreamEvent& event) {
             if (event.kind == ModelStreamEventKind::TextDelta &&

@@ -37,6 +37,7 @@ public:
 
     Result<EvidencePack> retrieve(const TaskState& state,
                                  const OperationContext& context) override;
+    using KnowledgeProvider::retrieve;
 
 private:
     enum class State { Stopped, Starting, Ready, Broken };

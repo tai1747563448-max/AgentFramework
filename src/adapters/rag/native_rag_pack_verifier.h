@@ -24,6 +24,7 @@ public:
     Result<void> verify_executable_payload(
         const std::filesystem::path& pack_root,
         const OperationContext& context) override;
+    using RagPackVerifier::verify_executable_payload;
 
 private:
     void release_locks() noexcept;

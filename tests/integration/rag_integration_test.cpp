@@ -6,6 +6,7 @@
 #include "application/state_reducer.h"
 #include "ports/cancellation.h"
 #include "ports/clock.h"
+#include "ports/operation_context.h"
 #include "ports/id_generator.h"
 #include "ports/model_client.h"
 #include "test_support.h"
@@ -106,7 +107,9 @@ private:
 
 class FixtureVerifier final : public agent::RagPackVerifier {
 public:
-    agent::Result<void> verify_executable_payload(const std::filesystem::path&) override {
+    agent::Result<void> verify_executable_payload(
+        const std::filesystem::path&,
+        const agent::OperationContext& /*context*/) override {
         return agent::Result<void>::success();
     }
 };

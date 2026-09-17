@@ -1,6 +1,7 @@
 #include "application/runtime_engine.h"
 #include "application/state_reducer.h"
 #include "ports/cancellation.h"
+#include "ports/operation_context.h"
 #include "ports/clock.h"
 #include "ports/event_store.h"
 #include "ports/id_generator.h"
@@ -126,7 +127,8 @@ public:
         : error_(std::move(error)) {}
 
     agent::Result<agent::EvidencePack> retrieve(
-        const agent::TaskState& state) override {
+        const agent::TaskState& state,
+        const agent::OperationContext& /*context*/) override {
         retrieved_states.push_back(state);
         if (error_.has_value()) {
             return agent::Result<agent::EvidencePack>::failure(*error_);
