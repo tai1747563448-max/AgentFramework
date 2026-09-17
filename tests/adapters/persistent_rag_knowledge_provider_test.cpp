@@ -35,6 +35,27 @@ std::string ready_line() {
         .dump();
 }
 
+std::string ready_line_v3(bool index_ready = true,
+                          bool embedding_ready = true) {
+    return nlohmann::json(
+        {{"schema_version", 3},
+         {"request_id", "req-00000000000000000000000000000000"},
+         {"op", "ready"},
+         {"payload",
+          {{"pack_id", "pack-cccccccccccccccccccccccccccccccc"},
+           {"retrieval_revision", "retrieval-" + std::string(64, 'e')},
+           {"snapshot_date", "2026-09-03"},
+           {"document_count", 30'000},
+           {"chunk_count", 45'000},
+           {"model", "BAAI/bge-m3"},
+           {"revision", "dddddddddddddddddddddddddddddddddddddddd"},
+           {"dimensions", 1024},
+           {"device", "cpu"},
+           {"index_ready", index_ready},
+           {"embedding_ready", embedding_ready}}}})
+        .dump();
+}
+
 std::string query_line(const std::string& request_line) {
     const auto request = nlohmann::json::parse(request_line);
     const std::string content = "Legal evidence";
@@ -301,5 +322,165 @@ TEST_CASE(persistent_rag_provider_rejects_invalid_inputs_before_starting) {
         REQUIRE(result.error().code == agent::ErrorCode::InvalidConfiguration);
         REQUIRE(process.start_count == 0);
         REQUIRE(verifier.verify_count == 0);
+    }
+}
+
+// T5: with the default Auto policy, an ordinary chat prompt must not
+// start the sidecar at all. The provider returns an empty pack and the
+// FakeJsonlProcess never sees a startup or a query exchange.
+TEST_CASE(persistent_rag_provider_skips_ordinary_chat_when_policy_is_auto) {
+    fixtures::FakeJsonlProcess process;
+    fixtures::FakeRagPackVerifier verifier;
+    agent::PersistentRagKnowledgeProvider provider(
+        process, verifier, fixtures::config());
+    const auto result = provider.retrieve(fixtures::state("Hello there"));
+    REQUIRE(result.has_value());
+    REQUIRE(result.value().items.empty());
+    REQUIRE(process.start_count == 0);
+    REQUIRE(process.exchange_count == 0);
+}
+
+// T5: an explicit Auto on a regulatory prompt must still hit the
+// sidecar and emit the v2 query request the legacy path uses for
+// ExactReference lookups.
+TEST_CASE(persistent_rag_provider_keeps_retrieval_for_regulatory_prompt) {
+    fixtures::FakeJsonlProcess process;
+    fixtures::FakeRagPackVerifier verifier;
+    agent::PersistentRagKnowledgeProvider provider(
+        process, verifier, fixtures::config());
+    const auto result = provider.retrieve(
+        fixtures::state("What does 40 CFR 60.1 require?"));
+    REQUIRE(result.has_value());
+    REQUIRE(process.start_count == 1);
+    REQUIRE(process.exchange_count == 1);
+    const auto request = nlohmann::json::parse(process.exchanges.front());
+    REQUIRE(request.at("schema_version") == 2);
+}
+
+// T5: an Off policy must skip the sidecar regardless of the prompt.
+TEST_CASE(persistent_rag_provider_skips_when_user_disables_retrieval) {
+    fixtures::FakeJsonlProcess process;
+    fixtures::FakeRagPackVerifier verifier;
+    auto config = fixtures::config();
+    config.retrieval_policy = agent::RetrievalPolicy::Off;
+    agent::PersistentRagKnowledgeProvider provider(
+        process, verifier, config);
+    const auto result = provider.retrieve(
+        fixtures::state("What does 40 CFR 60.1 require?"));
+    REQUIRE(result.has_value());
+    REQUIRE(result.value().items.empty());
+    REQUIRE(process.start_count == 0);
+}
+
+// T5: a v3 ready frame advertising only `index_ready` must satisfy an
+// ExactReference turn. A semantic turn in the same session must be
+// refused with a clear capability error.
+TEST_CASE(persistent_rag_provider_negotiates_v3_capability_per_turn) {
+    fixtures::FakeJsonlProcess process;
+    fixtures::FakeRagPackVerifier verifier;
+    process.ready = fixtures::ready_line_v3(true, false);
+    auto config = fixtures::config();
+    config.retrieval_policy = agent::RetrievalPolicy::Always;
+    agent::PersistentRagKnowledgeProvider provider(
+        process, verifier, std::move(config));
+
+    REQUIRE(provider.retrieve(
+        fixtures::state("Cite 40 CFR 60.1 verbatim.")).has_value());
+    REQUIRE(process.start_count == 1);
+    REQUIRE(process.exchange_count == 1);
+    REQUIRE(provider.embedding_ready() == false);
+    REQUIRE(provider.index_ready() == true);
+
+    // T5: state transition None -> Semantic on the next turn. The
+    // sidecar advertised only the index capability, so a semantic
+    // request must fail without making another network call.
+    const auto second = provider.retrieve(
+        fixtures::state("Explain the regulation"));
+    REQUIRE(!second.has_value());
+    REQUIRE(second.error().code == agent::ErrorCode::DependencyUnavailable);
+    REQUIRE(process.exchange_count == 1);
+}
+
+// T5: the v3 path emits a v3 schema_version on the wire so the sidecar
+// can reply with a capability-aware envelope.
+TEST_CASE(persistent_rag_provider_emits_v3_for_semantic_turns) {
+    fixtures::FakeJsonlProcess process;
+    fixtures::FakeRagPackVerifier verifier;
+    process.ready = fixtures::ready_line_v3(true, true);
+    auto config = fixtures::config();
+    config.retrieval_policy = agent::RetrievalPolicy::Always;
+    agent::PersistentRagKnowledgeProvider provider(
+        process, verifier, std::move(config));
+
+    REQUIRE(provider.retrieve(
+        fixtures::state("Explain the regulation")).has_value());
+    REQUIRE(process.start_count == 1);
+    REQUIRE(process.exchange_count == 1);
+    const auto request = nlohmann::json::parse(process.exchanges.front());
+    REQUIRE(request.at("schema_version") == 3);
+}
+
+// T5: `authoritative_no_match` MUST only come from a defined
+// authoritative mapping. Init failure, semantic miss, and timeout
+// must never produce that state, so the provider rejects any
+// authoritative_no_match outcome returned for a turn that did not
+// ask for an exact citation.
+TEST_CASE(persistent_rag_provider_authoritative_no_match_evidence_closure) {
+    // (1) Init failure: a malformed ready frame never produces
+    // authoritative_no_match; the provider surfaces a protocol failure.
+    {
+        fixtures::FakeJsonlProcess process;
+        fixtures::FakeRagPackVerifier verifier;
+        process.ready = R"({"schema_version":2,"request_id":"wrong"})";
+        agent::PersistentRagKnowledgeProvider provider(
+            process, verifier, fixtures::config());
+        const auto result = provider.retrieve(
+            fixtures::state("What does 40 CFR 60.1 require?"));
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == agent::ErrorCode::ProtocolFailure);
+        REQUIRE(process.exchange_count == 0);
+    }
+
+    // (2) Semantic miss: a no_match outcome for a non-citation turn
+    // is fine, but the orchestrator must never turn it into an
+    // authoritative_no_match response.
+    {
+        fixtures::FakeJsonlProcess process;
+        fixtures::FakeRagPackVerifier verifier;
+        auto config = fixtures::config();
+        config.retrieval_policy = agent::RetrievalPolicy::Always;
+        agent::PersistentRagKnowledgeProvider provider(
+            process, verifier, std::move(config));
+        process.responder = [](const std::string& line) {
+            const auto request = nlohmann::json::parse(line);
+            return agent::Result<std::string>::success(nlohmann::json(
+                {{"schema_version", request.at("schema_version")},
+                 {"request_id", request.at("request_id")},
+                 {"op", "query_result"},
+                 {"payload",
+                  {{"outcome", "no_match"}, {"items", nlohmann::json::array()}}}})
+                .dump());
+        };
+        const auto result = provider.retrieve(
+            fixtures::state("Explain the regulation"));
+        REQUIRE(result.has_value());
+        REQUIRE(result.value().items.empty());
+        REQUIRE(!result.value().authoritative_no_match);
+        REQUIRE(!result.value().tool_use_forbidden);
+    }
+
+    // (3) Timeout: an exchange timeout must NOT surface as an
+    // authoritative_no_match. The provider returns the timeout error.
+    {
+        fixtures::FakeJsonlProcess process;
+        fixtures::FakeRagPackVerifier verifier;
+        process.exchange_error = agent::RuntimeError{
+            agent::ErrorCode::RequestTimeout, "SENTINEL", true};
+        agent::PersistentRagKnowledgeProvider provider(
+            process, verifier, fixtures::config());
+        const auto result = provider.retrieve(
+            fixtures::state("What does 40 CFR 60.1 require?"));
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().code == agent::ErrorCode::RequestTimeout);
     }
 }

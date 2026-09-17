@@ -505,6 +505,7 @@ Result<RuntimeConfig> load_runtime_config(
     if (rag_enabled.value()) {
         const auto mode = environment.get("AGENT_RAG_MODE");
         const auto device = environment.get("AGENT_RAG_DEVICE");
+        const auto policy = environment.get("AGENT_RAG_RETRIEVAL_POLICY");
         rag.mode = mode.has_value() ? *mode : "dense";
         rag.device = device.has_value() ? *device : "auto";
         if (rag.mode != "hybrid" && rag.mode != "dense" &&
@@ -514,6 +515,28 @@ Result<RuntimeConfig> load_runtime_config(
         if (rag.device != "auto" && rag.device != "cuda" &&
             rag.device != "cpu") {
             return invalid_config("rag device must be auto, cuda, or cpu");
+        }
+        // T5: the explicit policy defaults to Auto so existing
+        // configurations keep working. Off is only ever set by an
+        // explicit user choice (CLI command or per-invocation flag),
+        // never by the heuristic.
+        if (policy.has_value()) {
+            const auto lower = policy.value();
+            std::string lowered(lower.size(), '\0');
+            std::transform(lower.begin(), lower.end(), lowered.begin(),
+                           [](unsigned char byte) {
+                               return static_cast<char>(std::tolower(byte));
+                           });
+            if (lowered == "auto") {
+                rag.retrieval_policy = agent::RetrievalPolicy::Auto;
+            } else if (lowered == "always") {
+                rag.retrieval_policy = agent::RetrievalPolicy::Always;
+            } else if (lowered == "off") {
+                rag.retrieval_policy = agent::RetrievalPolicy::Off;
+            } else {
+                return invalid_config(
+                    "rag retrieval policy must be auto, always, or off");
+            }
         }
         const auto top_k = positive_integer(environment, "AGENT_RAG_TOP_K", 6);
         const auto maximum = positive_integer(

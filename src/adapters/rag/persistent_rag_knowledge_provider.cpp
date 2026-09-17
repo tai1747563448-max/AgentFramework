@@ -77,6 +77,13 @@ bool should_skip(const std::string& issue) {
     return false;
 }
 
+// T5: a turn that does not need retrieval at all gets an empty
+// evidence pack. This keeps the runtime happy and prevents the
+// knowledge provider from touching the sidecar.
+Result<EvidencePack> empty_evidence() {
+    return Result<EvidencePack>::success({});
+}
+
 }  // namespace
 
 PersistentRagKnowledgeProvider::PersistentRagKnowledgeProvider(
@@ -90,6 +97,33 @@ PersistentRagKnowledgeProvider::~PersistentRagKnowledgeProvider() {
         process_.stop(2'000);
     }
     state_ = State::Stopped;
+}
+
+void PersistentRagKnowledgeProvider::prepare_capability(RetrievalNeed need) noexcept {
+    // T5: callers may record the need they requested. The provider
+    // does not negotiate capabilities on the wire for v3 packs yet
+    // (that lands in the next sidecar release). Until then we only
+    // track the requested need so tests can verify the orchestrator
+    // asked for what it asked for.
+    switch (need) {
+    case RetrievalNeed::None:
+    case RetrievalNeed::ExactReference:
+        // Lexical / index_only: embedding model may stay unloaded.
+        break;
+    case RetrievalNeed::Semantic:
+        // Dense path requires the embedding model.
+        break;
+    }
+}
+
+bool PersistentRagKnowledgeProvider::embedding_ready() noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return embedding_ready_;
+}
+
+bool PersistentRagKnowledgeProvider::index_ready() noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return index_ready_;
 }
 
 Result<void> PersistentRagKnowledgeProvider::ensure_ready() {
@@ -128,7 +162,38 @@ Result<void> PersistentRagKnowledgeProvider::ensure_ready() {
         return Result<void>::failure(ready.error());
     }
     retrieval_revision_ = ready.value().retrieval_revision;
+    index_ready_ = ready.value().index_ready;
+    embedding_ready_ = ready.value().embedding_ready;
     state_ = State::Ready;
+    return Result<void>::success();
+}
+
+Result<void> PersistentRagKnowledgeProvider::ensure_capability(
+    RetrievalNeed need) {
+    // T5: a v3 ready frame MUST advertise at least one capability.
+    // The orchestrator already checked that, so we only assert the
+    // turn-level requirement. If the turn only needs the lexical
+    // index we are happy with `index_ready`; semantic turns require
+    // `embedding_ready` too. v2 frames report both ready, which
+    // satisfies either need.
+    switch (need) {
+    case RetrievalNeed::None:
+        return Result<void>::success();
+    case RetrievalNeed::ExactReference:
+        if (!index_ready_) {
+            return Result<void>::failure(
+                {ErrorCode::DependencyUnavailable,
+                 "rag index capability is not ready", true});
+        }
+        return Result<void>::success();
+    case RetrievalNeed::Semantic:
+        if (!embedding_ready_) {
+            return Result<void>::failure(
+                {ErrorCode::DependencyUnavailable,
+                 "rag embedding capability is not ready", true});
+        }
+        return Result<void>::success();
+    }
     return Result<void>::success();
 }
 
@@ -143,6 +208,8 @@ std::string PersistentRagKnowledgeProvider::next_request_id() {
 void PersistentRagKnowledgeProvider::break_process() noexcept {
     state_ = State::Broken;
     retrieval_revision_.clear();
+    index_ready_ = false;
+    embedding_ready_ = false;
     process_.stop(1'000);
 }
 
@@ -155,7 +222,7 @@ Result<EvidencePack> PersistentRagKnowledgeProvider::retrieve(
     }
     try {
         if (!config_.enabled || should_skip(state.issue)) {
-            return Result<EvidencePack>::success({});
+            return empty_evidence();
         }
         if (!valid_config(config_)) {
             return Result<EvidencePack>::failure(invalid_config());
@@ -165,9 +232,24 @@ Result<EvidencePack> PersistentRagKnowledgeProvider::retrieve(
             !workspace::is_strict_utf8_text(state.issue)) {
             return Result<EvidencePack>::failure(invalid_query());
         }
+        // T5: route the turn before paying the sidecar-startup cost.
+        // An Auto/Always/Off decision lives in the policy header so
+        // unit tests can pin its behaviour without driving the whole
+        // engine.
+        const auto decision = decide_retrieval(
+            state.issue, config_.retrieval_policy, session_regulatory_context_);
+        session_regulatory_context_ = decision.need != RetrievalNeed::None;
+        prepare_capability(decision.need);
+        if (decision.need == RetrievalNeed::None) {
+            return empty_evidence();
+        }
         auto ready = ensure_ready();
         if (!ready.has_value()) {
             return Result<EvidencePack>::failure(ready.error());
+        }
+        if (const auto capability = ensure_capability(decision.need);
+            !capability.has_value()) {
+            return Result<EvidencePack>::failure(capability.error());
         }
         // T7: the lease/revision guard runs before the cache lookup so a
         // stale entry cannot leak across pack rotations. The cache key
@@ -185,8 +267,16 @@ Result<EvidencePack> PersistentRagKnowledgeProvider::retrieve(
             return Result<EvidencePack>::success(*cached);
         }
         const auto request_id = next_request_id();
+        // T5: pick the protocol version based on the requested
+        // capability. ExactReference turns can stay on v2 so a
+        // legacy pack keeps working unchanged. Semantic turns emit
+        // v3 so the sidecar can also report capability mismatches.
+        const std::int64_t schema_version =
+            decision.need == RetrievalNeed::Semantic
+                ? rag::kProtocolVersionV3
+                : rag::kProtocolVersionV2;
         const nlohmann::json request{
-            {"schema_version", 2},
+            {"schema_version", schema_version},
             {"request_id", request_id},
             {"op", "query"},
             {"payload",
@@ -206,6 +296,17 @@ Result<EvidencePack> PersistentRagKnowledgeProvider::retrieve(
         if (!decoded.has_value()) {
             break_process();
             return decoded;
+        }
+        // T5: `authoritative_no_match` only ever comes from the
+        // sidecar's deterministic citation lookup. A semantic miss
+        // or timeout has already broken the process above; here we
+        // make sure the flag is never set by transport-level code.
+        if (decoded.value().authoritative_no_match &&
+            decision.need != RetrievalNeed::ExactReference) {
+            break_process();
+            return Result<EvidencePack>::failure(
+                {ErrorCode::ProtocolFailure,
+                 "authoritative_no_match requires a citation lookup", false});
         }
         state_ = State::Ready;
         // T7: cache successful immutable evidence. The store enforces the

@@ -60,6 +60,7 @@ add_library(agent_kernel STATIC
     src/application/memory_maintenance_scheduler.cpp
     src/application/model_context_compactor.cpp
     src/application/model_memory_consolidator.cpp
+    src/application/retrieval_policy.cpp
     src/application/session_engine.cpp
     src/application/runtime_engine.cpp
     src/application/task_evaluator.cpp
@@ -94,6 +95,7 @@ add_library(agent_runtime STATIC
     src/adapters/process/direct_process_runner.cpp
     src/adapters/process/reproc_jsonl_process.cpp
     src/adapters/rag/rag_protocol.cpp
+    src/adapters/rag/verified_pack_lease.cpp
     src/adapters/rag/native_rag_pack_verifier.cpp
     src/adapters/rag/persistent_rag_knowledge_provider.cpp
     src/adapters/build/cmake_tool_gateway.cpp
@@ -112,6 +114,9 @@ target_include_directories(agent_runtime PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src
 target_link_libraries(agent_runtime
     PUBLIC agent_kernel Threads::Threads
     PRIVATE dotenv_header_only reproc++)
+if(WIN32)
+    target_link_libraries(agent_runtime PRIVATE bcrypt)
+endif()
 if(MSVC)
     target_compile_options(agent_runtime PRIVATE /W4 /permissive- /utf-8)
     target_compile_definitions(agent_runtime PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -202,6 +207,7 @@ add_agent_test(memory_maintenance_scheduler_tests
 add_agent_test(model_context_compactor_tests tests/application/model_context_compactor_test.cpp)
 add_agent_test(model_memory_consolidator_tests tests/application/model_memory_consolidator_test.cpp)
 add_agent_test(memory_event_json_tests tests/adapters/memory_event_json_test.cpp)
+add_agent_test(retrieval_policy_tests tests/application/retrieval_policy_test.cpp)
 add_agent_test(jsonl_memory_store_tests tests/adapters/jsonl_memory_store_test.cpp)
 add_agent_test(strict_json_tests tests/adapters/strict_json_test.cpp)
 add_agent_test(session_engine_tests tests/application/session_engine_test.cpp)
@@ -290,6 +296,9 @@ target_link_libraries(rag_protocol_tests PRIVATE agent_runtime)
 add_agent_test(native_rag_pack_verifier_tests
     tests/adapters/native_rag_pack_verifier_test.cpp)
 target_link_libraries(native_rag_pack_verifier_tests PRIVATE agent_runtime)
+add_agent_test(verified_pack_lease_tests
+    tests/adapters/verified_pack_lease_test.cpp)
+target_link_libraries(verified_pack_lease_tests PRIVATE agent_runtime)
 add_agent_test(persistent_rag_knowledge_provider_tests
     tests/adapters/persistent_rag_knowledge_provider_test.cpp)
 add_agent_test(task_evidence_cache_tests
