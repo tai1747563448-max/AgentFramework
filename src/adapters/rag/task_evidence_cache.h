@@ -1,6 +1,6 @@
 #pragma once
 
-#include "domain/evidence_pack.h"
+#include "domain/model_types.h"
 
 #include <cstddef>
 #include <optional>
@@ -31,6 +31,7 @@ struct EvidenceCacheKey {
     std::size_t top_k{0};
     std::size_t max_total_bytes{0};
     bool operator==(const EvidenceCacheKey& other) const noexcept;
+    bool operator!=(const EvidenceCacheKey& other) const noexcept;
 };
 
 }  // namespace agent

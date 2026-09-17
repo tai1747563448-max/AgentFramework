@@ -45,7 +45,7 @@ public:
         ++depth_;
         return true;
     }
-    bool key(std::string& key, bool) override {
+    bool key(std::string& key) override {
         auto& slot = keys_.back();
         if (!slot.insert(key).second) {
             fail(StrictJsonError::Kind::DuplicateKey,
@@ -103,8 +103,6 @@ public:
         failure_ = std::move(error);
         return false;
     }
-    bool took_too_long() override { return false; }
-
     const std::optional<StrictJsonError>& error() const { return failure_; }
 
 private:
@@ -143,8 +141,9 @@ StrictJsonResult parse_strict_json(std::string_view bytes,
     }
     DuplicateKeyDetector detector;
     const auto sax_ok = nlohmann::json::sax_parse(
-        bytes.data(), bytes.size(), &detector,
-        nlohmann::json::input_format_t::strict,
+        bytes.begin(), bytes.end(), &detector,
+        /*format=*/nlohmann::json::input_format_t::json,
+        /*strict=*/true,
         /*ignore_comments=*/false);
     if (!sax_ok) {
         if (detector.error().has_value()) {

@@ -14,6 +14,10 @@ bool EvidenceCacheKey::operator==(const EvidenceCacheKey& other) const noexcept 
            max_total_bytes == other.max_total_bytes;
 }
 
+bool EvidenceCacheKey::operator!=(const EvidenceCacheKey& other) const noexcept {
+    return !(*this == other);
+}
+
 }  // namespace agent
 
 namespace std {

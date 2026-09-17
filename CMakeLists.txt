@@ -65,6 +65,7 @@ add_library(agent_kernel STATIC
     src/application/benchmark_statistics.cpp
     src/adapters/json/value_json.cpp
     src/adapters/json/strict_json.cpp
+    src/adapters/rag/task_evidence_cache.cpp
     src/adapters/anthropic/cpr_http_transport.cpp
     src/adapters/anthropic/sse_decoder.cpp
     src/adapters/anthropic/anthropic_stream_assembler.cpp
@@ -93,7 +94,6 @@ add_library(agent_runtime STATIC
     src/adapters/rag/rag_protocol.cpp
     src/adapters/rag/native_rag_pack_verifier.cpp
     src/adapters/rag/persistent_rag_knowledge_provider.cpp
-    src/adapters/rag/task_evidence_cache.cpp
     src/adapters/build/cmake_tool_gateway.cpp
     src/adapters/tools/composite_tool_gateway.cpp
     src/adapters/system/system_clock.cpp
