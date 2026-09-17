@@ -1,5 +1,6 @@
 #include "cli/terminal_presenter.h"
 #include "cli/terminal_text.h"
+#include "domain/latency_trace.h"
 
 #include <algorithm>
 #include <iomanip>
@@ -49,6 +50,7 @@ void TerminalPresenter::begin() {
     sanitizer_ = StreamingTerminalText{};
     rendered_.clear();
     phase_.clear();
+    rendered_emitted_ = false;
     if (dynamic_) output_ << "\x1b[?25l";
 }
 
@@ -127,6 +129,15 @@ void TerminalPresenter::write_text(const std::string& text) {
     output_ << text;
     partial_line_ = text.back() != '\n';
     output_.flush();
+    // T0 latency trace hook. Emit first_text_rendered the first time we
+    // successfully write actual model content to the terminal. Status
+    // messages and tick animations do not count; only an actual text chunk
+    // does. The round/task identifier is provided through the previous
+    // text() callback via the rendered_emitted_ latch below.
+    if (!rendered_emitted_) {
+        rendered_emitted_ = true;
+        emit_latency_sample(pending_request_id_, kStageFirstTextRendered);
+    }
 }
 
 void TerminalPresenter::text(const RuntimeTextUpdate& update) {
@@ -139,6 +150,12 @@ void TerminalPresenter::text(const RuntimeTextUpdate& update) {
         sanitizer_ = StreamingTerminalText{};
         rendered_.clear();
         preview_ = false;
+        // A new model round restarts the first-text rendering latch so the
+        // next actual write emits a fresh sample for the new turn.
+        rendered_emitted_ = false;
+        pending_request_id_ = update.task_id;
+    } else if (pending_request_id_.empty()) {
+        pending_request_id_ = update.task_id;
     }
     const auto safe = update.event.kind == ModelStreamEventKind::TextBlockEnd
         ? sanitizer_.finish() : sanitizer_.append(update.event.text);

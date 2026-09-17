@@ -3,11 +3,14 @@
 #include "adapters/anthropic/bounded_stream_json.h"
 
 #include "adapters/json/value_json.h"
+#include "domain/latency_trace.h"
 
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -127,7 +130,7 @@ std::string isolated_evidence_json(const EvidencePack& evidence) {
 
 Result<HttpRequest> make_request(const AnthropicConfig& config,
                                  const ModelRequest& request,
-                                 bool stream) {
+                                 const ModelCallOptions& options) {
     if (request.timeout_ms <= 0) {
         return failure<HttpRequest>(ErrorCode::InvalidInput,
                                     "model request timeout must be positive");
@@ -136,7 +139,7 @@ Result<HttpRequest> make_request(const AnthropicConfig& config,
     try {
         nlohmann::json body = {{"model", config.model},
                                {"max_tokens", config.max_tokens}};
-        if (stream) body["stream"] = true;
+        if (options.stream) body["stream"] = true;
         if (!request.system_prompt.empty() || !request.evidence.items.empty()) {
             std::string system = request.system_prompt;
             if (!request.evidence.items.empty()) {
@@ -182,7 +185,7 @@ Result<HttpRequest> make_request(const AnthropicConfig& config,
 
         return Result<HttpRequest>::success(
             {endpoint_for(config.base_url), std::move(headers), body.dump(),
-             request.timeout_ms});
+             request.timeout_ms, options.latency_request_id});
     } catch (...) {
         return failure<HttpRequest>(ErrorCode::InvalidInput,
                                     "model request cannot be encoded");
@@ -355,12 +358,32 @@ Result<ModelResponse> AnthropicMessagesClient::complete(
                                       "Anthropic adapter configuration is invalid");
     }
 
-    auto encoded = make_request(config_, request, options.stream);
+    auto encoded = make_request(config_, request, options);
     if (!encoded.has_value()) {
         return Result<ModelResponse>::failure(encoded.error());
     }
 
-    AnthropicStreamAssembler assembler(options.observer);
+    // T0 latency trace hook. We wrap the caller's stream observer so the
+    // first TextDelta produced by the assembler emits first_text_received
+    // against the same request id RuntimeEngine used to mark the turn. The
+    // flag is per-call and threadsafe for the single-consumer streaming path
+    // we own here.
+    const std::string trace_id = options.latency_request_id;
+    const ModelStreamObserver user_observer = options.observer;
+    ModelCallOptions trace_options = options;
+    trace_options.observer = nullptr;
+    auto first_text = std::make_shared<std::atomic_bool>(false);
+    if (!trace_id.empty() && user_observer) {
+        trace_options.observer = [user_observer, trace_id, first_text](
+            const ModelStreamEvent& event) {
+            if (event.kind == ModelStreamEventKind::TextDelta &&
+                !first_text->exchange(true)) {
+                emit_latency_sample(trace_id, kStageFirstTextReceived);
+            }
+            user_observer(event);
+        };
+    }
+    AnthropicStreamAssembler assembler(trace_options.observer);
     SseDecoder decoder([&](const SseEvent& event) { return assembler.consume(event); });
     std::optional<RuntimeError> stream_error;
     const HttpChunkObserver consume = [&](std::string_view bytes) {

@@ -27,9 +27,11 @@
 #include "cli/terminal_text.h"
 #include "cli/terminal_capabilities.h"
 #include "config/runtime_config.h"
+#include "domain/latency_trace.h"
 
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -65,8 +67,77 @@ private:
     std::function<void(const std::string&)> observer_;
 };
 
+// LatencyTraceSink writes LatencySample records to a JSONL file. It is
+// installed only when AGENT_LATENCY_TRACE_FILE points to a writable path;
+// otherwise the global observer stays null and emission becomes a no-op.
+class LatencyTraceSink {
+public:
+    explicit LatencyTraceSink(const std::filesystem::path& path)
+        : stream_(path, std::ios::out | std::ios::trunc) {
+        if (!stream_.is_open()) {
+            throw std::runtime_error("latency trace file could not be opened");
+        }
+    }
+    void operator()(const agent::LatencySample& sample) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stream_ << "{\"request_id\":\"" << escape(sample.request_id)
+                << "\",\"stage\":\"" << escape(sample.stage)
+                << "\",\"monotonic_us\":" << sample.monotonic_us << "}\n";
+        stream_.flush();
+    }
+private:
+    static std::string escape(const std::string& raw) {
+        std::string out;
+        out.reserve(raw.size());
+        for (const auto byte : raw) {
+            switch (byte) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (static_cast<unsigned char>(byte) < 0x20) {
+                    char buffer[8];
+                    std::snprintf(buffer, sizeof(buffer), "\\u%04x",
+                                  static_cast<unsigned char>(byte));
+                    out += buffer;
+                } else {
+                    out.push_back(byte);
+                }
+            }
+        }
+        return out;
+    }
+    std::mutex mutex_;
+    std::ofstream stream_;
+};
+
 int run_agent(std::vector<std::string> args) {
     try {
+        // T0 latency trace wiring. The trace file is opt-in via env so the
+        // production Ready EXE is unaffected unless the benchmark harness
+        // explicitly requests samples.
+        std::optional<LatencyTraceSink> trace_sink;
+        {
+            agent::ProcessEnvironment probe;
+            const auto trace_path = probe.get("AGENT_LATENCY_TRACE_FILE");
+            if (trace_path.has_value() && !trace_path->empty()) {
+                try {
+                    trace_sink.emplace(std::filesystem::u8path(*trace_path));
+                    agent::set_global_latency_observer(
+                        [&trace_sink](const agent::LatencySample& sample) {
+                            if (trace_sink.has_value()) (*trace_sink)(sample);
+                        });
+                } catch (const std::exception&) {
+                    std::cerr << "latency trace file could not be opened; "
+                                 "disabling trace\n";
+                    agent::set_global_latency_observer(nullptr);
+                }
+            }
+        }
+        agent::emit_latency_sample("process", agent::kStageProcessStart);
+
         auto startup = agent::parse_startup_arguments(args);
         if (!startup.has_value()) {
             std::cerr << startup.error().message << '\n';
@@ -373,6 +444,7 @@ int run_agent(std::vector<std::string> args) {
                 config.value().session_context.memory_enabled,
                 {terminal.dynamic(), startup.value().stream_enabled,
                  [&terminal] { return terminal.columns(); }});
+            agent::emit_latency_sample("process", agent::kStageMenuReady);
             return interactive.run();
         }
 

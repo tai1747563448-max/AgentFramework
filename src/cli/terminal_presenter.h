@@ -41,6 +41,12 @@ private:
     StreamingTerminalText sanitizer_;
     std::string rendered_;
     std::string phase_;
+    // T0 latency trace state. rendered_emitted_ latches the first time the
+    // presenter writes a real text chunk; pending_request_id_ remembers the
+    // task id from the most recent RuntimeTextUpdate so the sample can be
+    // attributed to the right turn.
+    bool rendered_emitted_{false};
+    std::string pending_request_id_;
 };
 
 }  // namespace agent

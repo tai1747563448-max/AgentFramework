@@ -18,6 +18,10 @@ struct HttpRequest {
     std::map<std::string, std::string> headers;
     std::string body;
     std::int64_t timeout_ms;
+    // Optional latency trace request id. Set by callers that have a stable
+    // task/turn identifier (currently RuntimeEngine); the cpr transport reads
+    // it to attribute the first_text_received sample to the right turn.
+    std::string latency_request_id;
 };
 
 struct HttpResponse {

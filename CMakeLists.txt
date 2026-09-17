@@ -47,6 +47,7 @@ target_include_directories(dotenv_header_only INTERFACE
 add_library(agent_kernel STATIC
     src/domain/value.cpp
     src/domain/evidence_validation.cpp
+    src/domain/latency_trace.cpp
     src/domain/runtime_event.cpp
     src/domain/session_event.cpp
     src/domain/memory_event.cpp

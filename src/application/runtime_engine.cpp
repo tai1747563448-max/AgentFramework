@@ -2,6 +2,7 @@
 
 #include "application/state_reducer.h"
 #include "domain/evidence_validation.h"
+#include "domain/latency_trace.h"
 #include "ports/cancellation.h"
 #include "ports/clock.h"
 #include "ports/event_store.h"
@@ -289,6 +290,10 @@ RuntimeResult RuntimeEngine::continue_task(
                 return transition;
             }
 
+            // T0 latency trace hook: emit the submit sample the moment the
+            // turn's evidence retrieval is about to start. The task id is
+            // used as the request id so all four canonical samples line up.
+            emit_latency_sample(task_id, kStageSubmit);
             auto evidence = knowledge_.retrieve(*state);
             if (!evidence.has_value()) {
                 return append_event(
@@ -413,6 +418,11 @@ RuntimeResult RuntimeEngine::continue_task(
             ModelCallOptions options;
             options.stream = presentation.stream;
             options.cancellation = &cancellation_;
+            // T0 latency trace: thread the task id into the cpr transport so
+            // the first_text_received and request_send samples can be matched
+            // with the submit and first_text_rendered samples of the same
+            // turn. The transport ignores the field when it is empty.
+            options.latency_request_id = task_id;
             // Evidence-backed responses are released only by the caller after
             // task completion and a successful session commit.
             if (presentation.stream && presentation.text_observer &&
