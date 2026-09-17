@@ -368,3 +368,119 @@ def test_verify_pack_rejects_invalid_tokenizer_fingerprint(tmp_path: Path) -> No
 
     with pytest.raises(PackError, match="vector metadata is invalid"):
         verify_complete_pack(root)
+
+
+def _upgrade_pack_to_schema3(root: Path, *, chunk_count: int) -> dict[str, object]:
+    vectors_path = root / "index" / "vectors.json"
+    payload = json.loads(vectors_path.read_text("utf-8"))
+    payload["schema_version"] = 3
+    payload["row_count"] = chunk_count
+    payload["sum_token_count"] = chunk_count * 5
+    payload["database_sha256"] = _sha256(root / "index" / "metadata.sqlite3")
+    payload["matrix_sha256"] = _sha256(root / "index" / "vectors.f16")
+    vectors_path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+        newline="",
+    )
+    manifest = json.loads((root / "pack.json").read_text("utf-8"))
+    for record in manifest["files"]:
+        if record["path"] == "index/vectors.json":
+            record["bytes"] = vectors_path.stat().st_size
+            record["sha256"] = _sha256(vectors_path)
+    (root / "pack.json").write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+        newline="",
+    )
+    return payload
+
+
+def test_verify_pack_accepts_schema3_vector_metadata(tmp_path: Path) -> None:
+    root = _minimal_pack(tmp_path / "pack", chunk_count=2)
+    _upgrade_pack_to_schema3(root, chunk_count=2)
+
+    manifest = verify_complete_pack(root)
+
+    assert manifest.chunk_count == 2
+    vectors = json.loads((root / "index" / "vectors.json").read_text("utf-8"))
+    assert vectors["schema_version"] == 3
+    assert vectors["row_count"] == 2
+    assert vectors["sum_token_count"] == 10
+
+
+def test_verify_pack_rejects_schema3_with_missing_row_count(tmp_path: Path) -> None:
+    root = _minimal_pack(tmp_path / "pack", chunk_count=2)
+    vectors_path = root / "index" / "vectors.json"
+    payload = json.loads(vectors_path.read_text("utf-8"))
+    payload["schema_version"] = 3
+    payload["row_count"] = 2
+    payload["sum_token_count"] = 10
+    payload["database_sha256"] = _sha256(root / "index" / "metadata.sqlite3")
+    payload["matrix_sha256"] = _sha256(root / "index" / "vectors.f16")
+    del payload["row_count"]
+    vectors_path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+        newline="",
+    )
+    manifest = json.loads((root / "pack.json").read_text("utf-8"))
+    for record in manifest["files"]:
+        if record["path"] == "index/vectors.json":
+            record["bytes"] = vectors_path.stat().st_size
+            record["sha256"] = _sha256(vectors_path)
+    (root / "pack.json").write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+        newline="",
+    )
+
+    with pytest.raises(PackError, match="vector metadata is invalid"):
+        verify_complete_pack(root)
+
+
+def test_verify_pack_rejects_schema3_with_inconsistent_row_count(tmp_path: Path) -> None:
+    root = _minimal_pack(tmp_path / "pack", chunk_count=2)
+    vectors_path = root / "index" / "vectors.json"
+    payload = json.loads(vectors_path.read_text("utf-8"))
+    payload["schema_version"] = 3
+    payload["row_count"] = 2
+    payload["sum_token_count"] = 10
+    payload["database_sha256"] = _sha256(root / "index" / "metadata.sqlite3")
+    payload["matrix_sha256"] = _sha256(root / "index" / "vectors.f16")
+    payload["row_count"] = 99
+    vectors_path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+        newline="",
+    )
+    manifest = json.loads((root / "pack.json").read_text("utf-8"))
+    for record in manifest["files"]:
+        if record["path"] == "index/vectors.json":
+            record["bytes"] = vectors_path.stat().st_size
+            record["sha256"] = _sha256(vectors_path)
+    (root / "pack.json").write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+        newline="",
+    )
+
+    with pytest.raises(PackError, match="vector metadata is invalid"):
+        verify_complete_pack(root)
+
+
+def test_verify_runtime_pack_accepts_legacy_schema2(tmp_path: Path) -> None:
+    """The runtime validator must accept legacy schema 2 packs; the
+    retriever then runs its legacy AVG fallback.  Old packs are not
+    auto-upgraded."""
+    root = _minimal_pack(tmp_path / "pack", chunk_count=2, runtime_assets=True)
+    vectors_path = root / "index" / "vectors.json"
+    payload = json.loads(vectors_path.read_text("utf-8"))
+    assert payload["schema_version"] == 2
+    assert "row_count" not in payload
+    assert "sum_token_count" not in payload
+
+    manifest = verify_runtime_pack(root)
+
+    assert manifest.chunk_count == 2
+

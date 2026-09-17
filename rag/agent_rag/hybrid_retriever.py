@@ -214,31 +214,76 @@ def _read_vector_metadata(index_root: Path) -> dict[str, object]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError, TypeError) as error:
         raise HybridRetrievalError("index artifacts are invalid") from error
-    keys = {
-        "schema_version",
-        "dtype",
-        "rows",
-        "dimensions",
-        "model",
-        "revision",
-        "tokenizer_sha256",
-        "matrix_sha256",
-        "database_sha256",
-    }
-    if (
-        type(value) is not dict
-        or set(value) != keys
-        or value["schema_version"] != 2
-        or type(value["schema_version"]) is not int
-        or value["dtype"] != "<f2"
-        or type(value["rows"]) is not int
-        or value["rows"] <= 0
-        or type(value["dimensions"]) is not int
-        or value["dimensions"] <= 0
-        or any(type(value[name]) is not str or not value[name] for name in keys - {"schema_version", "rows", "dimensions"})
-    ):
+    if type(value) is not dict or not value:
         raise HybridRetrievalError("index artifacts are invalid")
-    return value
+    schema_version = value.get("schema_version")
+    if schema_version == 3:
+        keys = {
+            "schema_version",
+            "dtype",
+            "rows",
+            "row_count",
+            "sum_token_count",
+            "dimensions",
+            "model",
+            "revision",
+            "tokenizer_sha256",
+            "matrix_sha256",
+            "database_sha256",
+        }
+        if (
+            type(schema_version) is not int
+            or set(value) != keys
+            or value["dtype"] != "<f2"
+            or type(value["rows"]) is not int
+            or value["rows"] <= 0
+            or type(value["row_count"]) is not int
+            or value["row_count"] <= 0
+            or value["row_count"] != value["rows"]
+            or type(value["sum_token_count"]) is not int
+            or value["sum_token_count"] <= 0
+            or type(value["dimensions"]) is not int
+            or value["dimensions"] <= 0
+            or any(
+                type(value[name]) is not str or not value[name]
+                for name in keys
+                - {"schema_version", "rows", "row_count", "sum_token_count", "dimensions"}
+            )
+        ):
+            raise HybridRetrievalError("index artifacts are invalid")
+        return value
+    if schema_version == 2:
+        keys = {
+            "schema_version",
+            "dtype",
+            "rows",
+            "dimensions",
+            "model",
+            "revision",
+            "tokenizer_sha256",
+            "matrix_sha256",
+            "database_sha256",
+        }
+        if (
+            type(schema_version) is not int
+            or set(value) != keys
+            or value["dtype"] != "<f2"
+            or type(value["rows"]) is not int
+            or value["rows"] <= 0
+            or type(value["dimensions"]) is not int
+            or value["dimensions"] <= 0
+            or any(
+                type(value[name]) is not str or not value[name]
+                for name in keys - {"schema_version", "rows", "dimensions"}
+            )
+        ):
+            raise HybridRetrievalError("index artifacts are invalid")
+        # Surface legacy as a v2 record with explicit markers; the constructor
+        # routes these to the slow AVG path.
+        legacy = dict(value)
+        legacy["legacy"] = True
+        return legacy
+    raise HybridRetrievalError("index artifacts are invalid")
 
 
 def _readonly_connection(
@@ -312,35 +357,108 @@ class HybridRetriever:
         )
         if progress is not None:
             progress("retriever-database", 1, 2)
-        try:
-            expected = {
-                "schema_version": "2",
-                "model": metadata["model"],
-                "revision": metadata["revision"],
-                "dimensions": str(metadata["dimensions"]),
-                "tokenizer_sha256": metadata["tokenizer_sha256"],
-                "rows": str(metadata["rows"]),
-            }
-            actual = dict(connection.execute("SELECT key, value FROM metadata"))
-            vector_rows = connection.execute(
-                "SELECT chunk_id, vector_row FROM chunks ORDER BY vector_row"
-            ).fetchall()
-            average_token_count = connection.execute(
-                "SELECT AVG(token_count) FROM chunks"
-            ).fetchone()[0]
-            if (
-                actual != expected
-                or len(vector_rows) != metadata["rows"]
-                or average_token_count is None
-                or average_token_count <= 0
-            ):
-                raise HybridRetrievalError("index artifacts are invalid")
-            if [row[1] for row in vector_rows] != list(range(metadata["rows"])):
-                raise HybridRetrievalError("index artifacts are invalid")
-        finally:
-            connection.close()
-        if progress is not None:
-            progress("retriever-database", 2, 2)
+        legacy = bool(metadata.get("legacy"))
+        if legacy:
+            # Schema 2 packs retain the original AVG fallback.  The retriever
+            # does not auto-upgrade an old pack; that must happen via
+            # scripts/upgrade_rag_index_metadata.py.
+            try:
+                expected = {
+                    "schema_version": "2",
+                    "model": metadata["model"],
+                    "revision": metadata["revision"],
+                    "dimensions": str(metadata["dimensions"]),
+                    "tokenizer_sha256": metadata["tokenizer_sha256"],
+                    "rows": str(metadata["rows"]),
+                }
+                actual = dict(connection.execute("SELECT key, value FROM metadata"))
+                vector_rows = connection.execute(
+                    "SELECT chunk_id, vector_row FROM chunks ORDER BY vector_row"
+                ).fetchall()
+                average_token_count = connection.execute(
+                    "SELECT AVG(token_count) FROM chunks"
+                ).fetchone()[0]
+                if (
+                    actual != expected
+                    or len(vector_rows) != metadata["rows"]
+                    or average_token_count is None
+                    or average_token_count <= 0
+                ):
+                    raise HybridRetrievalError("index artifacts are invalid")
+                if [row[1] for row in vector_rows] != list(range(metadata["rows"])):
+                    raise HybridRetrievalError("index artifacts are invalid")
+            finally:
+                connection.close()
+            if progress is not None:
+                progress("retriever-database", 2, 2)
+            self._row_ids = tuple(str(row[0]) for row in vector_rows)
+            self._average_token_count = float(average_token_count)
+        else:
+            # Schema 3 reads statistics from metadata and the (vector_row,
+            # chunk_id) mapping through the covering index.  The covering
+            # index keeps the read strictly bounded by the row count and
+            # avoids an AVG(token_count) full-table scan.
+            try:
+                metadata_rows = dict(connection.execute("SELECT key, value FROM metadata"))
+                expected_keys = {
+                    "schema_version",
+                    "model",
+                    "revision",
+                    "dimensions",
+                    "tokenizer_sha256",
+                    "rows",
+                    "row_count",
+                    "sum_token_count",
+                }
+                missing = expected_keys - set(metadata_rows)
+                if missing:
+                    raise HybridRetrievalError("index artifacts are invalid")
+                if (
+                    metadata_rows["schema_version"] != "3"
+                    or metadata_rows["model"] != metadata["model"]
+                    or metadata_rows["revision"] != metadata["revision"]
+                    or metadata_rows["dimensions"] != str(metadata["dimensions"])
+                    or metadata_rows["tokenizer_sha256"] != metadata["tokenizer_sha256"]
+                    or metadata_rows["rows"] != str(metadata["rows"])
+                ):
+                    raise HybridRetrievalError("index artifacts are invalid")
+                row_count = int(metadata_rows["row_count"])
+                sum_token_count = int(metadata_rows["sum_token_count"])
+                if row_count <= 0 or row_count != metadata["rows"]:
+                    raise HybridRetrievalError("index artifacts are invalid")
+                if sum_token_count <= 0:
+                    raise HybridRetrievalError("index artifacts are invalid")
+                index_names = {
+                    str(name[0])
+                    for name in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'index'"
+                    )
+                }
+                if "chunks_vector_row_cover" not in index_names:
+                    raise HybridRetrievalError("index artifacts are invalid")
+                vector_rows = connection.execute(
+                    "SELECT chunk_id, vector_row FROM chunks "
+                    "INDEXED BY chunks_vector_row_cover ORDER BY vector_row"
+                ).fetchall()
+                if len(vector_rows) != row_count:
+                    raise HybridRetrievalError("index artifacts are invalid")
+                if [row[1] for row in vector_rows] != list(range(row_count)):
+                    raise HybridRetrievalError("index artifacts are invalid")
+                observed_sum = sum(
+                    int(token_count)
+                    for (token_count,) in connection.execute(
+                        "SELECT token_count FROM chunks "
+                        "INDEXED BY chunks_vector_row_cover ORDER BY vector_row"
+                    )
+                )
+                if observed_sum != sum_token_count:
+                    raise HybridRetrievalError("index artifacts are invalid")
+            finally:
+                connection.close()
+            if progress is not None:
+                progress("retriever-database", 2, 2)
+            self._row_ids = tuple(str(row[0]) for row in vector_rows)
+            self._average_token_count = sum_token_count / row_count
         if embedding is not None:
             if progress is not None:
                 progress("retriever-embedding-check", 0, 1)
@@ -364,8 +482,6 @@ class HybridRetriever:
         self._embedding = embedding
         self._dense_min = float(dense_min)
         self._scan_rows = scan_rows
-        self._row_ids = tuple(str(row[0]) for row in vector_rows)
-        self._average_token_count = float(average_token_count)
         try:
             self._vectors = np.memmap(
                 vectors,

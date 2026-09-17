@@ -15,6 +15,8 @@ from typing import Any, Callable, Iterable
 BGE_M3_MODEL = "BAAI/bge-m3"
 BGE_M3_REVISION = "5617a9f61b028005a4858fdac845db406aefb181"
 PACK_SCHEMA_VERSION = 2
+INDEX_LEGACY_SCHEMA_VERSION = 2
+INDEX_SCHEMA_VERSION = 3
 EMBEDDING_DIMENSIONS = 1024
 
 _PACK_KEYS = {
@@ -31,7 +33,7 @@ _PACK_KEYS = {
     "files",
 }
 _FILE_KEYS = {"path", "bytes", "sha256"}
-_VECTOR_KEYS = {
+_LEGACY_VECTOR_KEYS = {
     "schema_version",
     "dtype",
     "rows",
@@ -41,6 +43,10 @@ _VECTOR_KEYS = {
     "tokenizer_sha256",
     "matrix_sha256",
     "database_sha256",
+}
+_VECTOR_KEYS = _LEGACY_VECTOR_KEYS | {
+    "row_count",
+    "sum_token_count",
 }
 _MODEL_LOCK_KEYS = {
     "schema_version",
@@ -479,11 +485,17 @@ def _verify_vectors(
         maximum=64 * 1024,
         label="vector metadata",
     )
-    if type(value) is not dict or set(value) != _VECTOR_KEYS:
+    schema_version = value.get("schema_version") if type(value) is dict else None
+    if schema_version == INDEX_SCHEMA_VERSION:
+        expected_keys = _VECTOR_KEYS
+    elif schema_version == INDEX_LEGACY_SCHEMA_VERSION:
+        expected_keys = _LEGACY_VECTOR_KEYS
+    else:
+        raise PackError("vector metadata is invalid")
+    if type(value) is not dict or set(value) != expected_keys:
         raise PackError("vector metadata is invalid")
     if (
-        value["schema_version"] != PACK_SCHEMA_VERSION
-        or value["dtype"] != "<f2"
+        value["dtype"] != "<f2"
         or type(value["rows"]) is not int
         or value["rows"] != manifest.chunk_count
         or type(value["dimensions"]) is not int
@@ -492,6 +504,14 @@ def _verify_vectors(
         or value["revision"] != manifest.embedding_revision
     ):
         raise PackError("pack counts are inconsistent")
+    if schema_version == INDEX_SCHEMA_VERSION:
+        if (
+            type(value.get("row_count")) is not int
+            or value["row_count"] != manifest.chunk_count
+            or type(value.get("sum_token_count")) is not int
+            or value["sum_token_count"] <= 0
+        ):
+            raise PackError("vector metadata is invalid")
     if (
         type(value["tokenizer_sha256"]) is not str
         or _SHA256.fullmatch(value["tokenizer_sha256"]) is None
@@ -574,13 +594,19 @@ def verify_runtime_pack(
         maximum=64 * 1024,
         label="vector metadata",
     )
-    if type(vector_value) is not dict or set(vector_value) != _VECTOR_KEYS:
+    schema_version = vector_value.get("schema_version") if type(vector_value) is dict else None
+    if schema_version == INDEX_SCHEMA_VERSION:
+        expected_vector_keys = _VECTOR_KEYS
+    elif schema_version == INDEX_LEGACY_SCHEMA_VERSION:
+        expected_vector_keys = _LEGACY_VECTOR_KEYS
+    else:
+        raise PackError("vector metadata is invalid")
+    if type(vector_value) is not dict or set(vector_value) != expected_vector_keys:
         raise PackError("vector metadata is invalid")
     vectors = records["index/vectors.f16"]
     database = records["index/metadata.sqlite3"]
     if (
-        vector_value["schema_version"] != PACK_SCHEMA_VERSION
-        or vector_value["dtype"] != "<f2"
+        vector_value["dtype"] != "<f2"
         or vector_value["rows"] != manifest.chunk_count
         or vector_value["dimensions"] != manifest.embedding_dimensions
         or vector_value["model"] != manifest.embedding_model
@@ -594,6 +620,14 @@ def verify_runtime_pack(
         or _SHA256.fullmatch(vector_value["tokenizer_sha256"]) is None
     ):
         raise PackError("pack counts are inconsistent")
+    if schema_version == INDEX_SCHEMA_VERSION:
+        if (
+            type(vector_value["row_count"]) is not int
+            or vector_value["row_count"] != manifest.chunk_count
+            or type(vector_value["sum_token_count"]) is not int
+            or vector_value["sum_token_count"] <= 0
+        ):
+            raise PackError("vector metadata is invalid")
     return manifest
 
 

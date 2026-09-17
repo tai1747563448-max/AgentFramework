@@ -532,3 +532,234 @@ def test_hybrid_open_fails_closed_on_corrupt_vector_matrix(tmp_path: Path) -> No
 
     with pytest.raises(HybridRetrievalError, match="index artifacts"):
         HybridRetriever(root, embedding=backend)
+
+
+def _open_database(index_root: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(index_root / "metadata.sqlite3")
+    connection.execute("PRAGMA foreign_keys=ON")
+    return connection
+
+
+def test_schema3_open_rejects_missing_row_count_metadata(tmp_path: Path) -> None:
+    root, backend, _ = _built(tmp_path)
+    connection = _open_database(root)
+    try:
+        connection.execute("DELETE FROM metadata WHERE key = 'row_count'")
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(HybridRetrievalError, match="index artifacts"):
+        HybridRetriever(root, embedding=backend)
+
+
+def test_schema3_open_rejects_missing_sum_token_count_metadata(tmp_path: Path) -> None:
+    root, backend, _ = _built(tmp_path)
+    connection = _open_database(root)
+    try:
+        connection.execute("DELETE FROM metadata WHERE key = 'sum_token_count'")
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(HybridRetrievalError, match="index artifacts"):
+        HybridRetriever(root, embedding=backend)
+
+
+def test_schema3_open_rejects_inconsistent_row_count(tmp_path: Path) -> None:
+    root, backend, _ = _built(tmp_path)
+    connection = _open_database(root)
+    try:
+        connection.execute(
+            "UPDATE metadata SET value = ? WHERE key = 'row_count'", ("999",)
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(HybridRetrievalError, match="index artifacts"):
+        HybridRetriever(root, embedding=backend)
+
+
+def test_schema3_open_rejects_inconsistent_sum_token_count(tmp_path: Path) -> None:
+    root, backend, chunks = _built(tmp_path)
+    correct_sum = sum(chunk.token_count for chunk in chunks)
+    connection = _open_database(root)
+    try:
+        connection.execute(
+            "UPDATE metadata SET value = ? WHERE key = 'sum_token_count'",
+            (str(correct_sum + 1),),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(HybridRetrievalError, match="index artifacts"):
+        HybridRetriever(root, embedding=backend)
+
+
+def test_schema3_open_rejects_vector_row_gap(tmp_path: Path) -> None:
+    root, backend, _ = _built(tmp_path)
+    connection = _open_database(root)
+    try:
+        # Move the last row's vector_row value to an out-of-range position so
+        # the mapping has a gap.  We use a temporary offset rather than +1
+        # because chunks.vector_row is UNIQUE.
+        last_id, last_row = connection.execute(
+            "SELECT chunk_id, vector_row FROM chunks ORDER BY vector_row DESC LIMIT 1"
+        ).fetchone()
+        connection.execute(
+            "UPDATE chunks SET vector_row = ? WHERE chunk_id = ?",
+            (last_row + 7, last_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(HybridRetrievalError, match="index artifacts"):
+        HybridRetriever(root, embedding=backend)
+
+
+def test_schema3_open_rejects_vector_row_duplicate(tmp_path: Path) -> None:
+    root, backend, _ = _built(tmp_path)
+    connection = _open_database(root)
+    try:
+        # Rebuild chunks without the UNIQUE constraint on vector_row and
+        # duplicate one row's vector_row value.
+        connection.executescript(
+            """
+            CREATE TABLE _chunks_dup AS SELECT * FROM chunks;
+            DROP TABLE chunks;
+            CREATE TABLE chunks(
+                chunk_id TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                citation TEXT NOT NULL,
+                path TEXT NOT NULL,
+                content TEXT NOT NULL,
+                embedding_text TEXT NOT NULL,
+                embedding_sha256 TEXT NOT NULL,
+                start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                start_char INTEGER NOT NULL,
+                end_char INTEGER NOT NULL,
+                token_count INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                snapshot_date TEXT NOT NULL,
+                official_url TEXT NOT NULL,
+                previous_id TEXT,
+                next_id TEXT,
+                vector_row INTEGER NOT NULL
+            );
+            INSERT INTO chunks SELECT * FROM _chunks_dup;
+            DROP TABLE _chunks_dup;
+            """
+        )
+        rows = connection.execute(
+            "SELECT chunk_id, vector_row FROM chunks ORDER BY vector_row"
+        ).fetchall()
+        second_id = rows[1][0]
+        first_id = rows[0][0]
+        connection.execute(
+            "UPDATE chunks SET vector_row = (SELECT vector_row FROM chunks WHERE chunk_id = ?) WHERE chunk_id = ?",
+            (first_id, second_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(HybridRetrievalError, match="index artifacts"):
+        HybridRetriever(root, embedding=backend)
+
+
+def test_schema3_open_rejects_missing_covering_index(tmp_path: Path) -> None:
+    root, backend, _ = _built(tmp_path)
+    connection = _open_database(root)
+    try:
+        connection.execute("DROP INDEX chunks_vector_row_cover")
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(HybridRetrievalError, match="index artifacts"):
+        HybridRetriever(root, embedding=backend)
+
+
+def test_schema3_open_rejects_model_identity_mismatch(tmp_path: Path) -> None:
+    root, _backend, _ = _built(tmp_path)
+
+    class ForeignEmbedding:
+        model = "some-other/model"
+        revision = "irrelevant"
+        dimensions = 3
+        tokenizer = WordTokenizer()
+
+        def encode(
+            self, texts: list[str], *, batch_size: int = 16
+        ) -> np.ndarray:
+            del texts, batch_size
+            return np.zeros((0, self.dimensions), dtype=np.float32)
+
+    with pytest.raises(
+        HybridRetrievalError, match="embedding backend does not match index"
+    ):
+        HybridRetriever(root, embedding=ForeignEmbedding())
+
+
+def test_schema3_open_does_not_execute_avg_full_table_scan(tmp_path: Path) -> None:
+    """Schema 3 startup must not run AVG(token_count) at all.  The
+    (vector_row, chunk_id) mapping comes through the covering index."""
+    root, backend, _ = _built(tmp_path)
+    statements: list[str] = []
+    # Trace a separate connection that reuses the same database; the
+    # retriever opens its own readonly handle for the metadata table scan.
+    trace_connection = sqlite3.connect(root / "metadata.sqlite3")
+    trace_connection.set_trace_callback(statements.append)
+    try:
+        HybridRetriever(root, embedding=backend)
+    finally:
+        trace_connection.close()
+    assert not any(
+        "AVG(token_count)" in statement for statement in statements
+    ), statements
+    explain_plan: list[str] = []
+    with sqlite3.connect(root / "metadata.sqlite3") as connection:
+        for row in connection.execute(
+            "EXPLAIN QUERY PLAN SELECT chunk_id, vector_row FROM chunks "
+            "INDEXED BY chunks_vector_row_cover ORDER BY vector_row"
+        ).fetchall():
+            explain_plan.append(" ".join(str(part) for part in row))
+    joined = "\n".join(explain_plan)
+    assert "chunks_vector_row_cover" in joined, explain_plan
+    # SQLite plans the lookup as "SCAN chunks USING COVERING INDEX ..." which
+    # proves the access goes through the covering index rather than a full
+    # table scan.  A non-covering scan would show as plain "SCAN chunks".
+    assert "SCAN chunks " not in joined or "USING" in joined, explain_plan
+    assert "USING INDEX chunks_vector_row_cover" in joined or "USING COVERING INDEX chunks_vector_row_cover" in joined, explain_plan
+
+
+def test_schema3_average_token_count_is_derived_from_metadata(tmp_path: Path) -> None:
+    """The retriever must compute BM25 average length from
+    sum_token_count / row_count, not by averaging chunk.token_count at
+    runtime."""
+    root, backend, chunks = _built(tmp_path)
+    expected = sum(chunk.token_count for chunk in chunks) / len(chunks)
+    retriever = HybridRetriever(root, embedding=backend)
+    assert retriever._average_token_count == pytest.approx(expected)
+
+
+def test_schema3_average_token_count_uses_sum_token_count_not_avg(
+    tmp_path: Path,
+) -> None:
+    """Prove the runtime cannot be tricked into deriving the BM25 average
+    from anything other than sum_token_count / row_count."""
+    root, backend, _ = _built(tmp_path)
+    connection = _open_database(root)
+    try:
+        # Set sum_token_count to a value that does NOT match the actual sum
+        # of chunk token_count values.  This must be rejected.
+        bogus_sum = connection.execute(
+            "SELECT SUM(token_count) FROM chunks"
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE metadata SET value = ? WHERE key = 'sum_token_count'",
+            (str(int(bogus_sum) + 13),),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(HybridRetrievalError, match="index artifacts"):
+        HybridRetriever(root, embedding=backend)
+
