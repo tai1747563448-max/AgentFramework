@@ -2,6 +2,7 @@
 
 #include <dotenv.h>
 #include <nlohmann/json.hpp>
+#include "adapters/json/strict_json.h"
 
 #include <algorithm>
 #include <charconv>
@@ -262,33 +263,13 @@ std::optional<nlohmann::json> read_strict_json_file(
         if ((!input.good() && !input.eof()) || bytes.empty()) {
             return std::nullopt;
         }
-        bool duplicate = false;
-        std::vector<std::set<std::string>> keys;
-        const nlohmann::json::parser_callback_t callback =
-            [&](int depth, nlohmann::json::parse_event_t event,
-                nlohmann::json& parsed) {
-                if (event == nlohmann::json::parse_event_t::object_start) {
-                    const auto index = static_cast<std::size_t>(depth + 1);
-                    if (keys.size() <= index) {
-                        keys.resize(index + 1);
-                    }
-                    keys[index].clear();
-                } else if (event == nlohmann::json::parse_event_t::key) {
-                    const auto index = static_cast<std::size_t>(depth);
-                    if (keys.size() <= index) {
-                        keys.resize(index + 1);
-                    }
-                    if (!keys[index].insert(parsed.get<std::string>()).second) {
-                        duplicate = true;
-                    }
-                }
-                return true;
-            };
-        auto value = nlohmann::json::parse(bytes, callback, true, false);
-        if (value.is_discarded() || duplicate) {
+        // T1: route through the two-phase strict parser so the duplicate-key
+        // SAX check stays linear and the DOM build is callback-free.
+        const auto result = parse_strict_json(bytes, maximum_bytes);
+        if (!result.value.has_value()) {
             return std::nullopt;
         }
-        return value;
+        return std::move(result.value);
     } catch (...) {
         return std::nullopt;
     }

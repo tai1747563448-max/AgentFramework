@@ -64,6 +64,7 @@ add_library(agent_kernel STATIC
     src/application/task_evaluator.cpp
     src/application/benchmark_statistics.cpp
     src/adapters/json/value_json.cpp
+    src/adapters/json/strict_json.cpp
     src/adapters/anthropic/cpr_http_transport.cpp
     src/adapters/anthropic/sse_decoder.cpp
     src/adapters/anthropic/anthropic_stream_assembler.cpp
@@ -196,6 +197,7 @@ add_agent_test(model_context_compactor_tests tests/application/model_context_com
 add_agent_test(model_memory_consolidator_tests tests/application/model_memory_consolidator_test.cpp)
 add_agent_test(memory_event_json_tests tests/adapters/memory_event_json_test.cpp)
 add_agent_test(jsonl_memory_store_tests tests/adapters/jsonl_memory_store_test.cpp)
+add_agent_test(strict_json_tests tests/adapters/strict_json_test.cpp)
 add_agent_test(session_engine_tests tests/application/session_engine_test.cpp)
 add_agent_test(runtime_engine_tests tests/application/runtime_engine_test.cpp)
 add_agent_test(task_evaluator_tests tests/application/task_evaluator_test.cpp)

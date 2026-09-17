@@ -1,6 +1,7 @@
 #include "adapters/rag/native_rag_pack_verifier.h"
 
 #include <nlohmann/json.hpp>
+#include "adapters/json/strict_json.h"
 
 #include <algorithm>
 #include <array>
@@ -226,27 +227,14 @@ std::optional<nlohmann::json> read_strict_json(
         if ((!input.good() && !input.eof()) || bytes.empty()) {
             return std::nullopt;
         }
-        bool duplicate = false;
-        std::vector<std::set<std::string>> keys;
-        const nlohmann::json::parser_callback_t callback =
-            [&](int depth, nlohmann::json::parse_event_t event,
-                nlohmann::json& parsed) {
-                if (event == nlohmann::json::parse_event_t::object_start) {
-                    const auto index = static_cast<std::size_t>(depth + 1);
-                    if (keys.size() <= index) keys.resize(index + 1);
-                    keys[index].clear();
-                } else if (event == nlohmann::json::parse_event_t::key) {
-                    const auto index = static_cast<std::size_t>(depth);
-                    if (keys.size() <= index) keys.resize(index + 1);
-                    if (!keys[index].insert(parsed.get<std::string>()).second) {
-                        duplicate = true;
-                    }
-                }
-                return true;
-            };
-        auto value = nlohmann::json::parse(bytes, callback, true, false);
-        if (value.is_discarded() || duplicate) return std::nullopt;
-        return value;
+        // T1: delegate to the two-phase strict parser so the duplicate-key
+        // check is O(n) and the DOM build avoids the nlohmann end_object
+        // discarded-element scan.
+        const auto result = parse_strict_json(bytes, maximum_bytes);
+        if (!result.value.has_value()) {
+            return std::nullopt;
+        }
+        return std::move(result.value);
     } catch (...) {
         return std::nullopt;
     }
