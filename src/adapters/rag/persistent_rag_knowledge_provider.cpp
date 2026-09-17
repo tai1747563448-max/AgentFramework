@@ -1,6 +1,7 @@
 #include "adapters/rag/persistent_rag_knowledge_provider.h"
 
 #include "adapters/rag/rag_protocol.h"
+#include "adapters/rag/task_evidence_cache.h"
 #include "adapters/workspace/workspace_text.h"
 
 #include <nlohmann/json.hpp>
@@ -168,6 +169,21 @@ Result<EvidencePack> PersistentRagKnowledgeProvider::retrieve(
         if (!ready.has_value()) {
             return Result<EvidencePack>::failure(ready.error());
         }
+        // T7: the lease/revision guard runs before the cache lookup so a
+        // stale entry cannot leak across pack rotations. The cache key
+        // captures every input that can change the result.
+        EvidenceCacheKey cache_key;
+        cache_key.task_id = state.task_id;
+        cache_key.workspace = state.workspace_utf8;
+        cache_key.query = state.issue;
+        cache_key.retrieval_revision = retrieval_revision_;
+        cache_key.mode = config_.mode;
+        cache_key.top_k = config_.top_k;
+        cache_key.max_total_bytes = config_.max_total_bytes;
+        if (const auto cached = evidence_cache_.lookup(cache_key);
+            cached.has_value()) {
+            return Result<EvidencePack>::success(*cached);
+        }
         const auto request_id = next_request_id();
         const nlohmann::json request{
             {"schema_version", 2},
@@ -192,6 +208,10 @@ Result<EvidencePack> PersistentRagKnowledgeProvider::retrieve(
             return decoded;
         }
         state_ = State::Ready;
+        // T7: cache successful immutable evidence. The store enforces the
+        // 32 KiB byte cap; larger packs stay out of the cache so the
+        // per-turn budget is never exceeded by a re-read.
+        evidence_cache_.store(cache_key, decoded.value());
         return decoded;
     } catch (...) {
         break_process();

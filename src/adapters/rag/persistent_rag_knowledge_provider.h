@@ -3,6 +3,7 @@
 #include "ports/jsonl_process.h"
 #include "ports/knowledge_provider.h"
 #include "ports/rag_pack_verifier.h"
+#include "adapters/rag/task_evidence_cache.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -51,6 +52,9 @@ private:
     State state_{State::Stopped};
     std::string retrieval_revision_;
     std::uint64_t request_sequence_{0};
+    // T7: one-slot task evidence cache. Cleared on task end or when the
+    // verifier rotates the pack.
+    TaskEvidenceCache evidence_cache_;
 };
 
 }  // namespace agent

@@ -93,6 +93,7 @@ add_library(agent_runtime STATIC
     src/adapters/rag/rag_protocol.cpp
     src/adapters/rag/native_rag_pack_verifier.cpp
     src/adapters/rag/persistent_rag_knowledge_provider.cpp
+    src/adapters/rag/task_evidence_cache.cpp
     src/adapters/build/cmake_tool_gateway.cpp
     src/adapters/tools/composite_tool_gateway.cpp
     src/adapters/system/system_clock.cpp
@@ -287,6 +288,8 @@ add_agent_test(native_rag_pack_verifier_tests
 target_link_libraries(native_rag_pack_verifier_tests PRIVATE agent_runtime)
 add_agent_test(persistent_rag_knowledge_provider_tests
     tests/adapters/persistent_rag_knowledge_provider_test.cpp)
+add_agent_test(task_evidence_cache_tests
+    tests/adapters/task_evidence_cache_test.cpp)
 target_link_libraries(persistent_rag_knowledge_provider_tests PRIVATE agent_runtime)
 add_agent_test(composite_tool_gateway_tests tests/adapters/composite_tool_gateway_test.cpp)
 target_link_libraries(composite_tool_gateway_tests PRIVATE agent_runtime)
