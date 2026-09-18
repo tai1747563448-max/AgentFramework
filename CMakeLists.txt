@@ -133,7 +133,8 @@ add_library(agent_runtime STATIC
     src/cli/terminal_presenter.cpp
     src/cli/picker.cpp
     src/cli/interactive_cli.cpp
-    src/cli/cli_app.cpp)
+    src/cli/cli_app.cpp
+    src/commands/registry.cpp)
 target_include_directories(agent_runtime PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(agent_runtime
     PUBLIC agent_kernel Threads::Threads
@@ -353,6 +354,8 @@ add_agent_test(dangerous_patterns_tests tests/services/dangerous_patterns_test.c
 target_link_libraries(dangerous_patterns_tests PRIVATE agent_kernel)
 add_agent_test(cost_tracker_tests tests/services/cost_tracker_test.cpp)
 target_link_libraries(cost_tracker_tests PRIVATE agent_kernel)
+add_agent_test(command_registry_tests tests/commands/registry_test.cpp)
+target_link_libraries(command_registry_tests PRIVATE agent_runtime)
 add_agent_test(reproc_jsonl_process_tests
     tests/adapters/reproc_jsonl_process_test.cpp)
 target_link_libraries(reproc_jsonl_process_tests PRIVATE
