@@ -242,11 +242,19 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                 state.status = TaskStatus::Failed;
                 return Result<void>::success();
             } else if constexpr (std::is_same_v<Payload, ToolCallStartedPayload>) {
+                // T01: allow batched ToolCallStarted so AwaitingTool can
+                // dispatch a window of concurrency-safe tools in parallel
+                // before any Succeeded arrives. The Started event matches
+                // the next pending slot past the already-started-but-not-
+                // yet-completed head; active_tool_call_id tracks the
+                // most-recent Started call (still useful as a recovery
+                // sentinel for the resume path).
+                const std::size_t started_count =
+                    state.next_tool_index + state.pending_tool_results.size();
                 if (state.status != TaskStatus::AwaitingTool ||
-                    state.active_tool_call_id.has_value() ||
-                    state.next_tool_index >= state.pending_tool_calls.size() ||
+                    started_count >= state.pending_tool_calls.size() ||
                     !(typed_payload.call ==
-                      state.pending_tool_calls.at(state.next_tool_index))) {
+                      state.pending_tool_calls.at(started_count))) {
                     return invalid_transition(
                         "tool call start does not match the next pending call");
                 }
@@ -255,21 +263,34 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                 return Result<void>::success();
             } else if constexpr (std::is_same_v<Payload, ToolCallSucceededPayload>) {
                 if (state.status != TaskStatus::AwaitingTool ||
-                    !state.active_tool_call_id.has_value() ||
-                    typed_payload.result.tool_call_id != *state.active_tool_call_id) {
+                    state.next_tool_index >= state.pending_tool_calls.size() ||
+                    typed_payload.result.tool_call_id !=
+                        state.pending_tool_calls.at(state.next_tool_index).id) {
                     return invalid_transition(
-                        "tool result does not match the active tool call");
+                        "tool result does not match the next pending call");
                 }
                 state.pending_tool_results.push_back(typed_payload.result);
-                state.active_tool_call_id.reset();
                 ++state.next_tool_index;
+                if (state.next_tool_index <
+                    state.pending_tool_calls.size()) {
+                    state.active_tool_call_id =
+                        state.pending_tool_calls.at(state.next_tool_index).id;
+                } else {
+                    state.active_tool_call_id.reset();
+                }
                 return Result<void>::success();
             } else if constexpr (std::is_same_v<Payload, ToolCallFailedPayload>) {
+                // T01 batched model: ToolCallFailed must still match the
+                // head (next_tool_index). Failure short-circuits the
+                // window; in-flight siblings' Started events stay on
+                // disk but never receive a completion, which is the
+                // intended fail-fast behaviour.
                 if (state.status != TaskStatus::AwaitingTool ||
-                    !state.active_tool_call_id.has_value() ||
-                    typed_payload.tool_call_id != *state.active_tool_call_id) {
+                    state.next_tool_index >= state.pending_tool_calls.size() ||
+                    typed_payload.tool_call_id !=
+                        state.pending_tool_calls.at(state.next_tool_index).id) {
                     return invalid_transition(
-                        "tool failure does not match the active tool call");
+                        "tool failure does not match the next pending call");
                 }
                 state.active_tool_call_id.reset();
                 state.terminal_error = typed_payload.error;

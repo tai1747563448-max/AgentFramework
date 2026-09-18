@@ -620,7 +620,11 @@ Result<RuntimeConfig> load_runtime_config(
         static_cast<std::size_t>(model_rounds.value()),
         static_cast<std::size_t>(tool_calls.value()),
         static_cast<std::int64_t>(task_seconds.value() * 1000),
-        static_cast<std::int64_t>(timeout_seconds.value() * 1000)};
+        static_cast<std::int64_t>(timeout_seconds.value() * 1000),
+        // T01: default 4 parallel tools per AwaitingTool window. A
+        // future AGENT_MAX_PARALLEL_TOOLS env var can lift this
+        // without touching the constructor (see T05 SettingSource).
+        static_cast<std::size_t>(4)};
     config.runtime_root = runtime_root_value.has_value()
                               ? std::filesystem::u8path(*runtime_root_value)
                               : std::filesystem::path("runtime_data");

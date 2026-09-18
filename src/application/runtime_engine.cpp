@@ -15,8 +15,10 @@
 #include <string>
 #include <cstdint>
 #include <chrono>
+#include <future>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace agent {
 namespace {
@@ -576,10 +578,15 @@ RuntimeResult RuntimeEngine::continue_task(
                 return invariant_failure(
                     "awaiting tool state has no pending call");
             }
-            const ToolCall call =
-                state->pending_tool_calls.at(state->next_tool_index);
-
+            // Recovery path: when active_tool_call_id is set, the
+            // reducer previously appended a ToolCallStarted but no
+            // matching Succeeded/Failed (resume from a partially
+            // dispatched call). Re-execute that single call before
+            // touching the batched window so the event log stays
+            // linear.
             if (state->active_tool_call_id.has_value()) {
+                const ToolCall call =
+                    state->pending_tool_calls.at(state->next_tool_index);
                 if (*state->active_tool_call_id != call.id) {
                     return invariant_failure(
                         "active tool identity does not match pending call");
@@ -590,16 +597,67 @@ RuntimeResult RuntimeEngine::continue_task(
                     is_terminal(state->status)) {
                     return transition;
                 }
-            } else {
-                auto transition = guard_external_call(
-                    state, task_id, started_at_ms, observer,
-                    "max_tool_calls", state->usage.tool_calls,
-                    state->budgets.max_tool_calls);
-                if (transition.fatal_error.has_value() ||
-                    is_terminal(state->status)) {
-                    return transition;
+                auto tool_result = tools_.execute(
+                    call, ToolExecutionContext{state->workspace_utf8});
+                if (!tool_result.has_value()) {
+                    return append_event(
+                        state, task_id,
+                        ToolCallFailedPayload{call.id, tool_result.error()},
+                        observer);
                 }
+                if (tool_result.value().tool_call_id != call.id) {
+                    return append_event(
+                        state, task_id,
+                        ToolCallFailedPayload{
+                            call.id,
+                            {ErrorCode::ProtocolFailure,
+                             "tool result ID does not match active tool call",
+                             false}},
+                        observer);
+                }
+                return append_event(
+                    state, task_id,
+                    ToolCallSucceededPayload{std::move(tool_result.value())},
+                    observer);
+            }
 
+            // T01: batched dispatch window. The window size is bounded by
+            // max_parallel_tools; concurrency-safe tools run via
+            // std::async inside the window while mutating tools run
+            // serially. Event order is preserved by emitting all
+            // ToolCallStarted before any execute() call and all
+            // Succeeded/Failed in next_tool_index order.
+            const std::size_t window_budget = std::max<std::size_t>(
+                1, state->budgets.max_parallel_tools);
+            const std::size_t remaining_calls =
+                state->pending_tool_calls.size() - state->next_tool_index;
+            const std::size_t window_size = std::min(window_budget, remaining_calls);
+            if (state->usage.tool_calls + window_size >
+                state->budgets.max_tool_calls) {
+                return append_event(
+                    state, task_id,
+                    TaskBudgetExceededPayload{
+                        "max_tool_calls",
+                        {ErrorCode::BudgetExceeded,
+                         "tool call budget exceeded", false}},
+                    observer);
+            }
+            auto transition = guard_external_call(
+                state, task_id, started_at_ms, observer,
+                "max_tool_calls", state->usage.tool_calls,
+                state->budgets.max_tool_calls);
+            if (transition.fatal_error.has_value() ||
+                is_terminal(state->status)) {
+                return transition;
+            }
+
+            // Emit ToolCallStarted for every call in the window before
+            // any execute() runs. The reducer accepts batched Started
+            // events as long as the call matches the next pending slot
+            // past any already-started-but-not-yet-completed head.
+            for (std::size_t offset = 0; offset < window_size; ++offset) {
+                const ToolCall& call = state->pending_tool_calls.at(
+                    state->next_tool_index + offset);
                 transition = append_event(
                     state, task_id, ToolCallStartedPayload{call}, observer);
                 if (transition.fatal_error.has_value()) {
@@ -607,31 +665,97 @@ RuntimeResult RuntimeEngine::continue_task(
                 }
             }
 
-            auto tool_result = tools_.execute(
-                call, ToolExecutionContext{state->workspace_utf8});
-            if (!tool_result.has_value()) {
-                return append_event(
-                    state, task_id,
-                    ToolCallFailedPayload{call.id, tool_result.error()},
-                    observer);
+            // Partition the window: tools that opted into
+            // concurrency_safe run in parallel; everything else
+            // (replace_text / write_file and any future mutating tool)
+            // runs serially in next_tool_index order.
+            std::vector<std::optional<Result<ToolResult>>> results(window_size);
+            struct PendingFuture {
+                std::size_t offset;
+                std::future<Result<ToolResult>> future;
+            };
+            std::vector<PendingFuture> futures;
+            futures.reserve(window_size);
+            std::vector<std::size_t> serial_offsets;
+            serial_offsets.reserve(window_size);
+            const ToolExecutionContext tool_context{state->workspace_utf8};
+            for (std::size_t offset = 0; offset < window_size; ++offset) {
+                const ToolCall& call = state->pending_tool_calls.at(
+                    state->next_tool_index + offset);
+                if (tools_.tool_is_concurrency_safe(call.name)) {
+                    futures.push_back(
+                        {offset,
+                         std::async(std::launch::async,
+                                    [&tools = tools_, call,
+                                     tool_context] {
+                                        return tools.execute(call,
+                                                              tool_context);
+                                    })});
+                } else {
+                    serial_offsets.push_back(offset);
+                }
             }
-            if (tool_result.value().tool_call_id != call.id) {
-                return append_event(
-                    state, task_id,
-                    ToolCallFailedPayload{
-                        call.id,
-                        {ErrorCode::ProtocolFailure,
-                         "tool result ID does not match active tool call",
-                         false}},
-                    observer);
+            // Collect the parallel futures. future::get blocks until
+            // each call's std::async task finishes; the std::async
+            // launch above already started them concurrently so wall
+            // time approximates max(individual durations) rather than
+            // their sum.
+            for (auto& pending : futures) {
+                try {
+                    results[pending.offset] = pending.future.get();
+                } catch (...) {
+                    results[pending.offset] = Result<ToolResult>::failure(
+                        {ErrorCode::PersistenceFailure,
+                         "tool dispatch threw an exception", false});
+                }
+            }
+            // Run the serial tools in window order so a slow
+            // mutating tool still blocks before the next parallel
+            // batch starts.
+            for (const std::size_t offset : serial_offsets) {
+                const ToolCall& call = state->pending_tool_calls.at(
+                    state->next_tool_index + offset);
+                results[offset] = tools_.execute(call, tool_context);
             }
 
-            auto transition = append_event(
-                state, task_id,
-                ToolCallSucceededPayload{std::move(tool_result.value())},
-                observer);
-            if (transition.fatal_error.has_value()) {
-                return transition;
+            // Emit ToolCallSucceeded / ToolCallFailed in
+            // next_tool_index order so the reducer advances
+            // pending_tool_calls deterministically.
+            for (std::size_t offset = 0; offset < window_size; ++offset) {
+                const ToolCall& call = state->pending_tool_calls.at(
+                    state->next_tool_index + offset);
+                const auto& tool_result = results[offset];
+                if (!tool_result.has_value() || !tool_result->has_value()) {
+                    transition = append_event(
+                        state, task_id,
+                        ToolCallFailedPayload{
+                            call.id,
+                            tool_result.has_value()
+                                ? tool_result->error()
+                                : RuntimeError{
+                                      ErrorCode::PersistenceFailure,
+                                      "tool dispatch produced no result",
+                                      false}},
+                        observer);
+                } else if (tool_result->value().tool_call_id != call.id) {
+                    transition = append_event(
+                        state, task_id,
+                        ToolCallFailedPayload{
+                            call.id,
+                            {ErrorCode::ProtocolFailure,
+                             "tool result ID does not match active tool call",
+                             false}},
+                        observer);
+                } else {
+                    transition = append_event(
+                        state, task_id,
+                        ToolCallSucceededPayload{
+                            std::move(tool_result->value())},
+                        observer);
+                }
+                if (transition.fatal_error.has_value()) {
+                    return transition;
+                }
             }
             continue;
         }

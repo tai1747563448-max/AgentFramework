@@ -27,6 +27,14 @@ struct RuntimeBudgets {
     std::size_t max_tool_calls{64};
     std::int64_t max_task_time_ms{1'800'000};
     std::int64_t model_timeout_ms{120'000};
+    // T01: maximum number of pending tool calls AwaitingTool will
+    // dispatch in a single pass. Read-only tools (concurrency_safe=true)
+    // run in parallel via std::async; mutating tools run serially in the
+    // same window. A value of 1 reproduces the pre-T01 single-call
+    // behaviour. The field is appended at the end of RuntimeBudgets so
+    // event_json.cpp's 4-arg aggregate initializer keeps mapping the
+    // existing JSON fields to their original slots.
+    std::size_t max_parallel_tools{4};
 };
 
 struct RuntimeUsage {
@@ -107,12 +115,14 @@ inline bool is_valid_session_id(std::string_view session_id) noexcept {
 inline bool has_positive_runtime_budgets(
     const RuntimeBudgets& budgets) noexcept {
     return budgets.max_model_rounds > 0 && budgets.max_tool_calls > 0 &&
+           budgets.max_parallel_tools > 0 &&
            budgets.max_task_time_ms > 0 && budgets.model_timeout_ms > 0;
 }
 
 inline bool operator==(const RuntimeBudgets& left, const RuntimeBudgets& right) {
     return left.max_model_rounds == right.max_model_rounds &&
            left.max_tool_calls == right.max_tool_calls &&
+           left.max_parallel_tools == right.max_parallel_tools &&
            left.max_task_time_ms == right.max_task_time_ms &&
            left.model_timeout_ms == right.model_timeout_ms;
 }
