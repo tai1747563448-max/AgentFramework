@@ -51,6 +51,7 @@ add_library(agent_kernel STATIC
     src/domain/runtime_event.cpp
     src/domain/session_event.cpp
     src/domain/memory_event.cpp
+    src/domain/task_type.cpp
     src/ports/stop_reason_codec.cpp
     src/application/state_reducer.cpp
     src/application/session_reducer.cpp
@@ -336,6 +337,8 @@ add_custom_target(mcp_fixture_copy ALL
         "${CMAKE_CURRENT_SOURCE_DIR}/rag/tests/mcp_fixture.py"
         "${CMAKE_BINARY_DIR}/mcp_fixture.py"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/rag/tests/mcp_fixture.py")
+add_agent_test(task_type_tests tests/domain/task_type_tests.cpp)
+target_link_libraries(task_type_tests PRIVATE agent_kernel)
 add_agent_test(reproc_jsonl_process_tests
     tests/adapters/reproc_jsonl_process_test.cpp)
 target_link_libraries(reproc_jsonl_process_tests PRIVATE

@@ -484,6 +484,41 @@ int run_agent(std::vector<std::string> args) {
             commands.permission_state_text = [permission]() {
                 return agent::serialise_permission_state(*permission);
             };
+            // T17 (v2 §3): /tasks snapshots the active (non-terminal)
+            // task list by walking every session and reading its durable
+            // last_task_status. Background tasks that the model spawned
+            // in earlier turns still surface here even when the
+            // foreground session has moved on to a new issue.
+            commands.active_tasks_text = [&session_engine]() {
+                auto listed = session_engine.list_sessions();
+                if (!listed.has_value()) {
+                    return std::string{"[]"};
+                }
+                std::ostringstream stream;
+                stream << "[";
+                bool first = true;
+                for (const auto& session : listed.value()) {
+                    if (!session.last_task_id.has_value() ||
+                        !session.last_task_status.has_value()) {
+                        continue;
+                    }
+                    const auto status = session.last_task_status.value();
+                    const bool active =
+                        status == agent::TaskStatus::Created ||
+                        status == agent::TaskStatus::PreparingContext ||
+                        status == agent::TaskStatus::AwaitingModel ||
+                        status == agent::TaskStatus::AwaitingTool;
+                    if (!active) continue;
+                    if (!first) stream << ",";
+                    first = false;
+                    stream << "{\"session_id\":\""
+                           << session.session_id
+                           << "\",\"task_id\":\"" << session.last_task_id.value()
+                           << "\",\"status\":\"" << status << "\"}";
+                }
+                stream << "]";
+                return stream.str();
+            };
             commands.list = [&] { return session_engine.list_sessions(); };
             commands.create = [&](const std::string& workspace) {
                 auto created = session_engine.create_session(

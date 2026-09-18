@@ -73,7 +73,29 @@ struct TaskState {
     std::vector<ToolResult> pending_tool_results;
     std::optional<std::string> final_text;
     std::optional<RuntimeError> terminal_error;
+    // T17 (v2 §3): marks a task the model has flagged as
+    // background so it should not block the foreground session.
+    // Background tasks still produce durable events but the
+    // session_engine treats their completion as advisory rather
+    // than gating.
+    bool background{false};
 };
+
+// T17 (v2 §3): taxonomy of background tasks the model can spawn.
+// local_bash wraps a host shell command, local_agent schedules
+// a child session that runs to completion in the background,
+// in_process_teammate spawns an in-process state machine for
+// sub-agent collaboration. The enum is forward-compatible with
+// v3's planned ProcessRunner / SessionEngine / RuntimeEngine
+// integrations; T17 only models the data path.
+enum class TaskType {
+    LocalBash,
+    LocalAgent,
+    InProcessTeammate,
+};
+
+const char* task_type_name(TaskType type);
+TaskType parse_task_type(std::string_view text);
 
 inline bool is_terminal(TaskStatus status) noexcept {
     return status == TaskStatus::Completed || status == TaskStatus::Failed ||
@@ -146,7 +168,8 @@ inline bool operator==(const TaskState& left, const TaskState& right) {
            left.next_tool_index == right.next_tool_index &&
            left.active_tool_call_id == right.active_tool_call_id &&
            left.pending_tool_results == right.pending_tool_results &&
-           left.final_text == right.final_text && left.terminal_error == right.terminal_error;
+           left.final_text == right.final_text && left.terminal_error == right.terminal_error &&
+           left.background == right.background;
 }
 
 }  // namespace agent

@@ -526,6 +526,24 @@ int InteractiveCli::run() {
             }
             continue;
         }
+        // T17 (v2 §3): /tasks lists the active (non-terminal) tasks
+        // the session has scheduled. The list is sourced from the
+        // session engine's snapshot callback so it survives restarts
+        // and reflects background tasks the foreground has spawned.
+        if (command_argument(line, "/tasks", argument)) {
+            if (!argument.empty()) {
+                error_ << "tasks takes no arguments\n";
+                continue;
+            }
+            if (commands_.active_tasks_text) {
+                output_ << render_terminal_text(
+                               commands_.active_tasks_text())
+                        << '\n';
+            } else {
+                output_ << "no active tasks\n";
+            }
+            continue;
+        }
         if (command_argument(line, "/forget", argument)) {
             if (!is_valid_memory_id(argument)) {
                 error_ << "forget requires a valid memory ID\n";

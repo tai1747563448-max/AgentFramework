@@ -58,6 +58,11 @@ struct InteractiveSessionCommands {
     // runtime was assembled without a Permission and the CLI prints a
     // "not configured" message instead.
     std::function<std::string()> permission_state_text;
+    // T17 (v2 §3): returns the active (non-terminal) task list as
+    // a small JSON document so /tasks can print it without reaching
+    // into SessionEngine internals. The snapshot is rebuilt on
+    // every REPL tick so background task state is always live.
+    std::function<std::string()> active_tasks_text;
 };
 
 struct InteractiveUiOptions {
