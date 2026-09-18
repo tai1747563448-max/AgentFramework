@@ -104,6 +104,10 @@ add_library(agent_runtime STATIC
     src/adapters/sandbox/sandbox_profile.cpp
     src/adapters/sandbox/seatbelt_sandbox.cpp
     src/adapters/permission/static_permission.cpp
+    src/adapters/mcp/json_rpc.cpp
+    src/adapters/mcp/stdio_client.cpp
+    src/adapters/mcp/server_registry.cpp
+    src/adapters/mcp/mcp_tool_gateway.cpp
     src/adapters/rag/rag_protocol.cpp
     src/adapters/rag/verified_pack_lease.cpp
     src/adapters/rag/native_rag_pack_verifier.cpp
@@ -310,6 +314,28 @@ add_agent_test(static_permission_tests tests/adapters/static_permission_tests.cp
 target_link_libraries(static_permission_tests PRIVATE agent_runtime)
 add_agent_test(stop_reason_codec_tests tests/ports/stop_reason_codec_tests.cpp)
 target_link_libraries(stop_reason_codec_tests PRIVATE agent_kernel)
+add_agent_test(mcp_json_rpc_tests tests/adapters/mcp_json_rpc_tests.cpp)
+target_link_libraries(mcp_json_rpc_tests PRIVATE agent_runtime)
+add_agent_test(mcp_stdio_client_tests tests/adapters/mcp_stdio_client_tests.cpp)
+target_link_libraries(mcp_stdio_client_tests PRIVATE
+    agent_runtime Threads::Threads)
+add_dependencies(mcp_stdio_client_tests mcp_fixture_copy)
+target_compile_definitions(mcp_stdio_client_tests PRIVATE
+    AGENT_MCP_FIXTURE_PATH="${CMAKE_BINARY_DIR}/mcp_fixture.py"
+    _CRT_SECURE_NO_WARNINGS)
+add_agent_test(mcp_server_registry_tests
+    tests/adapters/mcp_server_registry_tests.cpp)
+target_link_libraries(mcp_server_registry_tests PRIVATE
+    agent_runtime Threads::Threads)
+add_dependencies(mcp_server_registry_tests mcp_fixture_copy)
+target_compile_definitions(mcp_server_registry_tests PRIVATE
+    AGENT_MCP_FIXTURE_PATH="${CMAKE_BINARY_DIR}/mcp_fixture.py"
+    _CRT_SECURE_NO_WARNINGS)
+add_custom_target(mcp_fixture_copy ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/rag/tests/mcp_fixture.py"
+        "${CMAKE_BINARY_DIR}/mcp_fixture.py"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/rag/tests/mcp_fixture.py")
 add_agent_test(reproc_jsonl_process_tests
     tests/adapters/reproc_jsonl_process_test.cpp)
 target_link_libraries(reproc_jsonl_process_tests PRIVATE

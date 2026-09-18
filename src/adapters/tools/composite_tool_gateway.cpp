@@ -22,6 +22,23 @@ CompositeToolGateway::CompositeToolGateway(
     }
 }
 
+void CompositeToolGateway::register_runtime(
+    std::shared_ptr<ToolGateway> runtime_gateway) {
+    if (!runtime_gateway) {
+        return;
+    }
+    auto& gateway = *runtime_gateway;
+    for (auto& definition : gateway.definitions()) {
+        if (definition.name.empty() ||
+            !routes_.emplace(definition.name, &gateway).second) {
+            throw std::invalid_argument(
+                "tool definitions must have unique nonempty names");
+        }
+        definitions_.push_back(std::move(definition));
+    }
+    owned_gateways_.push_back(std::move(runtime_gateway));
+}
+
 std::vector<ToolDefinition> CompositeToolGateway::definitions() const {
     return definitions_;
 }
