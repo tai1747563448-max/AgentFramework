@@ -59,4 +59,14 @@ bool CompositeToolGateway::tool_is_read_only(
     return route->second->tool_is_read_only(name);
 }
 
+PermissionDecision CompositeToolGateway::tool_permission_decision(
+    const ToolCall& call,
+    const ToolExecutionContext& context) const {
+    const auto route = routes_.find(call.name);
+    if (route == routes_.end()) {
+        return PermissionDecision::Ask;
+    }
+    return route->second->tool_permission_decision(call, context);
+}
+
 }  // namespace agent

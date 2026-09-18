@@ -101,6 +101,7 @@ add_library(agent_runtime STATIC
     src/adapters/sandbox/sandbox_factory.cpp
     src/adapters/sandbox/sandbox_profile.cpp
     src/adapters/sandbox/seatbelt_sandbox.cpp
+    src/adapters/permission/static_permission.cpp
     src/adapters/rag/rag_protocol.cpp
     src/adapters/rag/verified_pack_lease.cpp
     src/adapters/rag/native_rag_pack_verifier.cpp
@@ -303,6 +304,8 @@ add_agent_test(bubblewrap_sandbox_tests tests/adapters/bubblewrap_sandbox_test.c
 target_link_libraries(bubblewrap_sandbox_tests PRIVATE agent_runtime)
 add_agent_test(sandbox_factory_tests tests/adapters/sandbox_factory_test.cpp)
 target_link_libraries(sandbox_factory_tests PRIVATE agent_runtime)
+add_agent_test(static_permission_tests tests/adapters/static_permission_tests.cpp)
+target_link_libraries(static_permission_tests PRIVATE agent_runtime)
 add_agent_test(reproc_jsonl_process_tests
     tests/adapters/reproc_jsonl_process_test.cpp)
 target_link_libraries(reproc_jsonl_process_tests PRIVATE

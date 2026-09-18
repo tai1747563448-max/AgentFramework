@@ -211,6 +211,11 @@ const std::vector<std::string>& known_setting_keys() {
         "AGENT_RAG_STARTUP_TIMEOUT_SECONDS",
         "AGENT_RAG_QUERY_TIMEOUT_SECONDS",
         "AGENT_RAG_PACK_ROOT",
+        // T11: permission mode (default / acceptEdits / plan /
+        // bypassPermissions / auto) and the JSON-encoded rule list
+        // ({"tool":"x","decision":"allow|deny|ask"} entries).
+        "AGENT_PERMISSION_MODE",
+        "AGENT_PERMISSION_RULES",
     };
     return keys;
 }

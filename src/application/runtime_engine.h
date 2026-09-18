@@ -22,6 +22,7 @@ class EventStore;
 class IdGenerator;
 class KnowledgeProvider;
 class ModelClient;
+class Permission;
 class ToolGateway;
 
 struct RuntimeTextUpdate {
@@ -103,7 +104,8 @@ public:
                   Cancellation& cancellation,
                   std::string model_name = {},
                   std::function<void()> reactive_compact_trigger = {},
-                  std::shared_ptr<HookChain> hook_chain = {});
+                  std::shared_ptr<HookChain> hook_chain = {},
+                  std::shared_ptr<Permission> permission = {});
 
     const std::string& model_name() const noexcept { return model_name_; }
 
@@ -151,6 +153,13 @@ private:
     // (preModelCall / postModelCall) are reserved for T11 Permission
     // and T19 Cost-tracker.
     std::shared_ptr<HookChain> hook_chain_;
+    // T11: optional Permission policy. When non-null, AwaitingTool
+    // queries check() for every call before dispatch. Allow proceeds,
+    // Deny synthesises a failed ToolResult, Ask is treated as Deny
+    // with reason "permission required" until T15 wires the REPL
+    // confirm loop. A null pointer short-circuits the check entirely
+    // (every call proceeds) so existing tests do not regress.
+    std::shared_ptr<Permission> permission_;
 };
 
 }  // namespace agent

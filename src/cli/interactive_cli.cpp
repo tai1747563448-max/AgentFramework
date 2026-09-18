@@ -507,6 +507,25 @@ int InteractiveCli::run() {
             }
             continue;
         }
+        // T11: /permissions surfaces the active mode + per-tool rules
+        // so users can verify their posture before issuing a prompt.
+        // The command does not (yet) drive an interactive confirm
+        // loop for Ask decisions - that integration lands with T15.
+        if (command_argument(line, "/permissions", argument)) {
+            if (argument == "list" || argument.empty()) {
+                if (commands_.permission_state_text) {
+                    output_ << render_terminal_text(
+                                   commands_.permission_state_text())
+                            << '\n';
+                } else {
+                    output_ << "permissions: not configured\n";
+                }
+            } else {
+                error_ << "permissions takes no argument (try /permissions "
+                          "list)\n";
+            }
+            continue;
+        }
         if (command_argument(line, "/forget", argument)) {
             if (!is_valid_memory_id(argument)) {
                 error_ << "forget requires a valid memory ID\n";

@@ -11,6 +11,7 @@
 #include "ports/id_generator.h"
 #include "ports/knowledge_provider.h"
 #include "ports/model_client.h"
+#include "ports/permission.h"
 #include "ports/tool_gateway.h"
 
 #include <nlohmann/json.hpp>
@@ -178,7 +179,8 @@ RuntimeEngine::RuntimeEngine(ModelClient& model,
                              Cancellation& cancellation,
                              std::string model_name,
                              std::function<void()> reactive_compact_trigger,
-                             std::shared_ptr<HookChain> hook_chain)
+                             std::shared_ptr<HookChain> hook_chain,
+                             std::shared_ptr<Permission> permission)
     : model_(model),
       tools_(tools),
       knowledge_(knowledge),
@@ -188,7 +190,8 @@ RuntimeEngine::RuntimeEngine(ModelClient& model,
       cancellation_(cancellation),
       model_name_(std::move(model_name)),
       reactive_compact_trigger_(std::move(reactive_compact_trigger)),
-      hook_chain_(std::move(hook_chain)) {}
+      hook_chain_(std::move(hook_chain)),
+      permission_(std::move(permission)) {}
 
 RuntimeResult RuntimeEngine::append_event(std::optional<TaskState>& state,
                                           const std::string& task_id,
@@ -740,6 +743,27 @@ RuntimeResult RuntimeEngine::continue_task(
                             observer);
                     }
                 }
+                // T11: permission check on the single-call recovery path
+                // mirrors the batched window below. Ask is treated as
+                // Deny until T15 wires the interactive confirm loop.
+                if (permission_) {
+                    const auto decision = permission_->check(
+                        call,
+                        ToolExecutionContext{state->workspace_utf8});
+                    if (decision != PermissionDecision::Allow) {
+                        auto denied_result = ToolResult{
+                            call.id,
+                            decision == PermissionDecision::Deny
+                                ? std::string("permission denied")
+                                : std::string("permission required"),
+                            true};
+                        return append_event(
+                            state, task_id,
+                            ToolCallSucceededPayload{
+                                std::move(denied_result)},
+                            observer);
+                    }
+                }
                 auto tool_result = tools_.execute(
                     call, ToolExecutionContext{state->workspace_utf8});
                 if (!tool_result.has_value()) {
@@ -846,6 +870,17 @@ RuntimeResult RuntimeEngine::continue_task(
                 }
             }
 
+            // T11: permission check, evaluated after the preToolUse
+            // hook chain so audit-logging hooks can still observe every
+            // attempted call. A Deny / Ask decision synthesises a failed
+            // ToolResult (same path as a hook denial) and never invokes
+            // the gateway. Ask is treated as Deny with reason
+            // "permission required" until the REPL wires an interactive
+            // confirm loop (T15). When permission_ is null the check is
+            // a no-op so existing tests / non-interactive callers keep
+            // their historical behaviour.
+            std::vector<bool> permission_denied(window_size, false);
+            std::vector<std::string> permission_reason(window_size);
             // Partition the window: tools that opted into
             // concurrency_safe run in parallel; everything else
             // (replace_text / write_file and any future mutating tool)
@@ -860,8 +895,24 @@ RuntimeResult RuntimeEngine::continue_task(
             std::vector<std::size_t> serial_offsets;
             serial_offsets.reserve(window_size);
             const ToolExecutionContext tool_context{state->workspace_utf8};
+            if (permission_) {
+                for (std::size_t offset = 0; offset < window_size; ++offset) {
+                    const ToolCall& call = state->pending_tool_calls.at(
+                        state->next_tool_index + offset);
+                    const auto decision = permission_->check(
+                        call, tool_context);
+                    if (decision != PermissionDecision::Allow) {
+                        permission_denied[offset] = true;
+                        permission_reason[offset] =
+                            decision == PermissionDecision::Deny
+                                ? "permission denied"
+                                : "permission required";
+                    }
+                }
+            }
             for (std::size_t offset = 0; offset < window_size; ++offset) {
                 if (pre_denied[offset]) continue;  // skip pre-denied
+                if (permission_denied[offset]) continue;  // skip permission-denied
                 const ToolCall& call = state->pending_tool_calls.at(
                     state->next_tool_index + offset);
                 if (tools_.tool_is_concurrency_safe(call.name)) {
@@ -909,6 +960,20 @@ RuntimeResult RuntimeEngine::continue_task(
                 ToolResult denied{call.id,
                                   std::string("hook denied: ") +
                                       pre_denial_reason[offset],
+                                  true};
+                results[offset] = Result<ToolResult>::success(
+                    std::move(denied));
+            }
+
+            // T11: permission-denied slots synthesise a result
+            // mirroring the hook-deny path. Both Deny and Ask funnel
+            // here until T15 introduces an interactive confirm loop.
+            for (std::size_t offset = 0; offset < window_size; ++offset) {
+                if (!permission_denied[offset]) continue;
+                const ToolCall& call = state->pending_tool_calls.at(
+                    state->next_tool_index + offset);
+                ToolResult denied{call.id,
+                                  permission_reason[offset],
                                   true};
                 results[offset] = Result<ToolResult>::success(
                     std::move(denied));

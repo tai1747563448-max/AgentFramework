@@ -15,6 +15,8 @@
 #include "adapters/tools/composite_tool_gateway.h"
 #include "adapters/workspace/workspace_tool_gateway.h"
 #include "application/runtime_engine.h"
+#include "adapters/permission/static_permission.h"
+#include "ports/permission.h"
 #include "application/memory_engine.h"
 #include "application/memory_maintenance_scheduler.h"
 #include "application/memory_policy.h"
@@ -312,9 +314,29 @@ int run_agent(std::vector<std::string> args) {
         agent::SystemClock clock;
         agent::RandomIdGenerator ids;
         agent::SignalCancellation cancellation;
+        // T11: assemble a StaticPermission from the layered settings.
+        // Default posture is "default" (read tools allowed, write tools
+        // prompt). Operators can switch to bypassPermissions via
+        // .agentrc.json or AGENT_PERMISSION_MODE. The shared_ptr is
+        // moved into the engine so the REPL's /permissions command can
+        // print the same state the runtime is enforcing.
+        std::shared_ptr<agent::StaticPermission> permission;
+        {
+            const auto mode_setting =
+                std::getenv("AGENT_PERMISSION_MODE");
+            const auto parsed = mode_setting == nullptr
+                                   ? agent::PermissionMode::Default
+                                   : agent::parse_permission_mode(mode_setting)
+                                         .value_or(
+                                             agent::PermissionMode::Default);
+            permission = std::make_shared<agent::StaticPermission>(parsed);
+        }
         agent::RuntimeEngine engine(model, tools, *knowledge, events, clock,
                                     ids, cancellation,
-                                    config.value().anthropic.model);
+                                    config.value().anthropic.model,
+                                    {},
+                                    nullptr,
+                                    permission);
 
         agent::RunCommand run = [&]
             (const agent::RunRequest& cli_request,
@@ -455,6 +477,12 @@ int run_agent(std::vector<std::string> args) {
             commands.cancellation_requested = [&] { return cancellation.requested(); };
             commands.set_phase_observer = [&](std::function<void(const std::string&)> observer) {
                 diagnostics.observe(std::move(observer));
+            };
+            // T11: surface the runtime's permission state to /permissions.
+            // Capturing the shared_ptr by value keeps the callback alive
+            // even after the engine goes out of scope.
+            commands.permission_state_text = [permission]() {
+                return agent::serialise_permission_state(*permission);
             };
             commands.list = [&] { return session_engine.list_sessions(); };
             commands.create = [&](const std::string& workspace) {

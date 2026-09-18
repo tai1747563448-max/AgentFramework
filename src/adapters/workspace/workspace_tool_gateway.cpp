@@ -807,4 +807,25 @@ bool WorkspaceToolGateway::tool_is_read_only(
     return found->second->isReadOnly();
 }
 
+// T11: workspace tools are first-party and the underlying filesystem
+// policy already enforces path containment, so read-only tools can be
+// permitted silently. The mutating tools (replace_text / write_file)
+// still require an Ask because the model can request large rewrites;
+// a separate permission layer (T22 sandbox profile, T21 dangerous
+// patterns) is expected to upgrade them to Allow when conditions are
+// met.
+PermissionDecision WorkspaceToolGateway::tool_permission_decision(
+    const ToolCall& call,
+    const ToolExecutionContext& context) const {
+    (void)context;
+    const auto found = tools_.find(call.name);
+    if (found == tools_.end()) {
+        return PermissionDecision::Ask;
+    }
+    if (found->second->isReadOnly()) {
+        return PermissionDecision::Allow;
+    }
+    return PermissionDecision::Ask;
+}
+
 }  // namespace agent

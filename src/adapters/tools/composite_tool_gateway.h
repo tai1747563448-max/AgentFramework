@@ -23,6 +23,9 @@ public:
         const std::string& name) const override;
     bool tool_is_read_only(
         const std::string& name) const override;
+    PermissionDecision tool_permission_decision(
+        const ToolCall& call,
+        const ToolExecutionContext& context) const override;
 
 private:
     std::vector<ToolDefinition> definitions_;

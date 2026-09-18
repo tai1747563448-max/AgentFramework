@@ -52,6 +52,12 @@ struct InteractiveSessionCommands {
     std::function<void()> cancel_turn;
     std::function<bool()> cancellation_requested;
     std::function<void(std::function<void(const std::string&)>)> set_phase_observer;
+    // T11: returns the current permission state as a small JSON
+    // document so /permissions can print it without depending on the
+    // underlying StaticPermission type. Empty string means the
+    // runtime was assembled without a Permission and the CLI prints a
+    // "not configured" message instead.
+    std::function<std::string()> permission_state_text;
 };
 
 struct InteractiveUiOptions {

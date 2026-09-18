@@ -3,6 +3,7 @@
 #include "domain/model_types.h"
 #include "domain/result.h"
 #include "domain/value.h"
+#include "ports/permission.h"
 
 #include <functional>
 #include <memory>
@@ -103,6 +104,18 @@ public:
         const std::string& name) const {
         (void)name;
         return false;
+    }
+
+    // T11: per-tool permission descriptor. The default fail-closed
+    // answer is "ask" so a gateway that forgets to override the hook
+    // cannot silently allow risky operations. T22 sandbox profiles and
+    // T21 dangerous_patterns are expected to layer on top later.
+    virtual PermissionDecision tool_permission_decision(
+        const ToolCall& call,
+        const ToolExecutionContext& context) const {
+        (void)call;
+        (void)context;
+        return PermissionDecision::Ask;
     }
 };
 
