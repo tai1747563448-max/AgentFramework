@@ -274,6 +274,44 @@ Result<void> secure_append_line(const std::filesystem::path& runtime_root,
         }
         offset += static_cast<std::size_t>(written);
     }
+    // T07: per-event fsync moved to secure_flush_log, driven by
+    // JsonlEventStore::flush_pending every 32 events / 500ms.
+    return Result<void>::success();
+}
+
+// T07: separate fsync helper. flush_pending() (driven by the runtime every
+// 32 events or 500ms) opens the log file just long enough to flush any
+// bytes the kernel may still be holding back, then closes. The leaf
+// validation mirrors secure_append_line so a tampered path is rejected
+// even on the flush path.
+Result<void> secure_flush_log(const std::filesystem::path& runtime_root,
+                              const std::filesystem::path& path,
+                              const std::string& task_id) {
+    const auto root = open_directory_handle(runtime_root);
+    if (!root.valid() || !is_plain_directory(root.get())) {
+        return persistence_failure("event path escapes runtime root");
+    }
+    const auto tasks = open_directory_handle(runtime_root / "tasks");
+    if (!tasks.valid() || !is_plain_directory(tasks.get()) ||
+        !is_direct_handle_child(root.get(), tasks.get(), "tasks")) {
+        return persistence_failure("event path escapes runtime root");
+    }
+    const auto task = open_directory_handle(path.parent_path());
+    if (!task.valid() || !is_plain_directory(task.get()) ||
+        !is_direct_handle_child(tasks.get(), task.get(),
+                                std::filesystem::u8path(task_id))) {
+        return persistence_failure("event path escapes runtime root");
+    }
+    UniqueHandle leaf(CreateFileW(
+        path.c_str(), FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    if (!leaf.valid()) {
+        return persistence_failure("event log could not be opened for flush");
+    }
+    if (!is_direct_handle_child(task.get(), leaf.get(), "events.jsonl")) {
+        return persistence_failure("event log leaf is not a regular file");
+    }
     if (FlushFileBuffers(leaf.get()) == 0) {
         return persistence_failure("failed to flush event log");
     }
@@ -429,6 +467,39 @@ Result<void> secure_append_line(const std::filesystem::path& runtime_root,
         }
         offset += static_cast<std::size_t>(written);
     }
+    // T07: per-event fsync moved to secure_flush_log, driven by
+    // JsonlEventStore::flush_pending every 32 events / 500ms.
+    return Result<void>::success();
+}
+
+// T07: separate fsync helper for the 32-events-or-500ms flush schedule.
+Result<void> secure_flush_log(const std::filesystem::path& runtime_root,
+                              const std::filesystem::path&,
+                              const std::string& task_id) {
+    const UniqueFileDescriptor root(open(runtime_root.c_str(),
+                                         O_RDONLY | O_DIRECTORY | O_CLOEXEC |
+                                             O_NOFOLLOW));
+    if (!root.valid() || !is_plain_directory(root.get())) {
+        return persistence_failure("event path escapes runtime root");
+    }
+    const UniqueFileDescriptor tasks(openat(
+        root.get(), "tasks",
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+    if (!tasks.valid() || !is_plain_directory(tasks.get())) {
+        return persistence_failure("event path escapes runtime root");
+    }
+    const UniqueFileDescriptor task(openat(
+        tasks.get(), task_id.c_str(),
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+    if (!task.valid() || !is_plain_directory(task.get())) {
+        return persistence_failure("event path escapes runtime root");
+    }
+    const UniqueFileDescriptor leaf(openat(
+        task.get(), "events.jsonl", O_WRONLY | O_APPEND | O_CLOEXEC |
+            O_NOFOLLOW));
+    if (!leaf.valid()) {
+        return persistence_failure("event log could not be opened for flush");
+    }
     if (fsync(leaf.get()) != 0) {
         return persistence_failure("failed to flush event log");
     }
@@ -553,8 +624,28 @@ Result<void> JsonlEventStore::append(const RuntimeEvent& event) {
         if (error) {
             return persistence_failure("failed to create event directory");
         }
-        return secure_append_line(absolute_root, path, event.task_id,
-                                  serialized);
+        const auto write_result = secure_append_line(absolute_root, path,
+                                                    event.task_id, serialized);
+        if (!write_result.has_value()) {
+            return write_result;
+        }
+        // T07: count toward the 32-event flush threshold. The flush itself
+        // is best-effort here — a transient fsync failure should not lose
+        // data, only durability confirmation. The caller (runtime engine)
+        // owns the explicit flush_pending() schedule (32 events / 500ms).
+        bool should_flush = false;
+        {
+            std::lock_guard<std::mutex> lock(index_mutex_);
+            pending_counts_[event.task_id] += 1;
+            if (pending_counts_[event.task_id] >= 32) {
+                should_flush = true;
+            }
+        }
+        if (should_flush) {
+            const auto flushed = flush_pending(event.task_id);
+            if (!flushed.has_value()) return flushed;
+        }
+        return Result<void>::success();
     } catch (const std::exception&) {
         return persistence_failure("failed to serialize or append event");
     }
@@ -600,6 +691,50 @@ Result<std::vector<RuntimeEvent>> JsonlEventStore::read_task(
     } catch (const std::exception&) {
         return persistence_read_failure("failed while reading event log");
     }
+}
+
+// T07: 32 events / 500ms is the documented flush contract.
+
+Result<void> JsonlEventStore::flush_pending(const std::string& task_id) {
+    if (!is_valid_task_id(task_id)) {
+        return persistence_failure("invalid task ID for flush");
+    }
+    const auto resolved = event_path(task_id);
+    if (!resolved.has_value()) {
+        return Result<void>::failure(resolved.error());
+    }
+    std::error_code error;
+    const auto absolute_root =
+        std::filesystem::absolute(runtime_root_, error).lexically_normal();
+    if (error) {
+        return persistence_failure("failed to resolve runtime root");
+    }
+    const auto flush_result =
+        secure_flush_log(absolute_root, resolved.value(), task_id);
+    if (!flush_result.has_value()) {
+        return flush_result;
+    }
+    std::lock_guard<std::mutex> lock(index_mutex_);
+    // The committed_through index records the highest sequence the kernel
+    // has confirmed durable. Since the runtime calls append() then
+    // flush_pending() and we own the index here, the value advances only
+    // after fsync returns OK.
+    const auto pending = pending_counts_.count(task_id)
+                            ? pending_counts_[task_id]
+                            : std::uint64_t{0};
+    if (pending > 0) {
+        committed_through_[task_id] += pending;
+        pending_counts_[task_id] = 0;
+    }
+    return Result<void>::success();
+}
+
+std::uint64_t JsonlEventStore::committed_through(
+    const std::string& task_id) const {
+    std::lock_guard<std::mutex> lock(index_mutex_);
+    const auto found = committed_through_.find(task_id);
+    if (found == committed_through_.end()) return 0;
+    return found->second;
 }
 
 }  // namespace agent

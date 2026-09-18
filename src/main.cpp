@@ -72,6 +72,11 @@ private:
 // LatencyTraceSink writes LatencySample records to a JSONL file. It is
 // installed only when AGENT_LATENCY_TRACE_FILE points to a writable path;
 // otherwise the global observer stays null and emission becomes a no-op.
+//
+// T07: batching. Per-sample fflush() was the second fsync hotspot after
+// JsonlEventStore. The sink now buffers up to 32 samples or 500ms, then
+// writes the whole batch with a single flush. The destructor still drains
+// any pending samples so the trace file is closed in a durable state.
 class LatencyTraceSink {
 public:
     explicit LatencyTraceSink(const std::filesystem::path& path)
@@ -79,15 +84,38 @@ public:
         if (!stream_.is_open()) {
             throw std::runtime_error("latency trace file could not be opened");
         }
+        last_flush_ = std::chrono::steady_clock::now();
+    }
+    ~LatencyTraceSink() {
+        try { flush_locked(); } catch (...) {}
     }
     void operator()(const agent::LatencySample& sample) {
         std::lock_guard<std::mutex> lock(mutex_);
-        stream_ << "{\"request_id\":\"" << escape(sample.request_id)
-                << "\",\"stage\":\"" << escape(sample.stage)
-                << "\",\"monotonic_us\":" << sample.monotonic_us << "}\n";
-        stream_.flush();
+        buffer_ += "{\"request_id\":\"" + escape(sample.request_id)
+                + "\",\"stage\":\"" + escape(sample.stage)
+                + "\",\"monotonic_us\":"
+                + std::to_string(sample.monotonic_us) + "}\n";
+        ++pending_;
+        const auto now = std::chrono::steady_clock::now();
+        if (pending_ >= kBatchThreshold ||
+            now - last_flush_ >= kBatchInterval) {
+            flush_locked();
+        }
     }
 private:
+    // 32 samples / 500ms — same cadence as JsonlEventStore so the trace
+    // file does not get ahead of the WAL during a bursty turn.
+    static constexpr std::size_t kBatchThreshold = 32;
+    static constexpr std::chrono::milliseconds kBatchInterval{500};
+
+    void flush_locked() {
+        if (pending_ == 0) return;
+        stream_ << buffer_;
+        stream_.flush();
+        buffer_.clear();
+        pending_ = 0;
+        last_flush_ = std::chrono::steady_clock::now();
+    }
     static std::string escape(const std::string& raw) {
         std::string out;
         out.reserve(raw.size());
@@ -113,6 +141,9 @@ private:
     }
     std::mutex mutex_;
     std::ofstream stream_;
+    std::string buffer_;
+    std::size_t pending_{0};
+    std::chrono::steady_clock::time_point last_flush_;
 };
 
 int run_agent(std::vector<std::string> args) {
