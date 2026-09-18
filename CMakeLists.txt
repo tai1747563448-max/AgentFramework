@@ -134,7 +134,8 @@ add_library(agent_runtime STATIC
     src/cli/picker.cpp
     src/cli/interactive_cli.cpp
     src/cli/cli_app.cpp
-    src/commands/registry.cpp)
+    src/commands/registry.cpp
+    src/composition/engine.cpp)
 target_include_directories(agent_runtime PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(agent_runtime
     PUBLIC agent_kernel Threads::Threads
@@ -240,6 +241,8 @@ add_agent_test(strict_json_tests tests/adapters/strict_json_test.cpp)
 add_agent_test(session_engine_tests tests/application/session_engine_test.cpp)
 add_agent_test(runtime_engine_tests tests/application/runtime_engine_test.cpp)
 add_agent_test(continue_reason_tests tests/application/continue_reason_test.cpp)
+add_agent_test(engine_tests tests/composition/engine_test.cpp)
+target_link_libraries(engine_tests PRIVATE agent_runtime)
 add_agent_test(hook_chain_tests tests/application/hook_chain_test.cpp)
 add_agent_test(task_evaluator_tests tests/application/task_evaluator_test.cpp)
 add_agent_test(benchmark_statistics_tests
