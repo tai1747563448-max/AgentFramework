@@ -4,10 +4,12 @@
 
 #include "adapters/json/value_json.h"
 #include "domain/latency_trace.h"
+#include "util/retry_with_backoff.h"
 
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -383,47 +385,76 @@ Result<ModelResponse> AnthropicMessagesClient::complete(
             user_observer(event);
         };
     }
-    AnthropicStreamAssembler assembler(trace_options.observer);
-    SseDecoder decoder([&](const SseEvent& event) { return assembler.consume(event); });
-    std::optional<RuntimeError> stream_error;
-    const HttpChunkObserver consume = [&](std::string_view bytes) {
-        if (cancelled()) return false;
-        const auto result = decoder.feed(bytes);
-        if (!result.has_value()) stream_error = result.error();
-        return result.has_value();
-    };
-    auto response = options.stream
-        ? transport_.post_stream(encoded.value(), consume, options.cancellation)
-        : transport_.post(encoded.value(), options.cancellation);
-    if (cancelled() || (!response.has_value() && response.error().code == ErrorCode::Cancelled)) {
-        return failure<ModelResponse>(ErrorCode::Cancelled, "provider request cancelled");
-    }
-    if (stream_error) return Result<ModelResponse>::failure(*stream_error);
-    if (!response.has_value()) {
-        if (response.error().code == ErrorCode::RequestTimeout) {
-            return failure<ModelResponse>(ErrorCode::RequestTimeout,
-                                          "provider request timed out", true);
-        }
-        if (response.error().code == ErrorCode::ProtocolFailure) {
-            return failure<ModelResponse>(ErrorCode::ProtocolFailure, "provider stream is invalid");
-        }
-        return failure<ModelResponse>(ErrorCode::TransportFailure,
-                                      "provider transport failed", true);
-    }
-
-    if (response.value().status < 200 || response.value().status >= 300) {
-        return failure<ModelResponse>(ErrorCode::HttpFailure,
-                                      "provider returned a non-success status",
-                                      response.value().status >= 500);
-    }
-    if (options.stream && http_response_is_event_stream(response.value())) {
-        const auto framed = decoder.finish();
-        if (!framed.has_value()) return Result<ModelResponse>::failure(framed.error());
-        const auto assembled = assembler.finish();
-        if (!assembled.has_value()) return Result<ModelResponse>::failure(assembled.error());
-        response.value().body = assembled.value();
-    }
-    return decode_response(response.value(), options.stream);
+    // T02 (v2 §1): retry 5xx / TransportFailure / RequestTimeout with
+    // exponential backoff (base 500ms, cap 8s, ±20% jitter, max 3
+    // attempts). 429 and 4xx fail-fast because the existing retryable
+    // flag already discriminates them. The attempt lambda is the
+    // original single-call body; each retry creates fresh
+    // assembler/decoder so a partial stream from the prior attempt
+    // cannot leak into the next one.
+    const BackoffPolicy retry_policy{};
+    return retry_with_backoff(
+        retry_policy, options.cancellation,
+        [&]() -> Result<ModelResponse> {
+            AnthropicStreamAssembler assembler(trace_options.observer);
+            SseDecoder decoder(
+                [&](const SseEvent& event) { return assembler.consume(event); });
+            std::optional<RuntimeError> stream_error;
+            const HttpChunkObserver consume = [&](std::string_view bytes) {
+                if (cancelled()) return false;
+                const auto result = decoder.feed(bytes);
+                if (!result.has_value()) stream_error = result.error();
+                return result.has_value();
+            };
+            auto response = options.stream
+                ? transport_.post_stream(encoded.value(), consume,
+                                         options.cancellation)
+                : transport_.post(encoded.value(), options.cancellation);
+            if (cancelled() || (!response.has_value() &&
+                                response.error().code == ErrorCode::Cancelled)) {
+                return failure<ModelResponse>(ErrorCode::Cancelled,
+                                              "provider request cancelled");
+            }
+            if (stream_error) return Result<ModelResponse>::failure(*stream_error);
+            if (!response.has_value()) {
+                if (response.error().code == ErrorCode::RequestTimeout) {
+                    return failure<ModelResponse>(ErrorCode::RequestTimeout,
+                                                  "provider request timed out", true);
+                }
+                if (response.error().code == ErrorCode::ProtocolFailure) {
+                    return failure<ModelResponse>(ErrorCode::ProtocolFailure,
+                                                  "provider stream is invalid");
+                }
+                return failure<ModelResponse>(ErrorCode::TransportFailure,
+                                              "provider transport failed", true);
+            }
+            if (response.value().status < 200 || response.value().status >= 300) {
+                return failure<ModelResponse>(
+                    ErrorCode::HttpFailure,
+                    "provider returned a non-success status",
+                    response.value().status >= 500);
+            }
+            if (options.stream &&
+                http_response_is_event_stream(response.value())) {
+                const auto framed = decoder.finish();
+                if (!framed.has_value()) {
+                    return Result<ModelResponse>::failure(framed.error());
+                }
+                const auto assembled = assembler.finish();
+                if (!assembled.has_value()) {
+                    return Result<ModelResponse>::failure(assembled.error());
+                }
+                response.value().body = assembled.value();
+            }
+            return decode_response(response.value(), options.stream);
+        },
+        [&trace_id](std::size_t attempt,
+                    std::chrono::steady_clock::time_point) {
+            (void)attempt;
+            if (!trace_id.empty()) {
+                emit_latency_sample(trace_id, kStageProviderRetry);
+            }
+        });
 }
 
 }  // namespace agent
