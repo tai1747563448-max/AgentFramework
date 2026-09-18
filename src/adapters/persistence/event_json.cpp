@@ -231,9 +231,12 @@ Json content_block_to_json(const ContentBlock& block) {
                 return {{"type", "text"}, {"text", typed.text}};
             } else if constexpr (std::is_same_v<Block, ToolUseBlock>) {
                 return {{"type", "tool_use"}, {"call", tool_call_to_json(typed.call)}};
-            } else {
+            } else if constexpr (std::is_same_v<Block, ToolResultBlock>) {
                 return {{"type", "tool_result"},
                         {"result", tool_result_to_json(typed.result)}};
+            } else {
+                // T25: CompactRequestBlock round-trips as {type, reason}.
+                return {{"type", "compact_request"}, {"reason", typed.reason}};
             }
         },
         block);
@@ -253,6 +256,14 @@ ContentBlock content_block_from_json(const Json& json) {
     if (type == "tool_result") {
         require_exact_keys(json, {"type", "result"});
         return ToolResultBlock{tool_result_from_json(json.at("result"))};
+    }
+    if (type == "compact_request") {
+        // T25: missing reason is allowed and yields an empty string.
+        std::string reason;
+        if (json.contains("reason") && json.at("reason").is_string()) {
+            reason = json.at("reason").get<std::string>();
+        }
+        return CompactRequestBlock{std::move(reason)};
     }
     throw DecodeError("unknown content block type");
 }

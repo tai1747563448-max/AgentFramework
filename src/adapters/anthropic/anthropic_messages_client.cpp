@@ -86,8 +86,15 @@ nlohmann::json outgoing_block(const ContentBlock& block) {
                         {"content", typed.result.content},
                         {"is_error", typed.result.is_error}};
             } else {
-                static_assert(AlwaysFalse<Block>::value,
-                              "unsupported outgoing content block");
+                // T25: CompactRequestBlock is a runtime-only signal.
+                // When a prior response included one and the messages
+                // are being re-sent on a later turn, surface it as a
+                // text marker so the model sees the compaction intent
+                // without us inventing a wire type the provider does
+                // not understand.
+                return {{"type", "text"},
+                        {"text", std::string("[compact_request: ") +
+                                     typed.reason + "]"}};
             }
         },
         block);
@@ -280,6 +287,15 @@ Result<ModelResponse> decode_response(const HttpResponse& response,
                 return failure<ModelResponse>(
                     ErrorCode::ProtocolFailure,
                     "provider response contains an invalid tool-result block");
+            } else if (type == "compact_request") {
+                // T25: model signals it thinks the conversation is full.
+                // Reason is free-form; runtime treats presence as a trigger.
+                std::string reason;
+                if (block.contains("reason") &&
+                    block.at("reason").is_string()) {
+                    reason = block.at("reason").get<std::string>();
+                }
+                decoded.content.push_back(CompactRequestBlock{reason});
             } else {
                 return failure<ModelResponse>(ErrorCode::ProtocolFailure,
                                               "provider content block type is unknown");

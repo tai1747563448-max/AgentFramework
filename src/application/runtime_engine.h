@@ -99,7 +99,8 @@ public:
                   Clock& clock,
                   IdGenerator& ids,
                   Cancellation& cancellation,
-                  std::string model_name = {});
+                  std::string model_name = {},
+                  std::function<void()> reactive_compact_trigger = {});
 
     const std::string& model_name() const noexcept { return model_name_; }
 
@@ -136,6 +137,11 @@ private:
     IdGenerator& ids_;
     Cancellation& cancellation_;
     std::string model_name_;
+    // T25: optional callback invoked when the model emits a
+    // CompactRequestBlock. SessionEngine wires this to its
+    // CompactChain::ReactiveCompact::trigger(); tests can install
+    // their own callback to assert the trigger fired.
+    std::function<void()> reactive_compact_trigger_;
 };
 
 }  // namespace agent

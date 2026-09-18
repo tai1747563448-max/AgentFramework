@@ -175,7 +175,8 @@ RuntimeEngine::RuntimeEngine(ModelClient& model,
                              Clock& clock,
                              IdGenerator& ids,
                              Cancellation& cancellation,
-                             std::string model_name)
+                             std::string model_name,
+                             std::function<void()> reactive_compact_trigger)
     : model_(model),
       tools_(tools),
       knowledge_(knowledge),
@@ -183,7 +184,8 @@ RuntimeEngine::RuntimeEngine(ModelClient& model,
       clock_(clock),
       ids_(ids),
       cancellation_(cancellation),
-      model_name_(std::move(model_name)) {}
+      model_name_(std::move(model_name)),
+      reactive_compact_trigger_(std::move(reactive_compact_trigger)) {}
 
 RuntimeResult RuntimeEngine::append_event(std::optional<TaskState>& state,
                                           const std::string& task_id,
@@ -632,12 +634,30 @@ RuntimeResult RuntimeEngine::continue_task(
                 return transition;
             }
             const auto stop_reason = response.value().stop_reason;
+            // T25: detect the model's CompactRequestBlock before moving
+            // the response into the event. Presence triggers the
+            // session-level reactive compact (chain runs at the next
+            // compaction point — typically right after the model call).
+            bool compact_requested = false;
+            for (const auto& block : response.value().content) {
+                if (std::holds_alternative<CompactRequestBlock>(block)) {
+                    compact_requested = true;
+                    break;
+                }
+            }
             transition = append_event(
                 state, task_id,
                 ModelCallSucceededPayload{std::move(response.value())},
                 observer);
             if (transition.fatal_error.has_value()) {
                 return transition;
+            }
+            if (compact_requested && reactive_compact_trigger_) {
+                try {
+                    reactive_compact_trigger_();
+                } catch (...) {
+                    // Trigger callback must never break the runtime loop.
+                }
             }
             if (stop_reason == StopReason::EndTurn ||
                 stop_reason == StopReason::StopSequence) {

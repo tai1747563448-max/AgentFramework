@@ -48,7 +48,15 @@ struct ToolResultBlock {
     ToolResult result;
 };
 
-using ContentBlock = std::variant<TextBlock, ToolUseBlock, ToolResultBlock>;
+// T25: marker block the model emits when it thinks the conversation
+// needs compaction now. The runtime recognises this in the response and
+// invokes the reactive compact stage before continuing the loop.
+struct CompactRequestBlock {
+    std::string reason;
+};
+
+using ContentBlock = std::variant<TextBlock, ToolUseBlock, ToolResultBlock,
+                                  CompactRequestBlock>;
 
 struct Message {
     Role role;
@@ -244,6 +252,11 @@ inline bool operator==(const ToolUseBlock& left, const ToolUseBlock& right) {
 
 inline bool operator==(const ToolResultBlock& left, const ToolResultBlock& right) {
     return left.result == right.result;
+}
+
+inline bool operator==(const CompactRequestBlock& left,
+                       const CompactRequestBlock& right) {
+    return left.reason == right.reason;
 }
 
 inline bool operator==(const Message& left, const Message& right) {
