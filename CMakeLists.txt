@@ -81,6 +81,7 @@ add_library(agent_kernel STATIC
     src/adapters/persistence/session_event_json.cpp
     src/adapters/persistence/memory_event_json.cpp
     src/adapters/persistence/jsonl_memory_store.cpp
+    src/adapters/persistence/markdown_memory_store.cpp
     src/adapters/persistence/jsonl_event_store.cpp
     src/adapters/persistence/jsonl_session_store.cpp)
 target_include_directories(agent_kernel PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -231,6 +232,8 @@ add_agent_test(model_memory_consolidator_tests tests/application/model_memory_co
 add_agent_test(memory_event_json_tests tests/adapters/memory_event_json_test.cpp)
 add_agent_test(retrieval_policy_tests tests/application/retrieval_policy_test.cpp)
 add_agent_test(jsonl_memory_store_tests tests/adapters/jsonl_memory_store_test.cpp)
+add_agent_test(markdown_memory_store_tests tests/adapters/markdown_memory_store_test.cpp)
+target_link_libraries(markdown_memory_store_tests PRIVATE agent_runtime)
 add_agent_test(strict_json_tests tests/adapters/strict_json_test.cpp)
 add_agent_test(session_engine_tests tests/application/session_engine_test.cpp)
 add_agent_test(runtime_engine_tests tests/application/runtime_engine_test.cpp)
