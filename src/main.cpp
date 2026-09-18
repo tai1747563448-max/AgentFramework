@@ -313,7 +313,8 @@ int run_agent(std::vector<std::string> args) {
         agent::RandomIdGenerator ids;
         agent::SignalCancellation cancellation;
         agent::RuntimeEngine engine(model, tools, *knowledge, events, clock,
-                                    ids, cancellation);
+                                    ids, cancellation,
+                                    config.value().anthropic.model);
 
         agent::RunCommand run = [&]
             (const agent::RunRequest& cli_request,

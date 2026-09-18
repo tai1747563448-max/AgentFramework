@@ -723,8 +723,10 @@ TEST_CASE(runtime_progress_type_is_the_safe_projection_with_tool_name) {
     const agent::RuntimeProgress progress{
         "task-00000000000000000000000000000001", 7,
         agent::EventKind::ModelCallSucceeded,
-        agent::TaskStatus::AwaitingModel};
-    const auto& [task_id, sequence, event_kind, status, tool_name] = progress;
+        agent::TaskStatus::AwaitingModel, std::string{},
+        agent::RuntimeUsageDelta{1200, 340, 0.018}};
+    const auto& [task_id, sequence, event_kind, status, tool_name,
+                 usage_delta] = progress;
 
     static_assert(std::is_same_v<
                   decltype(agent::RuntimeProgress::task_id), std::string>);
@@ -741,6 +743,10 @@ TEST_CASE(runtime_progress_type_is_the_safe_projection_with_tool_name) {
     REQUIRE(event_kind == agent::EventKind::ModelCallSucceeded);
     REQUIRE(status == agent::TaskStatus::AwaitingModel);
     REQUIRE(tool_name.empty());
+    // T08: usage_delta is plumbed through the projection.
+    REQUIRE(usage_delta.input_delta == 1200);
+    REQUIRE(usage_delta.output_delta == 340);
+    REQUIRE(usage_delta.usd > 0.017 && usage_delta.usd < 0.019);
 }
 
 TEST_CASE(runtime_preview_arrives_before_acceptance_without_changing_durable_log) {

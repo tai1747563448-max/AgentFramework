@@ -3,6 +3,7 @@
 #include "domain/latency_trace.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <iomanip>
 #include <ostream>
 #include <sstream>
@@ -31,6 +32,31 @@ std::string fit_line(const std::string& text, std::size_t width) {
         used += cells;
     }
     return text.substr(0, offset);
+}
+
+// T08: format a token count as e.g. "1.2k", "340", "12.3k". Used by the
+// status line so large contexts stay readable.
+std::string compact_count(std::size_t value) {
+    if (value < 1000) return std::to_string(value);
+    char buffer[32];
+    const double scaled = static_cast<double>(value) / 1000.0;
+    if (value < 10000) {
+        std::snprintf(buffer, sizeof(buffer), "%.1fk", scaled);
+    } else {
+        std::snprintf(buffer, sizeof(buffer), "%.0fk", scaled);
+    }
+    return buffer;
+}
+
+// T08: render the running token/cost line. Stays on a single status row;
+// the live spinner stays on top, this row sits underneath.
+std::string usage_line(std::size_t input, std::size_t output, double usd) {
+    char buffer[96];
+    std::snprintf(buffer, sizeof(buffer),
+                  "tok in %s / out %s / $%.3f",
+                  compact_count(input).c_str(),
+                  compact_count(output).c_str(), usd);
+    return buffer;
 }
 
 }  // namespace
@@ -84,6 +110,15 @@ void TerminalPresenter::phase(const std::string& label) {
 }
 
 void TerminalPresenter::progress(const RuntimeProgress& progress) {
+    // T08: refresh accumulators before any UI work. input_ takes the max of
+    // what was reported because the provider returns cumulative input per
+    // response; output_ and usd_ sum up because the provider returns per-
+    // response deltas for those.
+    if (progress.usage_delta.input_delta > input_tokens_) {
+        input_tokens_ = progress.usage_delta.input_delta;
+    }
+    output_tokens_ += progress.usage_delta.output_delta;
+    usd_total_ += progress.usage_delta.usd;
     switch (progress.event_kind) {
     case EventKind::ContextPreparationStarted: phase("Preparing context..."); break;
     case EventKind::ModelCallStarted: {
@@ -177,7 +212,20 @@ void TerminalPresenter::tick(std::chrono::milliseconds elapsed) {
            << (phase_.empty() ? "Preparing context..." : phase_) << "  "
            << std::fixed << std::setprecision(1) << (elapsed.count() / 1000.0) << "s";
     const auto columns = columns_ ? columns_() : 80;
-    output_ << "\r\x1b[2K" << fit_line(status.str(), columns > 1 ? columns - 1 : 0);
+    // T08: the running token/cost line replaces the single tick row when
+    // any usage has been observed. The token row is moved to its own line
+    // under the spinner so the spinner frame still animates smoothly.
+    if (output_tokens_ > 0 || input_tokens_ > 0) {
+        std::ostringstream combined;
+        combined << status.str() << "\n\r\x1b[2K"
+                 << usage_line(input_tokens_, output_tokens_, usd_total_);
+        const auto budget = columns > 1 ? columns - 1 : 0;
+        output_ << "\r\x1b[2K"
+                << fit_line(combined.str(), budget);
+    } else {
+        output_ << "\r\x1b[2K"
+                << fit_line(status.str(), columns > 1 ? columns - 1 : 0);
+    }
     status_visible_ = true;
     output_.flush();
 }

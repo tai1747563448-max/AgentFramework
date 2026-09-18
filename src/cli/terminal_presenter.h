@@ -47,6 +47,14 @@ private:
     // attributed to the right turn.
     bool rendered_emitted_{false};
     std::string pending_request_id_;
+    // T08: running token/cost accumulator. input_ is the latest cumulative
+    // input reported by the provider (max across responses); output_ is
+    // the sum of every response's output tokens so far. usd_ mirrors
+    // output_ in dollar terms. The presenter takes input by MAX not SUM
+    // because Anthropic reports cumulative input per response.
+    std::size_t input_tokens_{0};
+    std::size_t output_tokens_{0};
+    double usd_total_{0.0};
 };
 
 }  // namespace agent

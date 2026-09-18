@@ -79,6 +79,49 @@ std::string concatenate_text(const ModelResponse& response) {
     return concatenate_text_blocks(response.content);
 }
 
+// T08: model → dollar-per-token. input/output prices are USD per million
+// tokens. Newer Anthropic models keep the 3:15 ratio; legacy haiku drops
+// to 1:5. Unknown model names return zeros so the presenter renders
+// "$0.000" instead of crashing on a not-yet-priced SKU.
+struct ModelPricing {
+    double input_per_million{0.0};
+    double output_per_million{0.0};
+};
+
+ModelPricing price_for_model(const std::string& model) {
+    if (model == "claude-3-5-sonnet" || model == "claude-3-5-sonnet-latest" ||
+        model == "claude-3-5-sonnet-20240620" ||
+        model == "claude-3-5-sonnet-20241022") {
+        return {3.0, 15.0};
+    }
+    if (model == "claude-3-opus" || model == "claude-3-opus-20240229") {
+        return {15.0, 75.0};
+    }
+    if (model == "claude-3-haiku" || model == "claude-3-haiku-20240307") {
+        return {0.25, 1.25};
+    }
+    if (model == "claude-3-5-haiku" || model == "claude-3-5-haiku-latest" ||
+        model == "claude-3-5-haiku-20241022") {
+        return {1.0, 5.0};
+    }
+    return {0.0, 0.0};
+}
+
+// T08: convert per-response token counts into a dollar cost. The runtime
+// is the only place that knows the model name (it owns the config), so the
+// conversion lives here. The resulting RuntimeUsageDelta is plumbed
+// through RuntimeProgress for the presenter to display.
+RuntimeUsageDelta compute_usage_delta(const ModelResponse& response,
+                                      const std::string& model) {
+    const auto pricing = price_for_model(model);
+    const auto usd = (static_cast<double>(response.input_tokens) *
+                          pricing.input_per_million +
+                      static_cast<double>(response.output_tokens) *
+                          pricing.output_per_million) /
+                     1'000'000.0;
+    return {response.input_tokens, response.output_tokens, usd};
+}
+
 bool contains_cjk(const std::string& text) {
     for (std::size_t index = 0; index < text.size();) {
         const auto first = static_cast<unsigned char>(text[index]);
@@ -129,21 +172,36 @@ RuntimeEngine::RuntimeEngine(ModelClient& model,
                              EventStore& events,
                              Clock& clock,
                              IdGenerator& ids,
-                             Cancellation& cancellation)
+                             Cancellation& cancellation,
+                             std::string model_name)
     : model_(model),
       tools_(tools),
       knowledge_(knowledge),
       events_(events),
       clock_(clock),
       ids_(ids),
-      cancellation_(cancellation) {}
+      cancellation_(cancellation),
+      model_name_(std::move(model_name)) {}
 
 RuntimeResult RuntimeEngine::append_event(std::optional<TaskState>& state,
                                           const std::string& task_id,
                                           EventPayload payload,
-                                          RuntimeProgressObserver& observer) {
+                                          RuntimeProgressObserver& observer,
+                                          const std::string& model_for_pricing) {
     const std::uint64_t sequence =
         state.has_value() ? state->last_sequence + 1 : 1;
+    // T08: capture the model response before move so we can derive the
+    // usage_delta for the progress observer. The payload is moved into
+    // RuntimeEvent afterwards, but we still have access to the captured
+    // copy's token counts here.
+    RuntimeUsageDelta usage_delta{};
+    if (const auto* succeeded =
+            std::get_if<ModelCallSucceededPayload>(&payload)) {
+        const auto& response = succeeded->response;
+        const auto& model = model_for_pricing.empty()
+                                ? model_name_ : model_for_pricing;
+        usage_delta = compute_usage_delta(response, model);
+    }
     RuntimeEvent event{1, sequence, task_id, clock_.now_utc(),
                        ids_.next_correlation_id(), std::move(payload)};
     const auto tool_name = observer ? progress_tool_name(state, event.payload)
@@ -163,7 +221,8 @@ RuntimeResult RuntimeEngine::append_event(std::optional<TaskState>& state,
     if (observer) {
         try {
             observer({state->task_id, state->last_sequence,
-                      event_kind(event.payload), state->status, tool_name});
+                      event_kind(event.payload), state->status, tool_name,
+                      usage_delta});
         } catch (...) {
             observer = nullptr;
         }

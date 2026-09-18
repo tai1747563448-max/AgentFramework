@@ -57,12 +57,25 @@ struct RuntimeResult {
     std::optional<RuntimeError> fatal_error;
 };
 
+// T08: per-event usage delta. The presenter accumulates these into
+// a running total and renders "tok in/out/$cost" on the second status
+// line. input_delta and output_delta are absolute counts (not deltas
+// between rounds) so the presenter can sum them directly without
+// remembering the previous event's values. usd is the dollar cost of
+// this single event priced by the runtime config.
+struct RuntimeUsageDelta {
+    std::size_t input_delta{0};
+    std::size_t output_delta{0};
+    double usd{0.0};
+};
+
 struct RuntimeProgress {
     std::string task_id;
     std::uint64_t sequence;
     EventKind event_kind;
     TaskStatus status;
     std::string tool_name;
+    RuntimeUsageDelta usage_delta;
 };
 
 using RuntimeProgressObserver =
@@ -76,7 +89,10 @@ public:
                   EventStore& events,
                   Clock& clock,
                   IdGenerator& ids,
-                  Cancellation& cancellation);
+                  Cancellation& cancellation,
+                  std::string model_name = {});
+
+    const std::string& model_name() const noexcept { return model_name_; }
 
     RuntimeResult run(const RunRequest& request,
                       RuntimeProgressObserver observer);
@@ -87,7 +103,8 @@ private:
     RuntimeResult append_event(std::optional<TaskState>& state,
                                const std::string& task_id,
                                EventPayload payload,
-                               RuntimeProgressObserver& observer);
+                               RuntimeProgressObserver& observer,
+                               const std::string& model_for_pricing = {});
     RuntimeResult guard_external_call(std::optional<TaskState>& state,
                                       const std::string& task_id,
                                       std::int64_t started_at_ms,
@@ -108,6 +125,7 @@ private:
     Clock& clock_;
     IdGenerator& ids_;
     Cancellation& cancellation_;
+    std::string model_name_;
 };
 
 }  // namespace agent
