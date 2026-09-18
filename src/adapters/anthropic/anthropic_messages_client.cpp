@@ -4,6 +4,7 @@
 
 #include "adapters/json/value_json.h"
 #include "domain/latency_trace.h"
+#include "ports/stop_reason_codec.h"
 #include "util/retry_with_backoff.h"
 
 #include <nlohmann/json.hpp>
@@ -202,19 +203,11 @@ Result<HttpRequest> make_request(const AnthropicConfig& config,
 }
 
 StopReason map_stop_reason(const std::string& raw) {
-    if (raw == "end_turn") {
-        return StopReason::EndTurn;
-    }
-    if (raw == "tool_use") {
-        return StopReason::ToolUse;
-    }
-    if (raw == "max_tokens") {
-        return StopReason::MaxTokens;
-    }
-    if (raw == "stop_sequence") {
-        return StopReason::StopSequence;
-    }
-    return StopReason::Unknown;
+    // T12 (v2 §3): delegate to the shared codec so the Anthropic
+    // adapter and any future OpenAI / local adapter agree on the
+    // provider-neutral mapping. The helper remains here as a thin
+    // wrapper to preserve the existing call sites in decode_response.
+    return decode_stop_reason(raw);
 }
 
 std::size_t token_count(const nlohmann::json& value) {
@@ -249,8 +242,8 @@ Result<ModelResponse> decode_response(const HttpResponse& response,
         }
 
         ModelResponse decoded;
-        decoded.raw_stop_reason = json.at("stop_reason").get<std::string>();
-        decoded.stop_reason = map_stop_reason(decoded.raw_stop_reason);
+        const auto raw_stop_reason = json.at("stop_reason").get<std::string>();
+        decoded.stop_reason = map_stop_reason(raw_stop_reason);
         bool contains_nonempty_text = false;
         bool contains_tool_use = false;
         for (const auto& block : json.at("content")) {

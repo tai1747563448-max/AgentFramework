@@ -1,6 +1,7 @@
 #include "application/state_reducer.h"
 
 #include "domain/evidence_validation.h"
+#include "ports/stop_reason_codec.h"
 
 #include <string>
 #include <type_traits>
@@ -34,9 +35,11 @@ std::string concatenated_text(const std::vector<ContentBlock>& content) {
 }
 
 Result<void> validate_model_response(const ModelResponse& response) {
-    if (!is_known_stop_reason_pair(response.stop_reason,
-                                   response.raw_stop_reason)) {
-        return invalid_transition("model stop reason fields do not match");
+    // T12 (v2 §3): provider-neutral stop reason check. The runtime
+    // never sees the provider's raw token; the adapter maps it to
+    // StopReason before the response leaves decode_response.
+    if (!is_known_stop_reason(response.stop_reason)) {
+        return invalid_transition("unknown model stop reason is not replayable");
     }
     if (!response_tool_uses_are_valid(response)) {
         return invalid_transition(

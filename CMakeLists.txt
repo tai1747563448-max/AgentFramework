@@ -51,6 +51,7 @@ add_library(agent_kernel STATIC
     src/domain/runtime_event.cpp
     src/domain/session_event.cpp
     src/domain/memory_event.cpp
+    src/ports/stop_reason_codec.cpp
     src/application/state_reducer.cpp
     src/application/session_reducer.cpp
     src/application/memory_reducer.cpp
@@ -73,6 +74,7 @@ add_library(agent_kernel STATIC
     src/adapters/anthropic/sse_decoder.cpp
     src/adapters/anthropic/anthropic_stream_assembler.cpp
     src/adapters/anthropic/anthropic_messages_client.cpp
+    src/adapters/anthropic/model_client_factory.cpp
     src/adapters/persistence/event_json.cpp
     src/adapters/persistence/session_event_json.cpp
     src/adapters/persistence/memory_event_json.cpp
@@ -306,6 +308,8 @@ add_agent_test(sandbox_factory_tests tests/adapters/sandbox_factory_test.cpp)
 target_link_libraries(sandbox_factory_tests PRIVATE agent_runtime)
 add_agent_test(static_permission_tests tests/adapters/static_permission_tests.cpp)
 target_link_libraries(static_permission_tests PRIVATE agent_runtime)
+add_agent_test(stop_reason_codec_tests tests/ports/stop_reason_codec_tests.cpp)
+target_link_libraries(stop_reason_codec_tests PRIVATE agent_kernel)
 add_agent_test(reproc_jsonl_process_tests
     tests/adapters/reproc_jsonl_process_test.cpp)
 target_link_libraries(reproc_jsonl_process_tests PRIVATE

@@ -101,7 +101,6 @@ agent::ToolCall tool_call() {
 agent::ModelResponse response_with_tool() {
     return {{agent::TextBlock{u8"先读取"}, agent::ToolUseBlock{tool_call()}},
             agent::StopReason::ToolUse,
-            "tool_use",
             123,
             45,
             "provider-request-一"};
@@ -121,7 +120,7 @@ std::vector<agent::RuntimeEvent> completed_text_trace(
         event(durable_task_id, 5,
               agent::ModelCallSucceededPayload{
                   {{agent::TextBlock{final_text}}, agent::StopReason::EndTurn,
-                   "end_turn", 120, 12, "provider-request-final"}}),
+                   120, 12, "provider-request-final"}}),
         event(durable_task_id, 6, agent::TaskCompletedPayload{final_text}),
     };
 }
@@ -429,34 +428,38 @@ TEST_CASE(jsonl_rejects_mixed_task_ids_and_illegal_transitions) {
     }
 }
 
-TEST_CASE(jsonl_rejects_forged_max_tokens_with_end_turn_raw_stop_reason) {
-    test::ScopedTempDir temp("jsonl-stop-pair-forgery");
-    const auto task = fixtures::valid_task_id("stop-pair-forgery");
-    const agent::RuntimeError budget_error{
-        agent::ErrorCode::BudgetExceeded,
-        "model output token budget exceeded", false};
-    const std::vector<agent::RuntimeEvent> forged = {
-        fixtures::task_started(task, 1, "issue"),
-        fixtures::event(task, 2, agent::ContextPreparationStartedPayload{}),
-        fixtures::event(task, 3,
-                        agent::ContextPreparedPayload{fixtures::evidence()}),
-        fixtures::event(task, 4,
-                        agent::ModelCallStartedPayload{fixtures::request()}),
-        fixtures::event(
-            task, 5,
-            agent::ModelCallSucceededPayload{
-                {{agent::TextBlock{"partial"}}, agent::StopReason::MaxTokens,
-                 "end_turn", 120, 12, "forged-provider-request"}}),
-        fixtures::event(
-            task, 6,
-            agent::TaskBudgetExceededPayload{"max_tokens", budget_error}),
-    };
-    const auto file =
-        temp.write_text("events.jsonl", fixtures::as_jsonl(forged));
+TEST_CASE(jsonl_rejects_legacy_raw_stop_reason_field_in_wire) {
+    // T12 (v2 §3): the v2 wire format drops raw_stop_reason. Legacy
+    // event logs that still contain the field fail strict validation
+    // so a rolling upgrade cannot silently mix formats. Operators
+    // must complete or discard in-flight tasks before swapping
+    // binaries.
+    test::ScopedTempDir temp("jsonl-legacy-raw-stop-reason");
+    const auto task = fixtures::valid_task_id("legacy-raw-stop-reason");
+    const auto prefix_jsonl = fixtures::as_jsonl(
+        {fixtures::task_started(task, 1, "issue"),
+         fixtures::event(task, 2,
+                         agent::ContextPreparationStartedPayload{}),
+         fixtures::event(task, 3,
+                         agent::ContextPreparedPayload{fixtures::evidence()}),
+         fixtures::event(task, 4,
+                         agent::ModelCallStartedPayload{fixtures::request()})});
+    const auto legacy_succeeded =
+        std::string{"{\"schema_version\":1,\"sequence\":5,"
+                    "\"task_id\":\""} +
+        task +
+        "\",\"timestamp_utc\":\"1970-01-01T00:00:05Z\","
+        "\"correlation_id\":\"corr\",\"payload\":{\"kind\":"
+        "\"ModelCallSucceeded\",\"value\":{\"content\":[{\"type\":"
+        "\"text\",\"text\":\"done\"}],\"stop_reason\":\"end_turn\","
+        "\"raw_stop_reason\":\"end_turn\","
+        "\"input_tokens\":10,\"output_tokens\":5,"
+        "\"provider_request_id\":\"legacy\"}}}";
+    const auto file = temp.write_text(
+        "events.jsonl", prefix_jsonl + "\n" + legacy_succeeded);
     agent::JsonlEventStore store(temp.path());
 
     const auto loaded = store.read_file(file);
-
     REQUIRE(!loaded.has_value());
     REQUIRE(loaded.error().code == agent::ErrorCode::PersistenceFailure);
 }
@@ -488,7 +491,7 @@ TEST_CASE(jsonl_rejects_invalid_or_duplicate_response_tool_calls) {
             fixtures::event(
                 task, 5,
                 agent::ModelCallSucceededPayload{
-                    {invalid.at(index), agent::StopReason::ToolUse, "tool_use",
+                    {invalid.at(index), agent::StopReason::ToolUse,
                      120, 12, "forged-provider-request"}}),
         };
         const auto file =

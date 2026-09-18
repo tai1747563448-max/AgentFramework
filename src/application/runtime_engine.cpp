@@ -12,6 +12,7 @@
 #include "ports/knowledge_provider.h"
 #include "ports/model_client.h"
 #include "ports/permission.h"
+#include "ports/stop_reason_codec.h"
 #include "ports/tool_gateway.h"
 
 #include <nlohmann/json.hpp>
@@ -579,11 +580,14 @@ RuntimeResult RuntimeEngine::continue_task(
                         {ErrorCode::ProtocolFailure, message, false}},
                     observer);
             };
-            if (!is_known_stop_reason_pair(
-                    response.value().stop_reason,
-                    response.value().raw_stop_reason)) {
+            // T12 (v2 §3): provider-neutral stop reason check. The
+            // canonical enum is the only thing the runtime sees; the
+            // adapter is responsible for mapping its provider-specific
+            // string into this enum and rejecting mismatches before the
+            // response is ever returned to the runtime.
+            if (!is_known_stop_reason(response.value().stop_reason)) {
                 return protocol_failure(
-                    "model stop reason fields do not match");
+                    "model returned an unknown stop reason");
             }
             if (!response_text_blocks_are_valid(response.value())) {
                 return protocol_failure(

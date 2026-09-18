@@ -1029,7 +1029,6 @@ TEST_CASE(anthropic_adapter_maps_ordered_tool_request_and_response) {
     REQUIRE(tool.arguments ==
             agent::Value::object({{"path", agent::Value("notes.txt")}}));
     REQUIRE(model_response.stop_reason == agent::StopReason::ToolUse);
-    REQUIRE(model_response.raw_stop_reason == "tool_use");
     REQUIRE(model_response.input_tokens == 12);
     REQUIRE(model_response.output_tokens == 6);
     REQUIRE(model_response.provider_request_id == "request-123");
@@ -1229,7 +1228,6 @@ TEST_CASE(anthropic_adapter_maps_all_known_and_unknown_stop_reasons) {
         const auto result = client.complete(fixtures::simple_model_request());
         REQUIRE(result.has_value());
         REQUIRE(result.value().stop_reason == item.mapped);
-        REQUIRE(result.value().raw_stop_reason == item.raw);
     }
 }
 
@@ -1258,7 +1256,6 @@ TEST_CASE(anthropic_adapter_preserves_empty_max_tokens_content) {
         }
         REQUIRE(result.has_value());
         REQUIRE(result.value().stop_reason == agent::StopReason::MaxTokens);
-        REQUIRE(result.value().raw_stop_reason == "max_tokens");
         if (item.expected_text == nullptr) {
             REQUIRE(result.value().content.empty());
         } else {

@@ -162,7 +162,7 @@ std::vector<agent::RuntimeEvent> awaiting_tool_task_events(
               agent::ToolUseBlock{{"call-1", "read_file",
                                     agent::Value::object(
                                         {{"path", "src/main.cpp"}})}}},
-             agent::StopReason::ToolUse, "tool_use", 10, 5,
+             agent::StopReason::ToolUse, 10, 5,
              "request-1"}}));
     return events;
 }
@@ -181,7 +181,7 @@ std::vector<agent::RuntimeEvent> completed_task_events(
         task_id, 5,
         agent::ModelCallSucceededPayload{
             {{agent::TextBlock{"answer"}}, agent::StopReason::EndTurn,
-             "end_turn", 10, 5, "request-1"}}));
+             10, 5, "request-1"}}));
     events.push_back(task_event(
         task_id, 6, agent::TaskCompletedPayload{"answer"}));
     return events;

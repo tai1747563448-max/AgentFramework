@@ -60,7 +60,7 @@ std::vector<agent::RuntimeEvent> completed_tool_trace() {
                      request(first_messages, first_evidence)}),
         event(5, agent::ModelCallSucceededPayload{
                      {{agent::ToolUseBlock{call}}, agent::StopReason::ToolUse,
-                      "tool_use", 10, 4, "provider-1"}}),
+                      10, 4, "provider-1"}}),
         event(6, agent::ToolCallStartedPayload{call}),
         event(7, agent::ToolCallSucceededPayload{tool_result}),
         event(8, agent::ContextPreparationStartedPayload{}),
@@ -69,7 +69,7 @@ std::vector<agent::RuntimeEvent> completed_tool_trace() {
                       request(second_messages, second_evidence)}),
         event(11, agent::ModelCallSucceededPayload{
                       {{agent::TextBlock{"fixed and verified"}},
-                       agent::StopReason::EndTurn, "end_turn", 15, 5,
+                       agent::StopReason::EndTurn, 15, 5,
                        "provider-2"}}),
         event(12, agent::TaskCompletedPayload{"fixed and verified"}),
     };
