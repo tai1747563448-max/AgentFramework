@@ -1,5 +1,6 @@
 #include "cli/terminal_presenter.h"
 #include "cli/terminal_text.h"
+#include "cli/theme.h"
 #include "domain/latency_trace.h"
 #include "domain/value.h"
 
@@ -64,8 +65,10 @@ std::string usage_line(std::size_t input, std::size_t output, double usd) {
 }  // namespace
 
 TerminalPresenter::TerminalPresenter(std::ostream& output, bool dynamic,
-                                     std::function<std::size_t()> columns)
-    : output_(output), dynamic_(dynamic), columns_(std::move(columns)) {}
+                                     std::function<std::size_t()> columns,
+                                     ThemeId theme_id)
+    : output_(output), dynamic_(dynamic), columns_(std::move(columns)),
+      theme_id_(theme_id) {}
 
 TerminalPresenter::~TerminalPresenter() {
     try { clear_status(); close_partial_line(); restore_cursor(); } catch (...) {}
@@ -229,9 +232,9 @@ void TerminalPresenter::text(const RuntimeTextUpdate& update) {
 
 void TerminalPresenter::tick(std::chrono::milliseconds elapsed) {
     if (!active_ || !dynamic_ || partial_line_) return;
-    static constexpr char frames[] = "|/-\\";
+    const auto& theme = theme_for(theme_id_);
     std::ostringstream status;
-    status << frames[(elapsed.count() / 100) % 4] << ' '
+    status << theme.spinner_frames[(elapsed.count() / 100) % theme.spinner_frames.size()] << ' '
            << (phase_.empty() ? "Preparing context..." : phase_) << "  "
            << std::fixed << std::setprecision(1) << (elapsed.count() / 1000.0) << "s";
     const auto columns = columns_ ? columns_() : 80;

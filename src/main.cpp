@@ -41,6 +41,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -514,7 +515,8 @@ int run_agent(std::vector<std::string> args) {
                     stream << "{\"session_id\":\""
                            << session.session_id
                            << "\",\"task_id\":\"" << session.last_task_id.value()
-                           << "\",\"status\":\"" << status << "\"}";
+                           << "\",\"status\":\""
+                           << agent::task_status_name(status) << "\"}";
                 }
                 stream << "]";
                 return stream.str();

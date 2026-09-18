@@ -2,6 +2,7 @@
 
 #include "application/runtime_engine.h"
 #include "cli/streaming_terminal_text.h"
+#include "cli/theme.h"
 
 #include <chrono>
 #include <functional>
@@ -13,8 +14,13 @@ namespace agent {
 
 class TerminalPresenter {
 public:
+    // T18: theme_id selects the spinner glyph + verb vocabulary. The
+    // default is the Claude-Code-parity theme; forks can pass
+    // kFramesThemeMinimal (no animation) or kFramesThemeAscii
+    // (ASCII-only animation) without recompiling presenter logic.
     TerminalPresenter(std::ostream& output, bool dynamic,
-                      std::function<std::size_t()> columns = {});
+                      std::function<std::size_t()> columns = {},
+                      ThemeId theme_id = ThemeId::Claude);
     ~TerminalPresenter();
     void begin();
     void phase(const std::string& label);
@@ -32,6 +38,11 @@ private:
     std::ostream& output_;
     bool dynamic_;
     std::function<std::size_t()> columns_;
+    // T18: theme is fixed at construction time. The presenter is a
+    // single-threaded UI component, so swapping themes mid-stream would
+    // split the in-flight progress row in half; the request owner should
+    // construct a new TerminalPresenter if they want a different theme.
+    ThemeId theme_id_;
     bool active_{false};
     bool status_visible_{false};
     bool partial_line_{false};

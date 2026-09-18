@@ -5,6 +5,7 @@
 #include "domain/model_stream_event.h"
 #include "domain/task_state.h"
 #include "application/hook_chain.h"
+#include "cli/theme.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -36,6 +37,11 @@ struct RuntimePresentationOptions {
     bool stream{false};
     std::function<void(const RuntimeTextUpdate&)> text_observer;
     std::function<void(const std::string&)> phase_observer;
+    // T18: theme selection. Presenters construct the matching spinner
+    // glyph + verb vocabulary; the runtime treats it as opaque so this
+    // field can be moved without dragging presenter code into the
+    // application layer.
+    ThemeId theme_id{ThemeId::Claude};
 };
 
 struct RunRequest {

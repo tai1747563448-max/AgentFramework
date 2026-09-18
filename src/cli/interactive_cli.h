@@ -2,6 +2,7 @@
 
 #include "application/session_engine.h"
 #include "cli/cli_app.h"
+#include "cli/theme.h"
 #include "domain/memory_state.h"
 
 #include <chrono>
@@ -69,6 +70,9 @@ struct InteractiveUiOptions {
     bool dynamic{false};
     bool stream{true};
     std::function<std::size_t()> columns;
+    // T18: theme selection forwarded to TerminalPresenter so forks
+    // can pick a low-glyph vocabulary without rebuilding the runtime.
+    ThemeId theme_id{ThemeId::Claude};
 };
 
 class InteractiveCli {

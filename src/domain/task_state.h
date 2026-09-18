@@ -97,6 +97,12 @@ enum class TaskType {
 const char* task_type_name(TaskType type);
 TaskType parse_task_type(std::string_view text);
 
+// T17 follow-up: stream TaskStatus into ostream-based JSON encoders
+// (/tasks snapshots, debug logs) without dragging the TaskState type
+// into the JSON layer. The string matches the runtime_event JSON
+// encoding so persisted logs and live JSON stay symmetric.
+const char* task_status_name(TaskStatus status);
+
 inline bool is_terminal(TaskStatus status) noexcept {
     return status == TaskStatus::Completed || status == TaskStatus::Failed ||
            status == TaskStatus::BudgetExceeded || status == TaskStatus::Cancelled;

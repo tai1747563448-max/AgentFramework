@@ -205,7 +205,9 @@ SessionTurnResult InteractiveCli::execute_turn(const std::string& session_id,
         channel->push(std::move(event));
     };
     if (commands_.set_phase_observer) commands_.set_phase_observer(presentation.phase_observer);
-    TerminalPresenter presenter(output_, ui_.dynamic, ui_.columns);
+    presentation.theme_id = ui_.theme_id;
+    TerminalPresenter presenter(output_, ui_.dynamic, ui_.columns,
+                                ui_.theme_id);
     const auto started = std::chrono::steady_clock::now();
     std::thread worker([&, channel, presentation, observer] {
         SessionTurnResult result;
