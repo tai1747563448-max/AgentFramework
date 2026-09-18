@@ -1,6 +1,7 @@
 #include "adapters/process/direct_process_runner.h"
 
 #include "adapters/workspace/workspace_text.h"
+#include "ports/sandbox.h"
 
 #if defined(_WIN32)
 #define NOMINMAX
@@ -397,8 +398,9 @@ void write_handle(HANDLE raw_handle, const std::string& input) {
     }
 }
 
-Result<ProcessOutput> run_native(const ProcessRequest& request) {
-    const auto wide_program = to_wide(request.program);
+Result<ProcessOutput> run_native(const ProcessRequest& request,
+                          const SandboxedCommand& wrapped) {
+    const auto wide_program = to_wide(wrapped.program);
     const auto wide_cwd = to_wide(request.working_directory.generic_u8string());
     auto environment = environment_block(request);
     if (!wide_program.has_value() || !wide_cwd.has_value() ||
@@ -406,7 +408,7 @@ Result<ProcessOutput> run_native(const ProcessRequest& request) {
         return Result<ProcessOutput>::failure(invalid_request());
     }
     std::wstring command = quote_argument(*wide_program);
-    for (const auto& argument : request.arguments) {
+    for (const auto& argument : wrapped.arguments) {
         const auto wide_argument = to_wide(argument);
         if (!wide_argument.has_value()) {
             return Result<ProcessOutput>::failure(invalid_request());
@@ -693,7 +695,8 @@ std::optional<std::string> resolved_executable(
     return std::nullopt;
 }
 
-Result<ProcessOutput> run_native(const ProcessRequest& request) {
+Result<ProcessOutput> run_native(const ProcessRequest& request,
+                          const SandboxedCommand& wrapped) {
     UniqueFd stdout_read, stdout_write;
     UniqueFd stderr_read, stderr_write;
     UniqueFd stdin_read, stdin_write;
@@ -721,11 +724,31 @@ Result<ProcessOutput> run_native(const ProcessRequest& request) {
     }
     environment_pointers.push_back(nullptr);
 
+    std::vector<std::string> argument_storage;
+    argument_storage.reserve(wrapped.arguments.size() + 1);
+    if (!wrapped.program.empty()) {
+        argument_storage.push_back(wrapped.program);
+    } else {
+        argument_storage.push_back(request.program);
+    }
+    for (const auto& argument : wrapped.arguments) {
+        argument_storage.push_back(argument);
+    }
+    if (wrapped.arguments.empty()) {
+        for (const auto& argument : request.arguments) {
+            argument_storage.push_back(argument);
+        }
+    }
+    std::vector<std::string> argument_storage;
+    argument_storage.reserve(wrapped.arguments.size() + 1);
+    argument_storage.push_back(wrapped.program);
+    for (const auto& argument : wrapped.arguments) {
+        argument_storage.push_back(argument);
+    }
     std::vector<char*> argument_pointers;
-    argument_pointers.reserve(request.arguments.size() + 2);
-    argument_pointers.push_back(const_cast<char*>(request.program.c_str()));
-    for (const auto& argument : request.arguments) {
-        argument_pointers.push_back(const_cast<char*>(argument.c_str()));
+    argument_pointers.reserve(argument_storage.size() + 1);
+    for (auto& entry : argument_storage) {
+        argument_pointers.push_back(entry.data());
     }
     argument_pointers.push_back(nullptr);
 
@@ -849,12 +872,36 @@ Result<ProcessOutput> run_native(const ProcessRequest& request) {
 
 }  // namespace
 
+DirectProcessRunner::DirectProcessRunner() = default;
+
+DirectProcessRunner::DirectProcessRunner(std::shared_ptr<Sandbox> sandbox)
+    : sandbox_(std::move(sandbox)) {}
+
 Result<ProcessOutput> DirectProcessRunner::run(const ProcessRequest& request) {
     if (!valid_request(request)) {
         return Result<ProcessOutput>::failure(invalid_request());
     }
+    // T22: when a sandbox is attached, translate the request into a
+    // SandboxedCommand before any host execution. When sandbox_ is null
+    // we still populate wrapped with the passthrough command so the
+    // platform runner reads a single, well-formed argv regardless of
+    // whether sandboxing is active.
+    SandboxedCommand wrapped;
+    if (sandbox_) {
+        const SandboxProfile default_profile{};
+        if (auto fault = sandbox_->apply(
+                default_profile, request.program, request.arguments,
+                request.working_directory.generic_u8string(), wrapped);
+            fault.has_value()) {
+            return Result<ProcessOutput>::failure(
+                {ErrorCode::DependencyUnavailable, fault->message, false});
+        }
+    } else {
+        wrapped.program = request.program;
+        wrapped.arguments = request.arguments;
+    }
     try {
-        return run_native(request);
+        return run_native(request, wrapped);
     } catch (...) {
         return Result<ProcessOutput>::failure(execution_failure());
     }

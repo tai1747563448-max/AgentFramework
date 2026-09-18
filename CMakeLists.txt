@@ -95,6 +95,12 @@ add_library(agent_runtime STATIC
     src/adapters/workspace/workspace_tool_gateway.cpp
     src/adapters/process/direct_process_runner.cpp
     src/adapters/process/reproc_jsonl_process.cpp
+    src/adapters/sandbox/bubblewrap_sandbox.cpp
+    src/adapters/sandbox/job_object_sandbox.cpp
+    src/adapters/sandbox/no_op_sandbox.cpp
+    src/adapters/sandbox/sandbox_factory.cpp
+    src/adapters/sandbox/sandbox_profile.cpp
+    src/adapters/sandbox/seatbelt_sandbox.cpp
     src/adapters/rag/rag_protocol.cpp
     src/adapters/rag/verified_pack_lease.cpp
     src/adapters/rag/native_rag_pack_verifier.cpp
@@ -291,6 +297,12 @@ add_dependencies(direct_process_runner_tests process_fixture)
 target_compile_definitions(direct_process_runner_tests PRIVATE
     AGENT_PROCESS_FIXTURE_PATH="$<TARGET_FILE:process_fixture>"
     _CRT_SECURE_NO_WARNINGS)
+add_agent_test(sandbox_profile_tests tests/adapters/sandbox_profile_test.cpp)
+target_link_libraries(sandbox_profile_tests PRIVATE agent_runtime)
+add_agent_test(bubblewrap_sandbox_tests tests/adapters/bubblewrap_sandbox_test.cpp)
+target_link_libraries(bubblewrap_sandbox_tests PRIVATE agent_runtime)
+add_agent_test(sandbox_factory_tests tests/adapters/sandbox_factory_test.cpp)
+target_link_libraries(sandbox_factory_tests PRIVATE agent_runtime)
 add_agent_test(reproc_jsonl_process_tests
     tests/adapters/reproc_jsonl_process_test.cpp)
 target_link_libraries(reproc_jsonl_process_tests PRIVATE
