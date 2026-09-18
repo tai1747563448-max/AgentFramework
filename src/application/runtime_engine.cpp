@@ -12,6 +12,8 @@
 #include "ports/model_client.h"
 #include "ports/tool_gateway.h"
 
+#include <nlohmann/json.hpp>
+
 #include <string>
 #include <cstdint>
 #include <chrono>
@@ -202,6 +204,29 @@ RuntimeResult RuntimeEngine::append_event(std::optional<TaskState>& state,
                                 ? model_name_ : model_for_pricing;
         usage_delta = compute_usage_delta(response, model);
     }
+    // T09: pull the unified diff lines out of the tool result JSON so the
+    // presenter can render them right after the "Tool completed" line.
+    // The replace_text / write_file handlers embed a "diff" field which
+    // is a JSON array of strings (each starting with '+' / '-' / ' ').
+    std::vector<std::string> diff_lines;
+    if (const auto* tool_succeeded =
+            std::get_if<ToolCallSucceededPayload>(&payload)) {
+        try {
+            const auto json = nlohmann::json::parse(
+                tool_succeeded->result.content);
+            if (json.is_object() && json.contains("diff") &&
+                json.at("diff").is_array()) {
+                for (const auto& line : json.at("diff")) {
+                    if (line.is_string()) {
+                        diff_lines.push_back(line.get<std::string>());
+                    }
+                }
+            }
+        } catch (...) {
+            // The result body is not parseable JSON; that is fine for
+            // non-write tools. Silently fall through with empty diff.
+        }
+    }
     RuntimeEvent event{1, sequence, task_id, clock_.now_utc(),
                        ids_.next_correlation_id(), std::move(payload)};
     const auto tool_name = observer ? progress_tool_name(state, event.payload)
@@ -222,7 +247,7 @@ RuntimeResult RuntimeEngine::append_event(std::optional<TaskState>& state,
         try {
             observer({state->task_id, state->last_sequence,
                       event_kind(event.payload), state->status, tool_name,
-                      usage_delta});
+                      usage_delta, std::move(diff_lines)});
         } catch (...) {
             observer = nullptr;
         }

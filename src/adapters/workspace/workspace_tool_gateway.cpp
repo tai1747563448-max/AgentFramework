@@ -353,6 +353,45 @@ nlohmann::json bounded_search_json(const std::string& path,
     return encoded;
 }
 
+// T09: build a unified diff segment between two text bodies. Lines are
+// split on '\n' (CRLF stripped); removals get '-' prefixes and additions
+// get '+' prefixes. Empty input on either side still emits a valid diff.
+// The result is JSON-serialisable and feeds directly into the
+// TerminalPresenter's ANSI-coloured +/- rendering.
+std::vector<std::string> unified_diff_lines(const std::string& before,
+                                            const std::string& after) {
+    std::vector<std::string> result;
+    // Always include a one-line header so the presenter can render a
+    // diff even when one side is empty (e.g. write_file with mode=create).
+    result.push_back("--- before");
+    result.push_back("+++ after");
+    auto split_lines = [](const std::string& text) {
+        std::vector<std::string> lines;
+        std::string current;
+        for (std::size_t index = 0; index < text.size(); ++index) {
+            const auto ch = text[index];
+            if (ch == '\r') continue;  // normalise CRLF
+            if (ch == '\n') {
+                lines.push_back(std::move(current));
+                current.clear();
+            } else {
+                current.push_back(ch);
+            }
+        }
+        // Trailing partial line is included verbatim. Files written without
+        // a trailing newline still get represented.
+        lines.push_back(std::move(current));
+        return lines;
+    };
+    for (auto& line : split_lines(before)) {
+        result.push_back("-" + std::move(line));
+    }
+    for (auto& line : split_lines(after)) {
+        result.push_back("+" + std::move(line));
+    }
+    return result;
+}
+
 nlohmann::json write_json(const workspace::WriteOutput& output) {
     return {{"path", output.path},
             {"created", output.created},
@@ -360,6 +399,19 @@ nlohmann::json write_json(const workspace::WriteOutput& output) {
             {"new_sha256", output.new_sha256},
             {"replacements", output.replacements},
             {"bytes_written", output.bytes_written}};
+}
+
+// T09: extend write_json with an optional unified diff. The diff is only
+// attached when both before/after are supplied by the tool handler. Empty
+// diff array means "no before/after captured" and the presenter falls
+// back to the existing summary line.
+nlohmann::json write_json(const workspace::WriteOutput& output,
+                          const std::string& before,
+                          const std::string& after) {
+    auto encoded = write_json(output);
+    auto diff = unified_diff_lines(before, after);
+    encoded["diff"] = diff;
+    return encoded;
 }
 
 // Per-tool handlers: each takes the same (call, ctx, files, policy)
@@ -545,7 +597,8 @@ Result<ToolResult> handle_replace_text(const ToolCall& call,
     }
     return success_result(
         call.id,
-        write_json(std::get<workspace::WriteOutput>(replaced)));
+        write_json(std::get<workspace::WriteOutput>(replaced),
+                    *old_text, *new_text));
 }
 
 Result<ToolResult> handle_write_file(const ToolCall& call,
@@ -598,7 +651,16 @@ Result<ToolResult> handle_write_file(const ToolCall& call,
     }
     return success_result(
         call.id,
-        write_json(std::get<workspace::WriteOutput>(written)));
+        // T09: write_file always reports the new content as the "after"
+        // half. For mode=create the before half is empty so the presenter
+        // renders pure "+" lines; for overwrite the before is the file's
+        // previous body if we still have it. The workspace file ops does
+        // not return prior content, so we leave before empty in this
+        // initial cut and rely on the +content rendering to convey the
+        // change. The presenter still shows the file path so users know
+        // what got rewritten.
+        write_json(std::get<workspace::WriteOutput>(written),
+                    std::string{}, *content));
 }
 
 // Bind a tool name to its static handler with the workspace gateway's

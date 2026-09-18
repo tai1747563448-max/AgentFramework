@@ -76,6 +76,11 @@ struct RuntimeProgress {
     TaskStatus status;
     std::string tool_name;
     RuntimeUsageDelta usage_delta;
+    // T09: pre-rendered unified diff lines for ToolCallSucceeded events
+    // whose underlying tool call returned a "diff" field (replace_text /
+    // write_file). Empty for everything else. The presenter colours '+'
+    // and '-' prefixes green / red.
+    std::vector<std::string> diff_lines;
 };
 
 using RuntimeProgressObserver =

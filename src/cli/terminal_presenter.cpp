@@ -1,12 +1,14 @@
 #include "cli/terminal_presenter.h"
 #include "cli/terminal_text.h"
 #include "domain/latency_trace.h"
+#include "domain/value.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <iomanip>
 #include <ostream>
 #include <sstream>
+#include <vector>
 
 namespace agent {
 namespace {
@@ -151,6 +153,27 @@ void TerminalPresenter::progress(const RuntimeProgress& progress) {
         phase_ += progress.tool_name.empty() ? "." : ": " + single_line(progress.tool_name);
         const auto columns = columns_ ? columns_() : 80;
         output_ << (dynamic_ ? fit_line(phase_, columns > 1 ? columns - 1 : 0) : phase_) << '\n';
+        // T09: render the unified diff lines under the tool summary. '+'
+        // lines get green, '-' lines get red, header lines ('--- ' /
+        // '+++ ') get dim. CJK widths follow the same fit_line rule so
+        // the columns budget stays accurate even with non-ASCII content.
+        for (const auto& line : progress.diff_lines) {
+            std::string prefix;
+            std::string body = line;
+            if (!body.empty() && (body.front() == '+' || body.front() == '-' ||
+                                  body.front() == ' ')) {
+                prefix = body.substr(0, 1);
+                body = body.substr(1);
+            }
+            const char* colour = "\x1b[2m";  // dim for header lines
+            if (prefix == "+") colour = "\x1b[32m";
+            else if (prefix == "-") colour = "\x1b[31m";
+            output_ << colour << prefix << "\x1b[0m"
+                    << (dynamic_
+                            ? fit_line(body, columns > 4 ? columns - 4 : 0)
+                            : body)
+                    << '\n';
+        }
         output_.flush();
         break;
     }
