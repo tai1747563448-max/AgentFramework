@@ -28,6 +28,7 @@
 #include "cli/terminal_text.h"
 #include "cli/terminal_capabilities.h"
 #include "config/runtime_config.h"
+#include "config/setting_source.h"
 #include "domain/latency_trace.h"
 
 #include <exception>
@@ -143,6 +144,20 @@ int run_agent(std::vector<std::string> args) {
         if (!startup.has_value()) {
             std::cerr << startup.error().message << '\n';
             return agent::ExitCode::InvalidInputOrConfig;
+        }
+        if (startup.value().show_effective_config) {
+            // T05: print the merged layered view without booting
+            // the runtime. Process env is read via ProcessEnvironment
+            // (the same source load_runtime_config consumes).
+            const auto layered = agent::build_default_layered_settings();
+            if (!layered.has_value()) {
+                std::cerr << layered.error().message << '\n';
+                return agent::ExitCode::InvalidInputOrConfig;
+            }
+            std::cout << agent::render_layered_settings_json(
+                              layered.value())
+                      << '\n';
+            return agent::ExitCode::Success;
         }
         if (startup.value().command_args.size() > 1 &&
             (startup.value().command_args[1] == "verify-log" ||

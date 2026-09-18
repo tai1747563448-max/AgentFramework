@@ -38,6 +38,7 @@ struct StartupArguments {
     std::optional<std::filesystem::path> env_file;
     bool plain_ui{false};
     bool stream_enabled{true};
+    bool show_effective_config{false};
 };
 
 Result<StartupArguments> parse_startup_arguments(

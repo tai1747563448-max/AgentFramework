@@ -1,4 +1,5 @@
 #include "config/runtime_config.h"
+#include "config/setting_source.h"
 
 #include <dotenv.h>
 #include <nlohmann/json.hpp>
@@ -404,54 +405,69 @@ std::optional<std::string> ProcessEnvironment::get(
 Result<RuntimeConfig> load_runtime_config(
     const Environment& environment,
     const std::filesystem::path& executable_path) {
-    const auto base_url = nonempty(environment, "AGENT_BASE_URL");
+    // T05 (v2 §1): layer .agentrc.json / user config / admin policy on
+    // top of the supplied env. The layered resolver falls through
+    // from highest priority to lowest, so passing the wrapped env
+    // to the existing helpers turns every key lookup into a layered
+    // query without touching the helper bodies.
+    std::error_code cwd_error;
+    const auto cwd = std::filesystem::current_path(cwd_error);
+    if (cwd_error) {
+        return invalid_config("current working directory is unavailable");
+    }
+    const auto layered = build_layered_settings(environment, cwd);
+    if (!layered.has_value()) {
+        return Result<RuntimeConfig>::failure(layered.error());
+    }
+    const LayeredEnvironment layered_env(layered.value());
+    const auto base_url = nonempty(layered_env, "AGENT_BASE_URL");
     if (!base_url.has_value()) {
         return invalid_config("AGENT_BASE_URL is required");
     }
-    const auto model = nonempty(environment, "AGENT_MODEL");
+    const auto model = nonempty(layered_env, "AGENT_MODEL");
     if (!model.has_value()) {
         return invalid_config("AGENT_MODEL is required");
     }
 
-    const auto api_key = nonempty(environment, "AGENT_API_KEY");
-    const auto auth_token = nonempty(environment, "AGENT_AUTH_TOKEN");
+    const auto api_key = nonempty(layered_env, "AGENT_API_KEY");
+    const auto auth_token = nonempty(layered_env, "AGENT_AUTH_TOKEN");
     if (api_key.has_value() == auth_token.has_value()) {
         return invalid_config("exactly one authentication mode is required");
     }
 
     const auto max_tokens =
-        positive_integer(environment, "AGENT_MAX_TOKENS", 4096);
+        positive_integer(layered_env, "AGENT_MAX_TOKENS", 4096);
     const auto model_rounds =
-        positive_integer(environment, "AGENT_MAX_MODEL_ROUNDS", 16);
+        positive_integer(layered_env, "AGENT_MAX_MODEL_ROUNDS", 16);
     const auto tool_calls =
-        positive_integer(environment, "AGENT_MAX_TOOL_CALLS", 64);
+        positive_integer(layered_env, "AGENT_MAX_TOOL_CALLS", 64);
     const auto task_seconds =
-        positive_integer(environment, "AGENT_MAX_TASK_SECONDS", 1800);
+        positive_integer(layered_env, "AGENT_MAX_TASK_SECONDS", 1800);
     const auto timeout_seconds =
-        positive_integer(environment, "AGENT_MODEL_TIMEOUT_SECONDS", 120);
+        positive_integer(layered_env, "AGENT_MODEL_TIMEOUT_SECONDS", 120);
     const auto build_tools_enabled =
-        exact_flag(environment, "AGENT_ENABLE_BUILD_TOOLS", false);
+        exact_flag(layered_env, "AGENT_ENABLE_BUILD_TOOLS", false);
     const auto build_timeout_seconds =
-        positive_integer(environment, "AGENT_BUILD_TIMEOUT_SECONDS", 300);
+        positive_integer(layered_env, "AGENT_BUILD_TIMEOUT_SECONDS", 300);
     const auto rag_enabled =
-        exact_flag(environment, "AGENT_ENABLE_RAG", false);
+        exact_flag(layered_env, "AGENT_ENABLE_RAG", false);
     const auto memory_enabled =
-        exact_flag(environment, "AGENT_ENABLE_MEMORY", true);
+        exact_flag(layered_env, "AGENT_ENABLE_MEMORY", true);
     // Compaction needs valid caps even with memory disabled.
     constexpr std::uint64_t kMemoryByteLimit = 1024 * 1024;
     constexpr std::uint64_t kContextByteLimit = 16 * 1024 * 1024;
-    const auto memory_top_k = bounded_size(environment, "AGENT_MEMORY_TOP_K", 5, 20);
-    const auto memory_injected = bounded_size(environment,
+    const auto memory_top_k = bounded_size(layered_env, "AGENT_MEMORY_TOP_K", 5, 20);
+    const auto memory_injected = bounded_size(layered_env,
         "AGENT_MEMORY_MAX_INJECTED_BYTES", 4096, kMemoryByteLimit);
-    const auto memory_entry = bounded_size(environment,
+    const auto memory_entry = bounded_size(layered_env,
         "AGENT_MEMORY_MAX_ENTRY_BYTES", 1024, kMemoryByteLimit);
-    const auto compaction_threshold = bounded_size(environment,
+    const auto compaction_threshold = bounded_size(layered_env,
         "AGENT_COMPACTION_THRESHOLD_BYTES", 65536, kContextByteLimit);
-    const auto compaction_hard_limit = bounded_size(environment,
+    const auto compaction_hard_limit = bounded_size(layered_env,
         "AGENT_COMPACTION_HARD_LIMIT_BYTES", 131072, kContextByteLimit);
-    const auto compaction_retain = bounded_size(environment,
+    const auto compaction_retain = bounded_size(layered_env,
         "AGENT_COMPACTION_RETAIN_TURNS", 6, 10000);
-    const auto compaction_summary = bounded_size(environment,
+    const auto compaction_summary = bounded_size(layered_env,
         "AGENT_COMPACTION_MAX_SUMMARY_BYTES", 8192, 8192);
     if (!max_tokens.has_value() || !model_rounds.has_value() ||
         !tool_calls.has_value() || !task_seconds.has_value() ||
@@ -494,18 +510,18 @@ Result<RuntimeConfig> load_runtime_config(
         return invalid_config("numeric configuration is out of range");
     }
 
-    const auto runtime_root_value = environment.get("AGENT_RUNTIME_ROOT");
+    const auto runtime_root_value = layered_env.get("AGENT_RUNTIME_ROOT");
     if (runtime_root_value.has_value() && runtime_root_value->empty()) {
         return invalid_config("AGENT_RUNTIME_ROOT must not be empty");
     }
-    const auto system_prompt = environment.get("AGENT_SYSTEM_PROMPT");
+    const auto system_prompt = layered_env.get("AGENT_SYSTEM_PROMPT");
 
     RagConfig rag;
     rag.enabled = rag_enabled.value();
     if (rag_enabled.value()) {
-        const auto mode = environment.get("AGENT_RAG_MODE");
-        const auto device = environment.get("AGENT_RAG_DEVICE");
-        const auto policy = environment.get("AGENT_RAG_RETRIEVAL_POLICY");
+        const auto mode = layered_env.get("AGENT_RAG_MODE");
+        const auto device = layered_env.get("AGENT_RAG_DEVICE");
+        const auto policy = layered_env.get("AGENT_RAG_RETRIEVAL_POLICY");
         rag.mode = mode.has_value() ? *mode : "dense";
         rag.device = device.has_value() ? *device : "auto";
         if (rag.mode != "hybrid" && rag.mode != "dense" &&
@@ -538,13 +554,13 @@ Result<RuntimeConfig> load_runtime_config(
                     "rag retrieval policy must be auto, always, or off");
             }
         }
-        const auto top_k = positive_integer(environment, "AGENT_RAG_TOP_K", 6);
+        const auto top_k = positive_integer(layered_env, "AGENT_RAG_TOP_K", 6);
         const auto maximum = positive_integer(
-            environment, "AGENT_RAG_MAX_TOTAL_BYTES", 32'768);
+            layered_env, "AGENT_RAG_MAX_TOTAL_BYTES", 32'768);
         const auto startup = positive_integer(
-            environment, "AGENT_RAG_STARTUP_TIMEOUT_SECONDS", 120);
+            layered_env, "AGENT_RAG_STARTUP_TIMEOUT_SECONDS", 120);
         const auto query = positive_integer(
-            environment, "AGENT_RAG_QUERY_TIMEOUT_SECONDS", 30);
+            layered_env, "AGENT_RAG_QUERY_TIMEOUT_SECONDS", 30);
         if (!top_k.has_value() || !maximum.has_value() ||
             !startup.has_value() || !query.has_value()) {
             return invalid_config(
@@ -569,7 +585,7 @@ Result<RuntimeConfig> load_runtime_config(
             return invalid_config("rag numeric configuration is out of range");
         }
         try {
-            const auto supplied = environment.get("AGENT_RAG_PACK_ROOT");
+            const auto supplied = layered_env.get("AGENT_RAG_PACK_ROOT");
             if (supplied.has_value()) {
                 if (supplied->empty()) {
                     return invalid_config("AGENT_RAG_PACK_ROOT must not be empty");

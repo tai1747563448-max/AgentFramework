@@ -242,6 +242,14 @@ Result<StartupArguments> parse_startup_arguments(
     bool ui_seen = false;
     bool stream_seen = false;
     for (std::size_t index = 1; index < args.size(); ++index) {
+        if (args[index] == "--show-effective-config") {
+            if (parsed.show_effective_config) {
+                return invalid_startup_arguments(
+                    "--show-effective-config may only appear once");
+            }
+            parsed.show_effective_config = true;
+            continue;
+        }
         if (parsed.command_args.size() == 1 &&
             (args[index] == "--ui" || args[index] == "--stream")) {
             const bool ui = args[index] == "--ui";

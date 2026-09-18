@@ -105,6 +105,7 @@ add_library(agent_runtime STATIC
     src/adapters/system/random_id_generator.cpp
     src/adapters/system/signal_cancellation.cpp
     src/config/runtime_config.cpp
+    src/config/setting_source.cpp
     src/cli/terminal_text.cpp
     src/cli/streaming_terminal_text.cpp
     src/cli/terminal_capabilities.cpp
