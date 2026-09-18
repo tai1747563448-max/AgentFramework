@@ -69,6 +69,7 @@ add_library(agent_kernel STATIC
     src/application/task_evaluator.cpp
     src/application/benchmark_statistics.cpp
     src/services/dangerous_patterns.cpp
+    src/services/cost_tracker.cpp
     src/adapters/json/value_json.cpp
     src/adapters/json/strict_json.cpp
     src/adapters/rag/task_evidence_cache.cpp
@@ -350,6 +351,8 @@ add_agent_test(task_type_tests tests/domain/task_type_tests.cpp)
 target_link_libraries(task_type_tests PRIVATE agent_kernel)
 add_agent_test(dangerous_patterns_tests tests/services/dangerous_patterns_test.cpp)
 target_link_libraries(dangerous_patterns_tests PRIVATE agent_kernel)
+add_agent_test(cost_tracker_tests tests/services/cost_tracker_test.cpp)
+target_link_libraries(cost_tracker_tests PRIVATE agent_kernel)
 add_agent_test(reproc_jsonl_process_tests
     tests/adapters/reproc_jsonl_process_test.cpp)
 target_link_libraries(reproc_jsonl_process_tests PRIVATE

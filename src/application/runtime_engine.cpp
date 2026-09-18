@@ -663,6 +663,23 @@ RuntimeResult RuntimeEngine::continue_task(
             if (transition.fatal_error.has_value()) {
                 return transition;
             }
+            // T19: postModelCall hook (cost-tracker + future audit).
+            // The hook chain runs synchronously on the calling thread,
+            // after the model response has been durably recorded. The
+            // cost tracker uses this slot to append a usage.jsonl row
+            // without coupling the runtime to the sink.
+            if (hook_chain_) {
+                ModelResponse response_ref = state->last_model_request.has_value() &&
+                    state->accepted_model_stop_reason.has_value()
+                    ? response.value()
+                    : response.value();
+                HookPostModelCall post{
+                    state->session_link.has_value()
+                        ? state->session_link->session_id
+                        : std::string{},
+                    task_id, &response_ref, false};
+                hook_chain_->run_post_model_call(post);
+            }
             if (compact_requested && reactive_compact_trigger_) {
                 try {
                     reactive_compact_trigger_();
