@@ -14,6 +14,7 @@
 #include "ports/permission.h"
 #include "ports/stop_reason_codec.h"
 #include "ports/tool_gateway.h"
+#include "services/dangerous_patterns.h"
 
 #include <nlohmann/json.hpp>
 
@@ -768,6 +769,20 @@ RuntimeResult RuntimeEngine::continue_task(
                             observer);
                     }
                 }
+                // T21: dangerous-pattern gate. Runs after permission
+                // (so audit hooks still see the call) but before the
+                // gateway execute(), so a hit never reaches the host.
+                if (const auto* hit = match_dangerous_pattern(
+                        call.name, call.arguments)) {
+                    return append_event(
+                        state, task_id,
+                        TaskCancelledPayload{
+                            std::string("dangerous_pattern: ") + hit->id,
+                            {ErrorCode::InvalidTransition,
+                              "tool call matches dangerous_pattern rule",
+                              false}},
+                        observer);
+                }
                 auto tool_result = tools_.execute(
                     call, ToolExecutionContext{state->workspace_utf8});
                 if (!tool_result.has_value()) {
@@ -872,6 +887,37 @@ RuntimeResult RuntimeEngine::continue_task(
                         pre_denial_reason[offset] = pre.denial_reason;
                     }
                 }
+            }
+
+            // T21: dangerous-pattern scan. Runs after preToolUse (so
+            // audit hooks still observe every attempted call) but
+            // before any execute(). A hit cancels the task — the
+            // refusal is louder than a permission "deny" because the
+            // agent believes the model has been guided off-rails.
+            std::vector<bool> dangerous_hit(window_size, false);
+            std::vector<std::string> dangerous_reason(window_size);
+            for (std::size_t offset = 0; offset < window_size; ++offset) {
+                if (pre_denied[offset]) continue;
+                const ToolCall& call =
+                    state->pending_tool_calls.at(state->next_tool_index +
+                                                 offset);
+                if (const auto* hit = match_dangerous_pattern(
+                        call.name, call.arguments)) {
+                    dangerous_hit[offset] = true;
+                    dangerous_reason[offset] = hit->id;
+                }
+            }
+            for (std::size_t offset = 0; offset < window_size; ++offset) {
+                if (!dangerous_hit[offset]) continue;
+                return append_event(
+                    state, task_id,
+                    TaskCancelledPayload{
+                        std::string("dangerous_pattern: ") +
+                            dangerous_reason[offset],
+                        {ErrorCode::InvalidTransition,
+                         "tool call matches dangerous_pattern rule",
+                         false}},
+                    observer);
             }
 
             // T11: permission check, evaluated after the preToolUse
