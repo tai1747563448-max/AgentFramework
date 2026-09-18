@@ -128,6 +128,7 @@ add_library(agent_runtime STATIC
     src/cli/streaming_terminal_text.cpp
     src/cli/terminal_capabilities.cpp
     src/cli/terminal_presenter.cpp
+    src/cli/picker.cpp
     src/cli/interactive_cli.cpp
     src/cli/cli_app.cpp)
 target_include_directories(agent_runtime PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -256,6 +257,8 @@ add_agent_test(terminal_presenter_tests tests/cli/terminal_presenter_test.cpp)
 target_link_libraries(terminal_presenter_tests PRIVATE agent_runtime)
 add_agent_test(theme_tests tests/cli/theme_test.cpp)
 target_link_libraries(theme_tests PRIVATE agent_runtime)
+add_agent_test(picker_tests tests/cli/picker_test.cpp)
+target_link_libraries(picker_tests PRIVATE agent_runtime)
 add_agent_test(signal_cancellation_tests tests/adapters/signal_cancellation_test.cpp)
 target_link_libraries(signal_cancellation_tests PRIVATE agent_runtime)
 add_agent_test(runtime_config_tests tests/config/runtime_config_test.cpp)
