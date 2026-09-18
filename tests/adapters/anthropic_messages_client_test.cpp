@@ -818,6 +818,162 @@ TEST_CASE(cpr_transport_returns_redirect_without_contacting_redirect_target) {
     REQUIRE(response.value().status == 302);
 }
 
+TEST_CASE(cpr_transport_does_not_reuse_credentials_or_session_when_api_key_or_base_url_changes) {
+    // The transport must construct an isolated session for every call so a
+    // credential or host rotation never leaks the previous request's headers
+    // or body. The fixture listens for two sequential requests on the same
+    // loopback port and verifies the second request carries the new key and
+    // does not contain any residue from the first.
+    test::SocketRuntime sockets;
+    std::uint16_t port = 0;
+    const auto listener = test::create_loopback_listener(port);
+    const std::string first_key = "FIRST_KEY_SECRET";
+    const std::string second_key = "SECOND_KEY_SECRET";
+    const std::string first_body = "{\"messages\":[{\"role\":\"user\",\"content\":\"first\"}]}";
+    const std::string second_body = "{\"messages\":[{\"role\":\"user\",\"content\":\"second\"}]}";
+    std::string first_request;
+    std::string second_request;
+    std::size_t accepted = 0;
+
+    std::thread server([&] {
+        for (std::size_t index = 0; index < 2; ++index) {
+            if (test::wait_for_socket(listener, std::chrono::seconds(3)) != 1) break;
+            const auto connection = accept(listener, nullptr, nullptr);
+            if (connection == test::kInvalidSocket) break;
+            const auto captured = test::receive_http_request(connection);
+            if (accepted == 0) first_request = captured;
+            else if (accepted == 1) second_request = captured;
+            ++accepted;
+            test::send_all(connection,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                "Content-Length: 51\r\nConnection: close\r\n\r\n"
+                "{\"id\":\"ok\",\"stop_reason\":\"end_turn\",\"usage\":"
+                "{\"input_tokens\":1,\"output_tokens\":1}}");
+            test::close_socket(connection);
+        }
+        test::close_socket(listener);
+    });
+
+    agent::CprHttpTransport transport;
+    const auto first_response = transport.post(
+        {"http://127.0.0.1:" + std::to_string(port) + "/v1/messages",
+         {{"content-type", "application/json"},
+          {"x-api-key", first_key},
+          {"anthropic-version", "2023-06-01"}},
+         first_body, 5'000});
+
+    const auto second_response = transport.post(
+        {"http://127.0.0.1:" + std::to_string(port) + "/v2/messages",
+         {{"content-type", "application/json"},
+          {"x-api-key", second_key},
+          {"anthropic-version", "2023-06-01"}},
+         second_body, 5'000});
+
+    server.join();
+
+    REQUIRE(first_response.has_value());
+    REQUIRE(second_response.has_value());
+    REQUIRE(accepted == 2);
+    // First call sent the first credential and the first body.
+    REQUIRE(first_request.find(first_key) != std::string::npos);
+    REQUIRE(first_request.find(first_body) != std::string::npos);
+    REQUIRE(first_request.find(second_key) == std::string::npos);
+    REQUIRE(first_request.find(second_body) == std::string::npos);
+    // Second call must not carry any trace of the previous credentials or body
+    // even though the transport was reused. This catches accidental pooling
+    // where the previous x-api-key header leaks into a later call's outbound
+    // bytes.
+    REQUIRE(second_request.find(second_key) != std::string::npos);
+    REQUIRE(second_request.find(second_body) != std::string::npos);
+    REQUIRE(second_request.find(first_key) == std::string::npos);
+    REQUIRE(second_request.find(first_body) == std::string::npos);
+    // Different base URL means the second request hits /v2/messages, not the
+    // first call's /v1/messages path.
+    REQUIRE(second_request.find("POST /v2/messages ") != std::string::npos);
+    REQUIRE(second_request.find("POST /v1/messages ") == std::string::npos);
+}
+
+TEST_CASE(cpr_stream_long_stall_with_incomplete_frame_is_not_published_as_final_success) {
+    // The fixture opens the SSE envelope, ships a valid message_start +
+    // content_block_start + the first text_delta, then stalls for longer
+    // than a normal inter-event gap and finally closes the socket without
+    // ever sending content_block_stop / message_delta / message_stop. The
+    // transport must surface the partial event as ProtocolFailure; the
+    // preview text observed by the consumer must never be reported as a
+    // complete answer. This guards the first-text-presentation contract
+    // against a stream that legitimately started writing tokens but died
+    // mid-event.
+    test::SocketRuntime sockets;
+    std::uint16_t port = 0;
+    const auto listener = test::create_loopback_listener(port);
+    const auto begin = streaming_fixtures::beginning() +
+                       streaming_fixtures::text("early token");
+    bool server_error = false;
+    std::thread server([&] {
+        try {
+            if (test::wait_for_socket(listener, std::chrono::seconds(3)) != 1) {
+                server_error = true;
+                test::close_socket(listener);
+                return;
+            }
+            const auto connection = accept(listener, nullptr, nullptr);
+            if (connection == test::kInvalidSocket) {
+                server_error = true;
+                test::close_socket(listener);
+                return;
+            }
+            static_cast<void>(test::receive_http_request(connection));
+            test::send_all(connection,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                "Connection: close\r\n\r\n");
+            test::send_all(connection, begin);
+            // Simulate a long stall well beyond the decoder's per-event idle
+            // tolerance. The transport has to remain responsive to
+            // cancellation and report a clean failure rather than hang.
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            test::close_socket(connection);
+        } catch (...) {
+            server_error = true;
+        }
+        test::close_socket(listener);
+    });
+
+    agent::CprHttpTransport transport;
+    auto config = fixtures::config();
+    config.base_url = "http://127.0.0.1:" + std::to_string(port);
+    agent::AnthropicMessagesClient client(config, transport);
+    agent::ModelCallOptions options;
+    options.stream = true;
+    std::string preview;
+    int text_deltas = 0;
+    options.observer = [&](const agent::ModelStreamEvent& update) {
+        if (update.kind == agent::ModelStreamEventKind::TextDelta) {
+            preview += update.text;
+            ++text_deltas;
+        }
+    };
+    auto request = fixtures::simple_model_request();
+    request.timeout_ms = 5'000;
+    const auto result = client.complete(request, options);
+    server.join();
+
+    REQUIRE(!server_error);
+    // The consumer did observe the early token bytes that arrived before the
+    // stall, but the request must fail with ProtocolFailure rather than
+    // returning a successful response that the presenter could render as
+    // the final committed answer.
+    REQUIRE(text_deltas == 1);
+    REQUIRE(preview == "early token");
+    REQUIRE(!result.has_value());
+    REQUIRE(result.error().code == agent::ErrorCode::ProtocolFailure);
+    REQUIRE(!result.error().retryable);
+    // The Anthropic client surfaces a stream that ends without message_stop
+    // with a stable, presenter-recognisable failure code. Any change here
+    // would alter how the terminal presenter classifies the turn, so pin the
+    // message against accidental drift.
+    REQUIRE(result.error().message == "provider stream ended before message_stop");
+}
+
 TEST_CASE(anthropic_adapter_maps_ordered_tool_request_and_response) {
     test::FakeHttpTransport http(fixtures::anthropic_tool_response());
     agent::AnthropicMessagesClient client(fixtures::config(), http);
@@ -873,7 +1029,6 @@ TEST_CASE(anthropic_adapter_maps_ordered_tool_request_and_response) {
     REQUIRE(tool.arguments ==
             agent::Value::object({{"path", agent::Value("notes.txt")}}));
     REQUIRE(model_response.stop_reason == agent::StopReason::ToolUse);
-    REQUIRE(model_response.raw_stop_reason == "tool_use");
     REQUIRE(model_response.input_tokens == 12);
     REQUIRE(model_response.output_tokens == 6);
     REQUIRE(model_response.provider_request_id == "request-123");
@@ -1073,7 +1228,6 @@ TEST_CASE(anthropic_adapter_maps_all_known_and_unknown_stop_reasons) {
         const auto result = client.complete(fixtures::simple_model_request());
         REQUIRE(result.has_value());
         REQUIRE(result.value().stop_reason == item.mapped);
-        REQUIRE(result.value().raw_stop_reason == item.raw);
     }
 }
 
@@ -1102,7 +1256,6 @@ TEST_CASE(anthropic_adapter_preserves_empty_max_tokens_content) {
         }
         REQUIRE(result.has_value());
         REQUIRE(result.value().stop_reason == agent::StopReason::MaxTokens);
-        REQUIRE(result.value().raw_stop_reason == "max_tokens");
         if (item.expected_text == nullptr) {
             REQUIRE(result.value().content.empty());
         } else {

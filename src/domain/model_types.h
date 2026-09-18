@@ -48,7 +48,15 @@ struct ToolResultBlock {
     ToolResult result;
 };
 
-using ContentBlock = std::variant<TextBlock, ToolUseBlock, ToolResultBlock>;
+// T25: marker block the model emits when it thinks the conversation
+// needs compaction now. The runtime recognises this in the response and
+// invokes the reactive compact stage before continuing the loop.
+struct CompactRequestBlock {
+    std::string reason;
+};
+
+using ContentBlock = std::variant<TextBlock, ToolUseBlock, ToolResultBlock,
+                                  CompactRequestBlock>;
 
 struct Message {
     Role role;
@@ -77,27 +85,15 @@ struct ModelRequest {
 
 enum class StopReason { EndTurn, ToolUse, MaxTokens, StopSequence, Unknown };
 
-inline bool is_known_stop_reason_pair(StopReason stop_reason,
-                                      const std::string& raw_stop_reason) {
-    switch (stop_reason) {
-    case StopReason::EndTurn:
-        return raw_stop_reason == "end_turn";
-    case StopReason::ToolUse:
-        return raw_stop_reason == "tool_use";
-    case StopReason::MaxTokens:
-        return raw_stop_reason == "max_tokens";
-    case StopReason::StopSequence:
-        return raw_stop_reason == "stop_sequence";
-    case StopReason::Unknown:
-        return false;
-    }
-    return false;
-}
-
 struct ModelResponse {
     std::vector<ContentBlock> content;
+    // T12 (v2 §3): provider-neutral StopReason enum only. Adapters
+    // map their provider-specific string through ports/stop_reason_codec.h
+    // internally; the runtime no longer sees raw provider tokens.
+    // The former is_known_stop_reason_pair(raw, ...) helper moved to
+    // ports/stop_reason_codec.h::is_known_stop_reason(reason) so the
+    // runtime's check stays provider-neutral.
     StopReason stop_reason{StopReason::Unknown};
-    std::string raw_stop_reason;
     std::size_t input_tokens{0};
     std::size_t output_tokens{0};
     std::string provider_request_id;
@@ -246,6 +242,11 @@ inline bool operator==(const ToolResultBlock& left, const ToolResultBlock& right
     return left.result == right.result;
 }
 
+inline bool operator==(const CompactRequestBlock& left,
+                       const CompactRequestBlock& right) {
+    return left.reason == right.reason;
+}
+
 inline bool operator==(const Message& left, const Message& right) {
     return left.role == right.role && left.content == right.content;
 }
@@ -269,7 +270,6 @@ inline bool operator==(const ModelRequest& left, const ModelRequest& right) {
 
 inline bool operator==(const ModelResponse& left, const ModelResponse& right) {
     return left.content == right.content && left.stop_reason == right.stop_reason &&
-           left.raw_stop_reason == right.raw_stop_reason &&
            left.input_tokens == right.input_tokens &&
            left.output_tokens == right.output_tokens &&
            left.provider_request_id == right.provider_request_id;

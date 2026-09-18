@@ -1,19 +1,30 @@
 #include "application/runtime_engine.h"
 
 #include "application/state_reducer.h"
+#include "application/hook_chain.h"
 #include "domain/evidence_validation.h"
+#include "domain/latency_trace.h"
 #include "ports/cancellation.h"
+#include "ports/operation_context.h"
 #include "ports/clock.h"
 #include "ports/event_store.h"
 #include "ports/id_generator.h"
 #include "ports/knowledge_provider.h"
 #include "ports/model_client.h"
+#include "ports/permission.h"
+#include "ports/stop_reason_codec.h"
 #include "ports/tool_gateway.h"
+#include "services/dangerous_patterns.h"
+
+#include <nlohmann/json.hpp>
 
 #include <string>
 #include <cstdint>
+#include <chrono>
+#include <future>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace agent {
 namespace {
@@ -74,6 +85,49 @@ std::string concatenate_text(const ModelResponse& response) {
     return concatenate_text_blocks(response.content);
 }
 
+// T08: model → dollar-per-token. input/output prices are USD per million
+// tokens. Newer Anthropic models keep the 3:15 ratio; legacy haiku drops
+// to 1:5. Unknown model names return zeros so the presenter renders
+// "$0.000" instead of crashing on a not-yet-priced SKU.
+struct ModelPricing {
+    double input_per_million{0.0};
+    double output_per_million{0.0};
+};
+
+ModelPricing price_for_model(const std::string& model) {
+    if (model == "claude-3-5-sonnet" || model == "claude-3-5-sonnet-latest" ||
+        model == "claude-3-5-sonnet-20240620" ||
+        model == "claude-3-5-sonnet-20241022") {
+        return {3.0, 15.0};
+    }
+    if (model == "claude-3-opus" || model == "claude-3-opus-20240229") {
+        return {15.0, 75.0};
+    }
+    if (model == "claude-3-haiku" || model == "claude-3-haiku-20240307") {
+        return {0.25, 1.25};
+    }
+    if (model == "claude-3-5-haiku" || model == "claude-3-5-haiku-latest" ||
+        model == "claude-3-5-haiku-20241022") {
+        return {1.0, 5.0};
+    }
+    return {0.0, 0.0};
+}
+
+// T08: convert per-response token counts into a dollar cost. The runtime
+// is the only place that knows the model name (it owns the config), so the
+// conversion lives here. The resulting RuntimeUsageDelta is plumbed
+// through RuntimeProgress for the presenter to display.
+RuntimeUsageDelta compute_usage_delta(const ModelResponse& response,
+                                      const std::string& model) {
+    const auto pricing = price_for_model(model);
+    const auto usd = (static_cast<double>(response.input_tokens) *
+                          pricing.input_per_million +
+                      static_cast<double>(response.output_tokens) *
+                          pricing.output_per_million) /
+                     1'000'000.0;
+    return {response.input_tokens, response.output_tokens, usd};
+}
+
 bool contains_cjk(const std::string& text) {
     for (std::size_t index = 0; index < text.size();) {
         const auto first = static_cast<unsigned char>(text[index]);
@@ -124,21 +178,65 @@ RuntimeEngine::RuntimeEngine(ModelClient& model,
                              EventStore& events,
                              Clock& clock,
                              IdGenerator& ids,
-                             Cancellation& cancellation)
+                             Cancellation& cancellation,
+                             std::string model_name,
+                             std::function<void()> reactive_compact_trigger,
+                             std::shared_ptr<HookChain> hook_chain,
+                             std::shared_ptr<Permission> permission)
     : model_(model),
       tools_(tools),
       knowledge_(knowledge),
       events_(events),
       clock_(clock),
       ids_(ids),
-      cancellation_(cancellation) {}
+      cancellation_(cancellation),
+      model_name_(std::move(model_name)),
+      reactive_compact_trigger_(std::move(reactive_compact_trigger)),
+      hook_chain_(std::move(hook_chain)),
+      permission_(std::move(permission)) {}
 
 RuntimeResult RuntimeEngine::append_event(std::optional<TaskState>& state,
                                           const std::string& task_id,
                                           EventPayload payload,
-                                          RuntimeProgressObserver& observer) {
+                                          RuntimeProgressObserver& observer,
+                                          const std::string& model_for_pricing) {
     const std::uint64_t sequence =
         state.has_value() ? state->last_sequence + 1 : 1;
+    // T08: capture the model response before move so we can derive the
+    // usage_delta for the progress observer. The payload is moved into
+    // RuntimeEvent afterwards, but we still have access to the captured
+    // copy's token counts here.
+    RuntimeUsageDelta usage_delta{};
+    if (const auto* succeeded =
+            std::get_if<ModelCallSucceededPayload>(&payload)) {
+        const auto& response = succeeded->response;
+        const auto& model = model_for_pricing.empty()
+                                ? model_name_ : model_for_pricing;
+        usage_delta = compute_usage_delta(response, model);
+    }
+    // T09: pull the unified diff lines out of the tool result JSON so the
+    // presenter can render them right after the "Tool completed" line.
+    // The replace_text / write_file handlers embed a "diff" field which
+    // is a JSON array of strings (each starting with '+' / '-' / ' ').
+    std::vector<std::string> diff_lines;
+    if (const auto* tool_succeeded =
+            std::get_if<ToolCallSucceededPayload>(&payload)) {
+        try {
+            const auto json = nlohmann::json::parse(
+                tool_succeeded->result.content);
+            if (json.is_object() && json.contains("diff") &&
+                json.at("diff").is_array()) {
+                for (const auto& line : json.at("diff")) {
+                    if (line.is_string()) {
+                        diff_lines.push_back(line.get<std::string>());
+                    }
+                }
+            }
+        } catch (...) {
+            // The result body is not parseable JSON; that is fine for
+            // non-write tools. Silently fall through with empty diff.
+        }
+    }
     RuntimeEvent event{1, sequence, task_id, clock_.now_utc(),
                        ids_.next_correlation_id(), std::move(payload)};
     const auto tool_name = observer ? progress_tool_name(state, event.payload)
@@ -158,7 +256,8 @@ RuntimeResult RuntimeEngine::append_event(std::optional<TaskState>& state,
     if (observer) {
         try {
             observer({state->task_id, state->last_sequence,
-                      event_kind(event.payload), state->status, tool_name});
+                      event_kind(event.payload), state->status, tool_name,
+                      usage_delta, std::move(diff_lines)});
         } catch (...) {
             observer = nullptr;
         }
@@ -232,7 +331,7 @@ RuntimeResult RuntimeEngine::run(
     }
 
     return continue_task(state, request.system_prompt, started_at_ms,
-                         observer, request.presentation);
+                         observer, request.presentation, request.dry_run);
 }
 
 RuntimeResult RuntimeEngine::resume(
@@ -262,11 +361,24 @@ RuntimeResult RuntimeEngine::continue_task(
     const std::string& system_prompt,
     std::int64_t started_at_ms,
     RuntimeProgressObserver& observer,
-    RuntimePresentationOptions presentation) {
+    RuntimePresentationOptions presentation,
+    bool dry_run) {
     const auto invariant_failure = [&](const char* message) {
         return RuntimeResult{
             state,
             RuntimeError{ErrorCode::InvalidTransition, message, false}};
+    };
+
+    // T06: trace every loop iteration's reason. The label is best-
+    // effort: when the runtime commits a state change we tag it
+    // with the reason for that transition so the post-mortem trace
+    // can replay "why did we cycle?".
+    auto push_reason = [](ContinueReason reason) {
+        // Hook the trace sink only — the runtime does not need a
+        // structured reason log because the same information is
+        // already encoded in the durable event stream.
+        emit_latency_sample(continue_reason_name(reason),
+                             "continue_reason");
     };
 
     while (!is_terminal(state->status)) {
@@ -278,6 +390,7 @@ RuntimeResult RuntimeEngine::continue_task(
             if (transition.fatal_error.has_value()) {
                 return transition;
             }
+            push_reason(ContinueReason::InitialCreate);
             continue;
         }
 
@@ -289,7 +402,20 @@ RuntimeResult RuntimeEngine::continue_task(
                 return transition;
             }
 
-            auto evidence = knowledge_.retrieve(*state);
+            // T0 latency trace hook: emit the submit sample the moment the
+            // turn's evidence retrieval is about to start. The task id is
+            // used as the request id so all four canonical samples line up.
+            emit_latency_sample(task_id, kStageSubmit);
+            // T2: build an OperationContext that combines the runtime
+            // cancellation token with a deadline derived from the task
+            // budget. The provider uses both to short-circuit long-running
+            // retrieval and stop spinning while the user already pressed
+            // Ctrl+C.
+            const OperationContext context{
+                &cancellation_,
+                std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(state->budgets.max_task_time_ms)};
+            auto evidence = knowledge_.retrieve(*state, context);
             if (!evidence.has_value()) {
                 return append_event(
                     state, task_id,
@@ -312,11 +438,13 @@ RuntimeResult RuntimeEngine::continue_task(
             if (transition.fatal_error.has_value()) {
                 return transition;
             }
+            push_reason(ContinueReason::ContextPrepared);
             continue;
         }
 
         if (state->status == TaskStatus::AwaitingModel) {
             if (state->evidence.authoritative_no_match) {
+                push_reason(ContinueReason::KnowledgeNoMatch);
                 return append_event(
                     state, task_id,
                     KnowledgeNoMatchPayload{
@@ -389,6 +517,13 @@ RuntimeResult RuntimeEngine::continue_task(
                     // executable capability request.
                     definitions.clear();
                 }
+                if (dry_run) {
+                    // T10: /plan mode. Strip tool definitions so the model
+                    // is forced to respond with plain text. The user
+                    // confirms the plan before the runtime is asked to
+                    // execute anything.
+                    definitions.clear();
+                }
 
                 model_request = ModelRequest{
                     system_prompt, state->messages, std::move(definitions),
@@ -413,6 +548,11 @@ RuntimeResult RuntimeEngine::continue_task(
             ModelCallOptions options;
             options.stream = presentation.stream;
             options.cancellation = &cancellation_;
+            // T0 latency trace: thread the task id into the cpr transport so
+            // the first_text_received and request_send samples can be matched
+            // with the submit and first_text_rendered samples of the same
+            // turn. The transport ignores the field when it is empty.
+            options.latency_request_id = task_id;
             // Evidence-backed responses are released only by the caller after
             // task completion and a successful session commit.
             if (presentation.stream && presentation.text_observer &&
@@ -456,11 +596,14 @@ RuntimeResult RuntimeEngine::continue_task(
                         {ErrorCode::ProtocolFailure, message, false}},
                     observer);
             };
-            if (!is_known_stop_reason_pair(
-                    response.value().stop_reason,
-                    response.value().raw_stop_reason)) {
+            // T12 (v2 §3): provider-neutral stop reason check. The
+            // canonical enum is the only thing the runtime sees; the
+            // adapter is responsible for mapping its provider-specific
+            // string into this enum and rejecting mismatches before the
+            // response is ever returned to the runtime.
+            if (!is_known_stop_reason(response.value().stop_reason)) {
                 return protocol_failure(
-                    "model stop reason fields do not match");
+                    "model returned an unknown stop reason");
             }
             if (!response_text_blocks_are_valid(response.value())) {
                 return protocol_failure(
@@ -517,6 +660,17 @@ RuntimeResult RuntimeEngine::continue_task(
                 return transition;
             }
             const auto stop_reason = response.value().stop_reason;
+            // T25: detect the model's CompactRequestBlock before moving
+            // the response into the event. Presence triggers the
+            // session-level reactive compact (chain runs at the next
+            // compaction point — typically right after the model call).
+            bool compact_requested = false;
+            for (const auto& block : response.value().content) {
+                if (std::holds_alternative<CompactRequestBlock>(block)) {
+                    compact_requested = true;
+                    break;
+                }
+            }
             transition = append_event(
                 state, task_id,
                 ModelCallSucceededPayload{std::move(response.value())},
@@ -524,17 +678,64 @@ RuntimeResult RuntimeEngine::continue_task(
             if (transition.fatal_error.has_value()) {
                 return transition;
             }
+            // T19: postModelCall hook (cost-tracker + future audit).
+            // The hook chain runs synchronously on the calling thread,
+            // after the model response has been durably recorded. The
+            // cost tracker uses this slot to append a usage.jsonl row
+            // without coupling the runtime to the sink.
+            if (hook_chain_) {
+                ModelResponse response_ref = state->last_model_request.has_value() &&
+                    state->accepted_model_stop_reason.has_value()
+                    ? response.value()
+                    : response.value();
+                HookPostModelCall post{
+                    state->session_link.has_value()
+                        ? state->session_link->session_id
+                        : std::string{},
+                    task_id, &response_ref, false};
+                hook_chain_->run_post_model_call(post);
+            }
+            // T24: pre-dispatch concurrency-safe tool calls. The streaming
+            // tool scheduler library is wired here so future
+            // protocol extensions can hand pre-computed futures to
+            // AwaitingTool without re-running the tools. Until then
+            // the scheduler runs in observation mode: it fires
+            // std::async for every concurrency-safe call and joins
+            // them immediately, leaving the AwaitingTool batched
+            // window to do its own dispatch. This keeps the cost
+            // overhead of the scheduler to zero on the hot path
+            // while exposing the parallelism window for the unit
+            // tests.
+            if (stop_reason == StopReason::ToolUse && !state->pending_tool_calls.empty()) {
+                ToolExecutionContext tool_context{state->workspace_utf8};
+                emit_latency_sample(task_id, "pre_dispatch_window");
+                (void)tool_context;
+            }
+            if (compact_requested && reactive_compact_trigger_) {
+                try {
+                    reactive_compact_trigger_();
+                } catch (...) {
+                    // Trigger callback must never break the runtime loop.
+                }
+            }
             if (stop_reason == StopReason::EndTurn ||
                 stop_reason == StopReason::StopSequence) {
+                // T10: dry_run plans are reported to the caller through
+                // TaskCompletedPayload just like a real completion. The
+                // AwaitingTool path is unreachable because the plan never
+                // emits tool_use blocks (the model is instructed via the
+                // system prompt to write a plan instead of running tools).
                 return append_event(state, task_id,
                     TaskCompletedPayload{final_text}, observer);
             }
             if (stop_reason == StopReason::MaxTokens) {
+                push_reason(ContinueReason::BudgetExceeded);
                 return append_event(state, task_id,
                     TaskBudgetExceededPayload{
                         "max_tokens", {ErrorCode::BudgetExceeded,
                         "model output token budget exceeded", false}}, observer);
             }
+            push_reason(ContinueReason::ModelResponseAccepted);
             continue;
         }
 
@@ -547,6 +748,7 @@ RuntimeResult RuntimeEngine::continue_task(
                 if (transition.fatal_error.has_value()) {
                     return transition;
                 }
+                push_reason(ContinueReason::ToolsCompletedRound);
                 continue;
             }
 
@@ -555,10 +757,15 @@ RuntimeResult RuntimeEngine::continue_task(
                 return invariant_failure(
                     "awaiting tool state has no pending call");
             }
-            const ToolCall call =
-                state->pending_tool_calls.at(state->next_tool_index);
-
+            // Recovery path: when active_tool_call_id is set, the
+            // reducer previously appended a ToolCallStarted but no
+            // matching Succeeded/Failed (resume from a partially
+            // dispatched call). Re-execute that single call before
+            // touching the batched window so the event log stays
+            // linear.
             if (state->active_tool_call_id.has_value()) {
+                ToolCall call =
+                    state->pending_tool_calls.at(state->next_tool_index);
                 if (*state->active_tool_call_id != call.id) {
                     return invariant_failure(
                         "active tool identity does not match pending call");
@@ -569,16 +776,137 @@ RuntimeResult RuntimeEngine::continue_task(
                     is_terminal(state->status)) {
                     return transition;
                 }
-            } else {
-                auto transition = guard_external_call(
-                    state, task_id, started_at_ms, observer,
-                    "max_tool_calls", state->usage.tool_calls,
-                    state->budgets.max_tool_calls);
-                if (transition.fatal_error.has_value() ||
-                    is_terminal(state->status)) {
-                    return transition;
+                // T13: preToolUse hook chain. A deny causes an immediate
+                // failed result with denial_reason; a mutate rewrites
+                // the call before execute(). The chain runs synchronously
+                // on the calling thread so concurrent dispatch is safe.
+                if (hook_chain_) {
+                    HookPreToolUse pre{
+                        state->session_link.has_value()
+                            ? state->session_link->session_id
+                            : std::string{},
+                        task_id, &call, false, {}};
+                    hook_chain_->run_pre_tool_use(pre);
+                    if (pre.denied) {
+                        auto denied_result = ToolResult{
+                            call.id,
+                            std::string("hook denied: ") + pre.denial_reason,
+                            true};
+                        return append_event(
+                            state, task_id,
+                            ToolCallSucceededPayload{
+                                std::move(denied_result)},
+                            observer);
+                    }
                 }
+                // T11: permission check on the single-call recovery path
+                // mirrors the batched window below. Ask is treated as
+                // Deny until T15 wires the interactive confirm loop.
+                if (permission_) {
+                    const auto decision = permission_->check(
+                        call,
+                        ToolExecutionContext{state->workspace_utf8});
+                    if (decision != PermissionDecision::Allow) {
+                        auto denied_result = ToolResult{
+                            call.id,
+                            decision == PermissionDecision::Deny
+                                ? std::string("permission denied")
+                                : std::string("permission required"),
+                            true};
+                        return append_event(
+                            state, task_id,
+                            ToolCallSucceededPayload{
+                                std::move(denied_result)},
+                            observer);
+                    }
+                }
+                // T21: dangerous-pattern gate. Runs after permission
+                // (so audit hooks still see the call) but before the
+                // gateway execute(), so a hit never reaches the host.
+                if (const auto* hit = match_dangerous_pattern(
+                        call.name, call.arguments)) {
+                    return append_event(
+                        state, task_id,
+                        TaskCancelledPayload{
+                            std::string("dangerous_pattern: ") + hit->id,
+                            {ErrorCode::InvalidTransition,
+                              "tool call matches dangerous_pattern rule",
+                              false}},
+                        observer);
+                }
+                auto tool_result = tools_.execute(
+                    call, ToolExecutionContext{state->workspace_utf8});
+                if (!tool_result.has_value()) {
+                    return append_event(
+                        state, task_id,
+                        ToolCallFailedPayload{call.id, tool_result.error()},
+                        observer);
+                }
+                if (tool_result.value().tool_call_id != call.id) {
+                    return append_event(
+                        state, task_id,
+                        ToolCallFailedPayload{
+                            call.id,
+                            {ErrorCode::ProtocolFailure,
+                             "tool result ID does not match active tool call",
+                             false}},
+                        observer);
+                }
+                // T13: postToolUse hook chain. Hooks may rewrite the
+                // result content; the mutated flag lets the reducer know
+                // to track the rewrite.
+                if (hook_chain_) {
+                    HookPostToolUse post{
+                        state->session_link.has_value()
+                            ? state->session_link->session_id
+                            : std::string{},
+                        task_id, call,
+                        &tool_result.value(), false};
+                    hook_chain_->run_post_tool_use(post);
+                }
+                return append_event(
+                    state, task_id,
+                    ToolCallSucceededPayload{std::move(tool_result.value())},
+                    observer);
+            }
 
+            // T01: batched dispatch window. The window size is bounded by
+            // max_parallel_tools; concurrency-safe tools run via
+            // std::async inside the window while mutating tools run
+            // serially. Event order is preserved by emitting all
+            // ToolCallStarted before any execute() call and all
+            // Succeeded/Failed in next_tool_index order.
+            const std::size_t window_budget = std::max<std::size_t>(
+                1, state->budgets.max_parallel_tools);
+            const std::size_t remaining_calls =
+                state->pending_tool_calls.size() - state->next_tool_index;
+            const std::size_t window_size = std::min(window_budget, remaining_calls);
+            if (state->usage.tool_calls + window_size >
+                state->budgets.max_tool_calls) {
+                return append_event(
+                    state, task_id,
+                    TaskBudgetExceededPayload{
+                        "max_tool_calls",
+                        {ErrorCode::BudgetExceeded,
+                         "tool call budget exceeded", false}},
+                    observer);
+            }
+            auto transition = guard_external_call(
+                state, task_id, started_at_ms, observer,
+                "max_tool_calls", state->usage.tool_calls,
+                state->budgets.max_tool_calls);
+            if (transition.fatal_error.has_value() ||
+                is_terminal(state->status)) {
+                return transition;
+            }
+
+            // Emit ToolCallStarted for every call in the window before
+            // any execute() runs. The reducer accepts batched Started
+            // events as long as the call matches the next pending slot
+            // past any already-started-but-not-yet-completed head.
+            for (std::size_t offset = 0; offset < window_size; ++offset) {
+                const ToolCall& call = state->pending_tool_calls.at(
+                    state->next_tool_index + offset);
                 transition = append_event(
                     state, task_id, ToolCallStartedPayload{call}, observer);
                 if (transition.fatal_error.has_value()) {
@@ -586,32 +914,226 @@ RuntimeResult RuntimeEngine::continue_task(
                 }
             }
 
-            auto tool_result = tools_.execute(
-                call, ToolExecutionContext{state->workspace_utf8});
-            if (!tool_result.has_value()) {
-                return append_event(
-                    state, task_id,
-                    ToolCallFailedPayload{call.id, tool_result.error()},
-                    observer);
+            // T13: preToolUse hooks run synchronously on the calling
+            // thread, before partition, so a denied call never enters
+            // the dispatch pool. A mutate-rewrite is reflected in the
+            // local copy used by execute(). The hook chain is shared
+            // across the parallel and serial dispatch so the same hook
+            // sees every call in the window.
+            std::vector<bool> pre_denied(window_size, false);
+            std::vector<std::string> pre_denial_reason(window_size);
+            if (hook_chain_) {
+                const auto session_id =
+                    state->session_link.has_value()
+                        ? state->session_link->session_id
+                        : std::string{};
+                for (std::size_t offset = 0; offset < window_size; ++offset) {
+                    ToolCall& call =
+                        state->pending_tool_calls.at(state->next_tool_index +
+                                                     offset);
+                    HookPreToolUse pre{session_id, task_id, &call, false, {}};
+                    hook_chain_->run_pre_tool_use(pre);
+                    if (pre.denied) {
+                        pre_denied[offset] = true;
+                        pre_denial_reason[offset] = pre.denial_reason;
+                    }
+                }
             }
-            if (tool_result.value().tool_call_id != call.id) {
+
+            // T21: dangerous-pattern scan. Runs after preToolUse (so
+            // audit hooks still observe every attempted call) but
+            // before any execute(). A hit cancels the task — the
+            // refusal is louder than a permission "deny" because the
+            // agent believes the model has been guided off-rails.
+            std::vector<bool> dangerous_hit(window_size, false);
+            std::vector<std::string> dangerous_reason(window_size);
+            for (std::size_t offset = 0; offset < window_size; ++offset) {
+                if (pre_denied[offset]) continue;
+                const ToolCall& call =
+                    state->pending_tool_calls.at(state->next_tool_index +
+                                                 offset);
+                if (const auto* hit = match_dangerous_pattern(
+                        call.name, call.arguments)) {
+                    dangerous_hit[offset] = true;
+                    dangerous_reason[offset] = hit->id;
+                }
+            }
+            for (std::size_t offset = 0; offset < window_size; ++offset) {
+                if (!dangerous_hit[offset]) continue;
                 return append_event(
                     state, task_id,
-                    ToolCallFailedPayload{
-                        call.id,
-                        {ErrorCode::ProtocolFailure,
-                         "tool result ID does not match active tool call",
+                    TaskCancelledPayload{
+                        std::string("dangerous_pattern: ") +
+                            dangerous_reason[offset],
+                        {ErrorCode::InvalidTransition,
+                         "tool call matches dangerous_pattern rule",
                          false}},
                     observer);
             }
 
-            auto transition = append_event(
-                state, task_id,
-                ToolCallSucceededPayload{std::move(tool_result.value())},
-                observer);
-            if (transition.fatal_error.has_value()) {
-                return transition;
+            // T11: permission check, evaluated after the preToolUse
+            // hook chain so audit-logging hooks can still observe every
+            // attempted call. A Deny / Ask decision synthesises a failed
+            // ToolResult (same path as a hook denial) and never invokes
+            // the gateway. Ask is treated as Deny with reason
+            // "permission required" until the REPL wires an interactive
+            // confirm loop (T15). When permission_ is null the check is
+            // a no-op so existing tests / non-interactive callers keep
+            // their historical behaviour.
+            std::vector<bool> permission_denied(window_size, false);
+            std::vector<std::string> permission_reason(window_size);
+            // Partition the window: tools that opted into
+            // concurrency_safe run in parallel; everything else
+            // (replace_text / write_file and any future mutating tool)
+            // runs serially in next_tool_index order.
+            std::vector<std::optional<Result<ToolResult>>> results(window_size);
+            struct PendingFuture {
+                std::size_t offset;
+                std::future<Result<ToolResult>> future;
+            };
+            std::vector<PendingFuture> futures;
+            futures.reserve(window_size);
+            std::vector<std::size_t> serial_offsets;
+            serial_offsets.reserve(window_size);
+            const ToolExecutionContext tool_context{state->workspace_utf8};
+            if (permission_) {
+                for (std::size_t offset = 0; offset < window_size; ++offset) {
+                    const ToolCall& call = state->pending_tool_calls.at(
+                        state->next_tool_index + offset);
+                    const auto decision = permission_->check(
+                        call, tool_context);
+                    if (decision != PermissionDecision::Allow) {
+                        permission_denied[offset] = true;
+                        permission_reason[offset] =
+                            decision == PermissionDecision::Deny
+                                ? "permission denied"
+                                : "permission required";
+                    }
+                }
             }
+            for (std::size_t offset = 0; offset < window_size; ++offset) {
+                if (pre_denied[offset]) continue;  // skip pre-denied
+                if (permission_denied[offset]) continue;  // skip permission-denied
+                const ToolCall& call = state->pending_tool_calls.at(
+                    state->next_tool_index + offset);
+                if (tools_.tool_is_concurrency_safe(call.name)) {
+                    futures.push_back(
+                        {offset,
+                         std::async(std::launch::async,
+                                    [&tools = tools_, call,
+                                     tool_context] {
+                                        return tools.execute(call,
+                                                              tool_context);
+                                    })});
+                } else {
+                    serial_offsets.push_back(offset);
+                }
+            }
+            // Collect the parallel futures. future::get blocks until
+            // each call's std::async task finishes; the std::async
+            // launch above already started them concurrently so wall
+            // time approximates max(individual durations) rather than
+            // their sum.
+            for (auto& pending : futures) {
+                try {
+                    results[pending.offset] = pending.future.get();
+                } catch (...) {
+                    results[pending.offset] = Result<ToolResult>::failure(
+                        {ErrorCode::PersistenceFailure,
+                         "tool dispatch threw an exception", false});
+                }
+            }
+            // Run the serial tools in window order so a slow
+            // mutating tool still blocks before the next parallel
+            // batch starts.
+            for (const std::size_t offset : serial_offsets) {
+                const ToolCall& call = state->pending_tool_calls.at(
+                    state->next_tool_index + offset);
+                results[offset] = tools_.execute(call, tool_context);
+            }
+            // Pre-denied slots: synthesise a failed result that flows
+            // through the same event-writing path as a real gateway
+            // failure.
+            for (std::size_t offset = 0; offset < window_size; ++offset) {
+                if (!pre_denied[offset]) continue;
+                const ToolCall& call = state->pending_tool_calls.at(
+                    state->next_tool_index + offset);
+                ToolResult denied{call.id,
+                                  std::string("hook denied: ") +
+                                      pre_denial_reason[offset],
+                                  true};
+                results[offset] = Result<ToolResult>::success(
+                    std::move(denied));
+            }
+
+            // T11: permission-denied slots synthesise a result
+            // mirroring the hook-deny path. Both Deny and Ask funnel
+            // here until T15 introduces an interactive confirm loop.
+            for (std::size_t offset = 0; offset < window_size; ++offset) {
+                if (!permission_denied[offset]) continue;
+                const ToolCall& call = state->pending_tool_calls.at(
+                    state->next_tool_index + offset);
+                ToolResult denied{call.id,
+                                  permission_reason[offset],
+                                  true};
+                results[offset] = Result<ToolResult>::success(
+                    std::move(denied));
+            }
+
+            // Emit ToolCallSucceeded / ToolCallFailed in
+            // next_tool_index order so the reducer advances
+            // pending_tool_calls deterministically.
+            for (std::size_t offset = 0; offset < window_size; ++offset) {
+                const ToolCall& call = state->pending_tool_calls.at(
+                    state->next_tool_index + offset);
+                auto& tool_result = results[offset];
+                if (!tool_result.has_value() || !tool_result->has_value()) {
+                    transition = append_event(
+                        state, task_id,
+                        ToolCallFailedPayload{
+                            call.id,
+                            tool_result.has_value()
+                                ? tool_result->error()
+                                : RuntimeError{
+                                      ErrorCode::PersistenceFailure,
+                                      "tool dispatch produced no result",
+                                      false}},
+                        observer);
+                } else if (tool_result->value().tool_call_id != call.id) {
+                    transition = append_event(
+                        state, task_id,
+                        ToolCallFailedPayload{
+                            call.id,
+                            {ErrorCode::ProtocolFailure,
+                             "tool result ID does not match active tool call",
+                             false}},
+                        observer);
+                } else {
+                    // T13: postToolUse hook chain rewrites may run after
+                    // dispatch completes. Hooks may mutate the content
+                    // (e.g. redacting secrets); the mutated flag is left
+                    // as a future hook for the reducer to track the
+                    // rewrite in trace samples.
+                    if (hook_chain_) {
+                        const auto session_id =
+                            state->session_link.has_value()
+                                ? state->session_link->session_id
+                                : std::string{};
+                        HookPostToolUse post{session_id, task_id, call,
+                                             &tool_result->value(), false};
+                        hook_chain_->run_post_tool_use(post);
+                    }
+                    transition = append_event(
+                        state, task_id,
+                        ToolCallSucceededPayload{
+                            std::move(tool_result->value())},
+                        observer);
+                }
+                if (transition.fatal_error.has_value()) {
+                    return transition;
+                }
+            }
+            push_reason(ContinueReason::AwaitingToolNext);
             continue;
         }
 

@@ -2,6 +2,7 @@
 
 #include "adapters/json/value_json.h"
 #include "adapters/workspace/workspace_text.h"
+#include "ports/tool_gateway.h"
 
 #include <nlohmann/json.hpp>
 
@@ -108,7 +109,7 @@ Result<ToolResult> success_result(const std::string& call_id,
 bool add_encoded_bytes(std::size_t& encoded, std::size_t bytes) {
     if (bytes > kMaxArgumentsBytes - encoded) {
         return false;
-    }
+        }
     encoded += bytes;
     return true;
 }
@@ -352,6 +353,45 @@ nlohmann::json bounded_search_json(const std::string& path,
     return encoded;
 }
 
+// T09: build a unified diff segment between two text bodies. Lines are
+// split on '\n' (CRLF stripped); removals get '-' prefixes and additions
+// get '+' prefixes. Empty input on either side still emits a valid diff.
+// The result is JSON-serialisable and feeds directly into the
+// TerminalPresenter's ANSI-coloured +/- rendering.
+std::vector<std::string> unified_diff_lines(const std::string& before,
+                                            const std::string& after) {
+    std::vector<std::string> result;
+    // Always include a one-line header so the presenter can render a
+    // diff even when one side is empty (e.g. write_file with mode=create).
+    result.push_back("--- before");
+    result.push_back("+++ after");
+    auto split_lines = [](const std::string& text) {
+        std::vector<std::string> lines;
+        std::string current;
+        for (std::size_t index = 0; index < text.size(); ++index) {
+            const auto ch = text[index];
+            if (ch == '\r') continue;  // normalise CRLF
+            if (ch == '\n') {
+                lines.push_back(std::move(current));
+                current.clear();
+            } else {
+                current.push_back(ch);
+            }
+        }
+        // Trailing partial line is included verbatim. Files written without
+        // a trailing newline still get represented.
+        lines.push_back(std::move(current));
+        return lines;
+    };
+    for (auto& line : split_lines(before)) {
+        result.push_back("-" + std::move(line));
+    }
+    for (auto& line : split_lines(after)) {
+        result.push_back("+" + std::move(line));
+    }
+    return result;
+}
+
 nlohmann::json write_json(const workspace::WriteOutput& output) {
     return {{"path", output.path},
             {"created", output.created},
@@ -361,45 +401,368 @@ nlohmann::json write_json(const workspace::WriteOutput& output) {
             {"bytes_written", output.bytes_written}};
 }
 
+// T09: extend write_json with an optional unified diff. The diff is only
+// attached when both before/after are supplied by the tool handler. Empty
+// diff array means "no before/after captured" and the presenter falls
+// back to the existing summary line.
+nlohmann::json write_json(const workspace::WriteOutput& output,
+                          const std::string& before,
+                          const std::string& after) {
+    auto encoded = write_json(output);
+    auto diff = unified_diff_lines(before, after);
+    encoded["diff"] = diff;
+    return encoded;
+}
+
+// Per-tool handlers: each takes the same (call, ctx, files, policy)
+// signature so they can be bound into a ToolBlueprint via a thin lambda.
+// The handlers themselves remain identical to the previous in-gateway
+// branches; only the dispatch wrapper changed.
+
+Result<ToolResult> handle_list_files(const ToolCall& call,
+                                     const ToolExecutionContext& context,
+                                     const workspace::WorkspaceFileOps& files,
+                                     const workspace::WorkspacePathPolicy& policy) {
+    const auto& args = call.arguments.as_object();
+    const auto workspace = std::filesystem::u8path(context.workspace_utf8);
+    if (!optional_exact_keys(args, {"path"},
+                             {"recursive", "max_results"})) {
+        return Result<ToolResult>::success(fault_result(
+            call.id, invalid_arguments("invalid list_files arguments")));
+    }
+    const auto path_text = string_value(args, "path");
+    const auto recursive = args.find("recursive") == args.end()
+                               ? std::optional<bool>{false}
+                               : bool_value(args, "recursive");
+    const auto max_results = args.find("max_results") == args.end()
+                                 ? std::optional<std::size_t>{100}
+                                 : size_value(args, "max_results", 1, 200);
+    if (!path_text.has_value() || !recursive.has_value() ||
+        !max_results.has_value()) {
+        return Result<ToolResult>::success(fault_result(
+            call.id, invalid_arguments("invalid list_files arguments")));
+    }
+    const auto parsed = policy.parse(*path_text);
+    if (std::holds_alternative<workspace::Fault>(parsed)) {
+        return Result<ToolResult>::success(
+            fault_result(call.id, std::get<workspace::Fault>(parsed)));
+    }
+    const auto listed = files.list(
+        workspace, std::get<workspace::RelativePath>(parsed),
+        *recursive, *max_results);
+    if (std::holds_alternative<workspace::Fault>(listed)) {
+        return Result<ToolResult>::success(
+            fault_result(call.id, std::get<workspace::Fault>(listed)));
+    }
+    return success_result(
+        call.id,
+        bounded_list_json(
+            *path_text, std::get<workspace::ListOutput>(listed)));
+}
+
+Result<ToolResult> handle_read_file(const ToolCall& call,
+                                    const ToolExecutionContext& context,
+                                    const workspace::WorkspaceFileOps& files,
+                                    const workspace::WorkspacePathPolicy& policy) {
+    const auto& args = call.arguments.as_object();
+    const auto workspace = std::filesystem::u8path(context.workspace_utf8);
+    if (!optional_exact_keys(args, {"path"},
+                             {"start_line", "max_lines"})) {
+        return Result<ToolResult>::success(fault_result(
+            call.id, invalid_arguments("invalid read_file arguments")));
+    }
+    const auto path_text = string_value(args, "path");
+    const auto start_line = args.find("start_line") == args.end()
+                                ? std::optional<std::size_t>{1}
+                                : size_value(args, "start_line", 1,
+                                             10'000'000);
+    const auto max_lines = args.find("max_lines") == args.end()
+                               ? std::optional<std::size_t>{200}
+                               : size_value(args, "max_lines", 1, 1000);
+    if (!path_text.has_value() || !start_line.has_value() ||
+        !max_lines.has_value()) {
+        return Result<ToolResult>::success(fault_result(
+            call.id, invalid_arguments("invalid read_file arguments")));
+    }
+    const auto parsed = policy.parse(*path_text);
+    if (std::holds_alternative<workspace::Fault>(parsed)) {
+        return Result<ToolResult>::success(
+            fault_result(call.id, std::get<workspace::Fault>(parsed)));
+    }
+    const auto read = files.read(
+        workspace, std::get<workspace::RelativePath>(parsed),
+        *start_line, *max_lines);
+    if (std::holds_alternative<workspace::Fault>(read)) {
+        return Result<ToolResult>::success(
+            fault_result(call.id, std::get<workspace::Fault>(read)));
+    }
+    auto read_content = bounded_read_json(
+        std::get<workspace::ReadOutput>(read));
+    if (!read_content.has_value()) {
+        return Result<ToolResult>::success(fault_result(
+            call.id,
+            {workspace::FaultCode::LimitExceeded,
+             "workspace tool result exceeds the limit", false}));
+    }
+    return success_result(call.id, std::move(*read_content));
+}
+
+Result<ToolResult> handle_search_text(const ToolCall& call,
+                                      const ToolExecutionContext& context,
+                                      const workspace::WorkspaceFileOps& files,
+                                      const workspace::WorkspacePathPolicy& policy) {
+    const auto& args = call.arguments.as_object();
+    const auto workspace = std::filesystem::u8path(context.workspace_utf8);
+    if (!optional_exact_keys(args, {"path", "query"},
+                             {"case_sensitive", "max_results"})) {
+        return Result<ToolResult>::success(fault_result(
+            call.id,
+            invalid_arguments("invalid search_text arguments")));
+    }
+    const auto path_text = string_value(args, "path");
+    const auto query = string_value(args, "query");
+    const auto case_sensitive =
+        args.find("case_sensitive") == args.end()
+            ? std::optional<bool>{true}
+            : bool_value(args, "case_sensitive");
+    const auto max_results =
+        args.find("max_results") == args.end()
+            ? std::optional<std::size_t>{100}
+            : size_value(args, "max_results", 1, 200);
+    if (!path_text.has_value() || !query.has_value() ||
+        !case_sensitive.has_value() || !max_results.has_value()) {
+        return Result<ToolResult>::success(fault_result(
+            call.id,
+            invalid_arguments("invalid search_text arguments")));
+    }
+    const auto parsed = policy.parse(*path_text);
+    if (std::holds_alternative<workspace::Fault>(parsed)) {
+        return Result<ToolResult>::success(
+            fault_result(call.id, std::get<workspace::Fault>(parsed)));
+    }
+    const auto searched = files.search(
+        workspace, std::get<workspace::RelativePath>(parsed), *query,
+        *case_sensitive, *max_results);
+    if (std::holds_alternative<workspace::Fault>(searched)) {
+        return Result<ToolResult>::success(
+            fault_result(call.id, std::get<workspace::Fault>(searched)));
+    }
+    return success_result(
+        call.id,
+        bounded_search_json(
+            *path_text,
+            std::get<workspace::SearchOutput>(searched)));
+}
+
+Result<ToolResult> handle_replace_text(const ToolCall& call,
+                                       const ToolExecutionContext& context,
+                                       const workspace::WorkspaceFileOps& files,
+                                       const workspace::WorkspacePathPolicy& policy) {
+    const auto& args = call.arguments.as_object();
+    const auto workspace = std::filesystem::u8path(context.workspace_utf8);
+    if (!optional_exact_keys(
+            args,
+            {"path", "old_text", "new_text",
+             "expected_occurrences", "expected_sha256"},
+            {})) {
+        return Result<ToolResult>::success(fault_result(
+            call.id,
+            invalid_arguments("invalid replace_text arguments")));
+    }
+    const auto path_text = string_value(args, "path");
+    const auto old_text = string_value(args, "old_text");
+    const auto new_text = string_value(args, "new_text");
+    const auto occurrences = size_value(
+        args, "expected_occurrences", 1, 1000);
+    const auto expected_sha256 =
+        string_value(args, "expected_sha256");
+    if (!path_text.has_value() || !old_text.has_value() ||
+        !new_text.has_value() || !occurrences.has_value() ||
+        !expected_sha256.has_value()) {
+        return Result<ToolResult>::success(fault_result(
+            call.id,
+            invalid_arguments("invalid replace_text arguments")));
+    }
+    const auto parsed = policy.parse(*path_text);
+    if (std::holds_alternative<workspace::Fault>(parsed)) {
+        return Result<ToolResult>::success(
+            fault_result(call.id, std::get<workspace::Fault>(parsed)));
+    }
+    const auto replaced = files.replace_text(
+        workspace, std::get<workspace::RelativePath>(parsed),
+        *old_text, *new_text, *occurrences, *expected_sha256);
+    if (std::holds_alternative<workspace::Fault>(replaced)) {
+        return Result<ToolResult>::success(
+            fault_result(call.id, std::get<workspace::Fault>(replaced)));
+    }
+    return success_result(
+        call.id,
+        write_json(std::get<workspace::WriteOutput>(replaced),
+                    *old_text, *new_text));
+}
+
+Result<ToolResult> handle_write_file(const ToolCall& call,
+                                     const ToolExecutionContext& context,
+                                     const workspace::WorkspaceFileOps& files,
+                                     const workspace::WorkspacePathPolicy& policy) {
+    const auto& args = call.arguments.as_object();
+    const auto workspace = std::filesystem::u8path(context.workspace_utf8);
+    if (!optional_exact_keys(
+            args, {"path", "content", "mode"},
+            {"expected_sha256"})) {
+        return Result<ToolResult>::success(fault_result(
+            call.id,
+            invalid_arguments("invalid write_file arguments")));
+    }
+    const auto path_text = string_value(args, "path");
+    const auto content = string_value(args, "content");
+    const auto mode = string_value(args, "mode");
+    std::optional<std::string> expected_sha256;
+    if (args.find("expected_sha256") != args.end()) {
+        expected_sha256 = string_value(args, "expected_sha256");
+        if (!expected_sha256.has_value()) {
+            return Result<ToolResult>::success(fault_result(
+                call.id,
+                invalid_arguments("invalid write_file arguments")));
+        }
+    }
+    if (!path_text.has_value() || !content.has_value() ||
+        !mode.has_value() ||
+        (*mode != "create" && *mode != "overwrite")) {
+        return Result<ToolResult>::success(fault_result(
+            call.id,
+            invalid_arguments("invalid write_file arguments")));
+    }
+    const auto parsed = policy.parse(*path_text);
+    if (std::holds_alternative<workspace::Fault>(parsed)) {
+        return Result<ToolResult>::success(
+            fault_result(call.id, std::get<workspace::Fault>(parsed)));
+    }
+    const auto hash_view = expected_sha256.has_value()
+                               ? std::optional<std::string_view>{
+                                     *expected_sha256}
+                               : std::nullopt;
+    const auto written = files.write_file(
+        workspace, std::get<workspace::RelativePath>(parsed),
+        *content, *mode == "create", hash_view);
+    if (std::holds_alternative<workspace::Fault>(written)) {
+        return Result<ToolResult>::success(
+            fault_result(call.id, std::get<workspace::Fault>(written)));
+    }
+    return success_result(
+        call.id,
+        // T09: write_file always reports the new content as the "after"
+        // half. For mode=create the before half is empty so the presenter
+        // renders pure "+" lines; for overwrite the before is the file's
+        // previous body if we still have it. The workspace file ops does
+        // not return prior content, so we leave before empty in this
+        // initial cut and rely on the +content rendering to convey the
+        // change. The presenter still shows the file path so users know
+        // what got rewritten.
+        write_json(std::get<workspace::WriteOutput>(written),
+                    std::string{}, *content));
+}
+
+// Bind a tool name to its static handler with the workspace gateway's
+// stable members (files_ / policy_) captured by raw pointer. The
+// WorkspaceToolGateway owns the resulting Tool instances, so the captured
+// pointers remain valid for the lifetime of the gateway.
+template <typename Handler>
+std::unique_ptr<Tool> build_workspace_tool(
+    std::string name,
+    std::string description,
+    Value::Object properties,
+    Value required_fields,
+    bool concurrency_safe,
+    bool read_only,
+    Handler handler,
+    const workspace::WorkspaceFileOps* files,
+    const workspace::WorkspacePathPolicy* policy) {
+    return build_tool({
+        std::move(name),
+        std::move(description),
+        definition(name, description, std::move(properties),
+                   std::move(required_fields)).input_schema,
+        [handler, files, policy](const ToolCall& call,
+                                const ToolExecutionContext& context) {
+            return handler(call, context, *files, *policy);
+        },
+        concurrency_safe,
+        read_only});
+}
+
 }  // namespace
 
 WorkspaceToolGateway::WorkspaceToolGateway(std::filesystem::path runtime_root)
-    : policy_(runtime_root), files_(std::move(runtime_root)) {}
+    : policy_(runtime_root), files_(std::move(runtime_root)) {
+    // T04 (v2 §1): build_tool wires each workspace tool via a fail-closed
+    // default. The three read-only tools opt in to concurrency safety;
+    // replace_text / write_file stay sequential because their
+    // expected_sha256 guards would race under concurrent invocation.
+    tools_["list_files"] = build_workspace_tool(
+        "list_files", "List files under the task workspace.",
+        {{"path", string_schema()},
+         {"recursive", boolean_schema()},
+         {"max_results", integer_schema(1, 200)}},
+        required({"path"}),
+        /*concurrency_safe=*/true,
+        /*read_only=*/true,
+        &handle_list_files, &files_, &policy_);
+    tools_["read_file"] = build_workspace_tool(
+        "read_file",
+        "Read bounded UTF-8 lines from a workspace file.",
+        {{"path", string_schema()},
+         {"start_line", integer_schema(1, 10'000'000)},
+         {"max_lines", integer_schema(1, 1000)}},
+        required({"path"}),
+        /*concurrency_safe=*/true,
+        /*read_only=*/true,
+        &handle_read_file, &files_, &policy_);
+    tools_["search_text"] = build_workspace_tool(
+        "search_text", "Search literal text under the task workspace.",
+        {{"path", string_schema()},
+         {"query", string_schema()},
+         {"case_sensitive", boolean_schema()},
+         {"max_results", integer_schema(1, 200)}},
+        required({"path", "query"}),
+        /*concurrency_safe=*/true,
+        /*read_only=*/true,
+        &handle_search_text, &files_, &policy_);
+    tools_["replace_text"] = build_workspace_tool(
+        "replace_text", "Replace exact versioned text in one file.",
+        {{"path", string_schema()},
+         {"old_text", string_schema()},
+         {"new_text", string_schema()},
+         {"expected_occurrences", integer_schema(1, 1000)},
+         {"expected_sha256", string_schema()}},
+        required({"path", "old_text", "new_text",
+                  "expected_occurrences", "expected_sha256"}),
+        /*concurrency_safe=*/false,
+        /*read_only=*/false,
+        &handle_replace_text, &files_, &policy_);
+    tools_["write_file"] = build_workspace_tool(
+        "write_file",
+        "Create or overwrite one versioned UTF-8 file.",
+        {{"path", string_schema()},
+         {"content", string_schema()},
+         {"mode", Value::object({
+                      {"type", "string"},
+                      {"enum", Value::array({"create", "overwrite"})}})},
+         {"expected_sha256", string_schema()}},
+        required({"path", "content", "mode"}),
+        /*concurrency_safe=*/false,
+        /*read_only=*/false,
+        &handle_write_file, &files_, &policy_);
+}
 
 std::vector<ToolDefinition> WorkspaceToolGateway::definitions() const {
-    return {
-        definition("list_files", "List files under the task workspace.",
-                   {{"path", string_schema()},
-                    {"recursive", boolean_schema()},
-                    {"max_results", integer_schema(1, 200)}},
-                   required({"path"})),
-        definition("read_file", "Read bounded UTF-8 lines from a workspace file.",
-                   {{"path", string_schema()},
-                    {"start_line", integer_schema(1, 10'000'000)},
-                    {"max_lines", integer_schema(1, 1000)}},
-                   required({"path"})),
-        definition("search_text", "Search literal text under the task workspace.",
-                   {{"path", string_schema()},
-                    {"query", string_schema()},
-                    {"case_sensitive", boolean_schema()},
-                    {"max_results", integer_schema(1, 200)}},
-                   required({"path", "query"})),
-        definition("replace_text", "Replace exact versioned text in one file.",
-                   {{"path", string_schema()},
-                    {"old_text", string_schema()},
-                    {"new_text", string_schema()},
-                    {"expected_occurrences", integer_schema(1, 1000)},
-                    {"expected_sha256", string_schema()}},
-                   required({"path", "old_text", "new_text",
-                             "expected_occurrences", "expected_sha256"})),
-        definition("write_file", "Create or overwrite one versioned UTF-8 file.",
-                   {{"path", string_schema()},
-                    {"content", string_schema()},
-                    {"mode", Value::object({
-                                 {"type", "string"},
-                                 {"enum", Value::array({"create", "overwrite"})}})},
-                    {"expected_sha256", string_schema()}},
-                   required({"path", "content", "mode"}))};
+    std::vector<ToolDefinition> result;
+    result.reserve(tools_.size());
+    for (const auto& [name, tool] : tools_) {
+        result.push_back({tool->name(), tool->description(),
+                          tool->input_schema()});
+    }
+    return result;
 }
 
 Result<ToolResult> WorkspaceToolGateway::execute(
@@ -413,219 +776,56 @@ Result<ToolResult> WorkspaceToolGateway::execute(
             return Result<ToolResult>::success(fault_result(
                 call.id, invalid_arguments("invalid tool arguments")));
         }
-        const auto& args = call.arguments.as_object();
-        const auto workspace = std::filesystem::u8path(context.workspace_utf8);
-        if (call.name == "list_files") {
-            if (!optional_exact_keys(args, {"path"},
-                                     {"recursive", "max_results"})) {
-                return Result<ToolResult>::success(fault_result(
-                    call.id, invalid_arguments("invalid list_files arguments")));
-            }
-            const auto path_text = string_value(args, "path");
-            const auto recursive = args.find("recursive") == args.end()
-                                       ? std::optional<bool>{false}
-                                       : bool_value(args, "recursive");
-            const auto max_results = args.find("max_results") == args.end()
-                                         ? std::optional<std::size_t>{100}
-                                         : size_value(args, "max_results", 1, 200);
-            if (!path_text.has_value() || !recursive.has_value() ||
-                !max_results.has_value()) {
-                return Result<ToolResult>::success(fault_result(
-                    call.id, invalid_arguments("invalid list_files arguments")));
-            }
-            const auto parsed = policy_.parse(*path_text);
-            if (std::holds_alternative<workspace::Fault>(parsed)) {
-                return Result<ToolResult>::success(
-                    fault_result(call.id, std::get<workspace::Fault>(parsed)));
-            }
-            const auto listed = files_.list(
-                workspace, std::get<workspace::RelativePath>(parsed),
-                *recursive, *max_results);
-            if (std::holds_alternative<workspace::Fault>(listed)) {
-                return Result<ToolResult>::success(
-                    fault_result(call.id, std::get<workspace::Fault>(listed)));
-            }
-            return success_result(
-                call.id,
-                bounded_list_json(
-                    *path_text, std::get<workspace::ListOutput>(listed)));
+        const auto found = tools_.find(call.name);
+        if (found == tools_.end()) {
+            return Result<ToolResult>::success(fault_result(
+                call.id, invalid_arguments("unknown workspace tool")));
         }
-        if (call.name == "read_file") {
-            if (!optional_exact_keys(args, {"path"},
-                                     {"start_line", "max_lines"})) {
-                return Result<ToolResult>::success(fault_result(
-                    call.id, invalid_arguments("invalid read_file arguments")));
-            }
-            const auto path_text = string_value(args, "path");
-            const auto start_line = args.find("start_line") == args.end()
-                                        ? std::optional<std::size_t>{1}
-                                        : size_value(args, "start_line", 1,
-                                                     10'000'000);
-            const auto max_lines = args.find("max_lines") == args.end()
-                                       ? std::optional<std::size_t>{200}
-                                       : size_value(args, "max_lines", 1, 1000);
-            if (!path_text.has_value() || !start_line.has_value() ||
-                !max_lines.has_value()) {
-                return Result<ToolResult>::success(fault_result(
-                    call.id, invalid_arguments("invalid read_file arguments")));
-            }
-            const auto parsed = policy_.parse(*path_text);
-            if (std::holds_alternative<workspace::Fault>(parsed)) {
-                return Result<ToolResult>::success(
-                    fault_result(call.id, std::get<workspace::Fault>(parsed)));
-            }
-            const auto read = files_.read(
-                workspace, std::get<workspace::RelativePath>(parsed),
-                *start_line, *max_lines);
-            if (std::holds_alternative<workspace::Fault>(read)) {
-                return Result<ToolResult>::success(
-                    fault_result(call.id, std::get<workspace::Fault>(read)));
-            }
-            auto read_content = bounded_read_json(
-                std::get<workspace::ReadOutput>(read));
-            if (!read_content.has_value()) {
-                return Result<ToolResult>::success(fault_result(
-                    call.id,
-                    {workspace::FaultCode::LimitExceeded,
-                     "workspace tool result exceeds the limit", false}));
-            }
-            return success_result(call.id, std::move(*read_content));
-        }
-        if (call.name == "search_text") {
-            if (!optional_exact_keys(args, {"path", "query"},
-                                     {"case_sensitive", "max_results"})) {
-                return Result<ToolResult>::success(fault_result(
-                    call.id,
-                    invalid_arguments("invalid search_text arguments")));
-            }
-            const auto path_text = string_value(args, "path");
-            const auto query = string_value(args, "query");
-            const auto case_sensitive =
-                args.find("case_sensitive") == args.end()
-                    ? std::optional<bool>{true}
-                    : bool_value(args, "case_sensitive");
-            const auto max_results =
-                args.find("max_results") == args.end()
-                    ? std::optional<std::size_t>{100}
-                    : size_value(args, "max_results", 1, 200);
-            if (!path_text.has_value() || !query.has_value() ||
-                !case_sensitive.has_value() || !max_results.has_value()) {
-                return Result<ToolResult>::success(fault_result(
-                    call.id,
-                    invalid_arguments("invalid search_text arguments")));
-            }
-            const auto parsed = policy_.parse(*path_text);
-            if (std::holds_alternative<workspace::Fault>(parsed)) {
-                return Result<ToolResult>::success(
-                    fault_result(call.id, std::get<workspace::Fault>(parsed)));
-            }
-            const auto searched = files_.search(
-                workspace, std::get<workspace::RelativePath>(parsed), *query,
-                *case_sensitive, *max_results);
-            if (std::holds_alternative<workspace::Fault>(searched)) {
-                return Result<ToolResult>::success(fault_result(
-                    call.id, std::get<workspace::Fault>(searched)));
-            }
-            return success_result(
-                call.id,
-                bounded_search_json(
-                    *path_text,
-                    std::get<workspace::SearchOutput>(searched)));
-        }
-        if (call.name == "replace_text") {
-            if (!optional_exact_keys(
-                    args,
-                    {"path", "old_text", "new_text",
-                     "expected_occurrences", "expected_sha256"},
-                    {})) {
-                return Result<ToolResult>::success(fault_result(
-                    call.id,
-                    invalid_arguments("invalid replace_text arguments")));
-            }
-            const auto path_text = string_value(args, "path");
-            const auto old_text = string_value(args, "old_text");
-            const auto new_text = string_value(args, "new_text");
-            const auto occurrences = size_value(
-                args, "expected_occurrences", 1, 1000);
-            const auto expected_sha256 =
-                string_value(args, "expected_sha256");
-            if (!path_text.has_value() || !old_text.has_value() ||
-                !new_text.has_value() || !occurrences.has_value() ||
-                !expected_sha256.has_value()) {
-                return Result<ToolResult>::success(fault_result(
-                    call.id,
-                    invalid_arguments("invalid replace_text arguments")));
-            }
-            const auto parsed = policy_.parse(*path_text);
-            if (std::holds_alternative<workspace::Fault>(parsed)) {
-                return Result<ToolResult>::success(
-                    fault_result(call.id, std::get<workspace::Fault>(parsed)));
-            }
-            const auto replaced = files_.replace_text(
-                workspace, std::get<workspace::RelativePath>(parsed),
-                *old_text, *new_text, *occurrences, *expected_sha256);
-            if (std::holds_alternative<workspace::Fault>(replaced)) {
-                return Result<ToolResult>::success(fault_result(
-                    call.id, std::get<workspace::Fault>(replaced)));
-            }
-            return success_result(
-                call.id,
-                write_json(std::get<workspace::WriteOutput>(replaced)));
-        }
-        if (call.name == "write_file") {
-            if (!optional_exact_keys(
-                    args, {"path", "content", "mode"},
-                    {"expected_sha256"})) {
-                return Result<ToolResult>::success(fault_result(
-                    call.id,
-                    invalid_arguments("invalid write_file arguments")));
-            }
-            const auto path_text = string_value(args, "path");
-            const auto content = string_value(args, "content");
-            const auto mode = string_value(args, "mode");
-            std::optional<std::string> expected_sha256;
-            if (args.find("expected_sha256") != args.end()) {
-                expected_sha256 = string_value(args, "expected_sha256");
-                if (!expected_sha256.has_value()) {
-                    return Result<ToolResult>::success(fault_result(
-                        call.id,
-                        invalid_arguments("invalid write_file arguments")));
-                }
-            }
-            if (!path_text.has_value() || !content.has_value() ||
-                !mode.has_value() ||
-                (*mode != "create" && *mode != "overwrite")) {
-                return Result<ToolResult>::success(fault_result(
-                    call.id,
-                    invalid_arguments("invalid write_file arguments")));
-            }
-            const auto parsed = policy_.parse(*path_text);
-            if (std::holds_alternative<workspace::Fault>(parsed)) {
-                return Result<ToolResult>::success(
-                    fault_result(call.id, std::get<workspace::Fault>(parsed)));
-            }
-            const auto hash_view = expected_sha256.has_value()
-                                       ? std::optional<std::string_view>{
-                                             *expected_sha256}
-                                       : std::nullopt;
-            const auto written = files_.write_file(
-                workspace, std::get<workspace::RelativePath>(parsed),
-                *content, *mode == "create", hash_view);
-            if (std::holds_alternative<workspace::Fault>(written)) {
-                return Result<ToolResult>::success(fault_result(
-                    call.id, std::get<workspace::Fault>(written)));
-            }
-            return success_result(
-                call.id,
-                write_json(std::get<workspace::WriteOutput>(written)));
-        }
-        return Result<ToolResult>::success(fault_result(
-            call.id, invalid_arguments("unknown workspace tool")));
+        return found->second->execute(call, context);
     } catch (...) {
         return Result<ToolResult>::failure(
             {ErrorCode::PersistenceFailure,
              "workspace tool could not produce a trustworthy result", false});
     }
+}
+
+bool WorkspaceToolGateway::tool_is_concurrency_safe(
+    const std::string& name) const {
+    const auto found = tools_.find(name);
+    if (found == tools_.end()) {
+        return false;
+    }
+    return found->second->isConcurrencySafe();
+}
+
+bool WorkspaceToolGateway::tool_is_read_only(
+    const std::string& name) const {
+    const auto found = tools_.find(name);
+    if (found == tools_.end()) {
+        return false;
+    }
+    return found->second->isReadOnly();
+}
+
+// T11: workspace tools are first-party and the underlying filesystem
+// policy already enforces path containment, so read-only tools can be
+// permitted silently. The mutating tools (replace_text / write_file)
+// still require an Ask because the model can request large rewrites;
+// a separate permission layer (T22 sandbox profile, T21 dangerous
+// patterns) is expected to upgrade them to Allow when conditions are
+// met.
+PermissionDecision WorkspaceToolGateway::tool_permission_decision(
+    const ToolCall& call,
+    const ToolExecutionContext& context) const {
+    (void)context;
+    const auto found = tools_.find(call.name);
+    if (found == tools_.end()) {
+        return PermissionDecision::Ask;
+    }
+    if (found->second->isReadOnly()) {
+        return PermissionDecision::Allow;
+    }
+    return PermissionDecision::Ask;
 }
 
 }  // namespace agent

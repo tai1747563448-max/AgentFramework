@@ -3,11 +3,17 @@
 #include "adapters/anthropic/bounded_stream_json.h"
 
 #include "adapters/json/value_json.h"
+#include "domain/latency_trace.h"
+#include "ports/stop_reason_codec.h"
+#include "util/retry_with_backoff.h"
 
 #include <nlohmann/json.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -81,8 +87,15 @@ nlohmann::json outgoing_block(const ContentBlock& block) {
                         {"content", typed.result.content},
                         {"is_error", typed.result.is_error}};
             } else {
-                static_assert(AlwaysFalse<Block>::value,
-                              "unsupported outgoing content block");
+                // T25: CompactRequestBlock is a runtime-only signal.
+                // When a prior response included one and the messages
+                // are being re-sent on a later turn, surface it as a
+                // text marker so the model sees the compaction intent
+                // without us inventing a wire type the provider does
+                // not understand.
+                return {{"type", "text"},
+                        {"text", std::string("[compact_request: ") +
+                                     typed.reason + "]"}};
             }
         },
         block);
@@ -127,7 +140,7 @@ std::string isolated_evidence_json(const EvidencePack& evidence) {
 
 Result<HttpRequest> make_request(const AnthropicConfig& config,
                                  const ModelRequest& request,
-                                 bool stream) {
+                                 const ModelCallOptions& options) {
     if (request.timeout_ms <= 0) {
         return failure<HttpRequest>(ErrorCode::InvalidInput,
                                     "model request timeout must be positive");
@@ -136,7 +149,7 @@ Result<HttpRequest> make_request(const AnthropicConfig& config,
     try {
         nlohmann::json body = {{"model", config.model},
                                {"max_tokens", config.max_tokens}};
-        if (stream) body["stream"] = true;
+        if (options.stream) body["stream"] = true;
         if (!request.system_prompt.empty() || !request.evidence.items.empty()) {
             std::string system = request.system_prompt;
             if (!request.evidence.items.empty()) {
@@ -182,7 +195,7 @@ Result<HttpRequest> make_request(const AnthropicConfig& config,
 
         return Result<HttpRequest>::success(
             {endpoint_for(config.base_url), std::move(headers), body.dump(),
-             request.timeout_ms});
+             request.timeout_ms, options.latency_request_id});
     } catch (...) {
         return failure<HttpRequest>(ErrorCode::InvalidInput,
                                     "model request cannot be encoded");
@@ -190,19 +203,11 @@ Result<HttpRequest> make_request(const AnthropicConfig& config,
 }
 
 StopReason map_stop_reason(const std::string& raw) {
-    if (raw == "end_turn") {
-        return StopReason::EndTurn;
-    }
-    if (raw == "tool_use") {
-        return StopReason::ToolUse;
-    }
-    if (raw == "max_tokens") {
-        return StopReason::MaxTokens;
-    }
-    if (raw == "stop_sequence") {
-        return StopReason::StopSequence;
-    }
-    return StopReason::Unknown;
+    // T12 (v2 §3): delegate to the shared codec so the Anthropic
+    // adapter and any future OpenAI / local adapter agree on the
+    // provider-neutral mapping. The helper remains here as a thin
+    // wrapper to preserve the existing call sites in decode_response.
+    return decode_stop_reason(raw);
 }
 
 std::size_t token_count(const nlohmann::json& value) {
@@ -237,8 +242,8 @@ Result<ModelResponse> decode_response(const HttpResponse& response,
         }
 
         ModelResponse decoded;
-        decoded.raw_stop_reason = json.at("stop_reason").get<std::string>();
-        decoded.stop_reason = map_stop_reason(decoded.raw_stop_reason);
+        const auto raw_stop_reason = json.at("stop_reason").get<std::string>();
+        decoded.stop_reason = map_stop_reason(raw_stop_reason);
         bool contains_nonempty_text = false;
         bool contains_tool_use = false;
         for (const auto& block : json.at("content")) {
@@ -275,6 +280,15 @@ Result<ModelResponse> decode_response(const HttpResponse& response,
                 return failure<ModelResponse>(
                     ErrorCode::ProtocolFailure,
                     "provider response contains an invalid tool-result block");
+            } else if (type == "compact_request") {
+                // T25: model signals it thinks the conversation is full.
+                // Reason is free-form; runtime treats presence as a trigger.
+                std::string reason;
+                if (block.contains("reason") &&
+                    block.at("reason").is_string()) {
+                    reason = block.at("reason").get<std::string>();
+                }
+                decoded.content.push_back(CompactRequestBlock{reason});
             } else {
                 return failure<ModelResponse>(ErrorCode::ProtocolFailure,
                                               "provider content block type is unknown");
@@ -355,52 +369,101 @@ Result<ModelResponse> AnthropicMessagesClient::complete(
                                       "Anthropic adapter configuration is invalid");
     }
 
-    auto encoded = make_request(config_, request, options.stream);
+    auto encoded = make_request(config_, request, options);
     if (!encoded.has_value()) {
         return Result<ModelResponse>::failure(encoded.error());
     }
 
-    AnthropicStreamAssembler assembler(options.observer);
-    SseDecoder decoder([&](const SseEvent& event) { return assembler.consume(event); });
-    std::optional<RuntimeError> stream_error;
-    const HttpChunkObserver consume = [&](std::string_view bytes) {
-        if (cancelled()) return false;
-        const auto result = decoder.feed(bytes);
-        if (!result.has_value()) stream_error = result.error();
-        return result.has_value();
-    };
-    auto response = options.stream
-        ? transport_.post_stream(encoded.value(), consume, options.cancellation)
-        : transport_.post(encoded.value(), options.cancellation);
-    if (cancelled() || (!response.has_value() && response.error().code == ErrorCode::Cancelled)) {
-        return failure<ModelResponse>(ErrorCode::Cancelled, "provider request cancelled");
+    // T0 latency trace hook. We wrap the caller's stream observer so the
+    // first TextDelta produced by the assembler emits first_text_received
+    // against the same request id RuntimeEngine used to mark the turn. The
+    // flag is per-call and threadsafe for the single-consumer streaming path
+    // we own here. When the caller did not request tracing we leave the
+    // original observer untouched.
+    const std::string trace_id = options.latency_request_id;
+    ModelCallOptions trace_options = options;
+    if (!trace_id.empty() && trace_options.observer) {
+        const ModelStreamObserver user_observer = trace_options.observer;
+        auto first_text = std::make_shared<std::atomic_bool>(false);
+        trace_options.observer = [user_observer, trace_id, first_text](
+            const ModelStreamEvent& event) {
+            if (event.kind == ModelStreamEventKind::TextDelta &&
+                !first_text->exchange(true)) {
+                emit_latency_sample(trace_id, kStageFirstTextReceived);
+            }
+            user_observer(event);
+        };
     }
-    if (stream_error) return Result<ModelResponse>::failure(*stream_error);
-    if (!response.has_value()) {
-        if (response.error().code == ErrorCode::RequestTimeout) {
-            return failure<ModelResponse>(ErrorCode::RequestTimeout,
-                                          "provider request timed out", true);
-        }
-        if (response.error().code == ErrorCode::ProtocolFailure) {
-            return failure<ModelResponse>(ErrorCode::ProtocolFailure, "provider stream is invalid");
-        }
-        return failure<ModelResponse>(ErrorCode::TransportFailure,
-                                      "provider transport failed", true);
-    }
-
-    if (response.value().status < 200 || response.value().status >= 300) {
-        return failure<ModelResponse>(ErrorCode::HttpFailure,
-                                      "provider returned a non-success status",
-                                      response.value().status >= 500);
-    }
-    if (options.stream && http_response_is_event_stream(response.value())) {
-        const auto framed = decoder.finish();
-        if (!framed.has_value()) return Result<ModelResponse>::failure(framed.error());
-        const auto assembled = assembler.finish();
-        if (!assembled.has_value()) return Result<ModelResponse>::failure(assembled.error());
-        response.value().body = assembled.value();
-    }
-    return decode_response(response.value(), options.stream);
+    // T02 (v2 §1): retry 5xx / TransportFailure / RequestTimeout with
+    // exponential backoff (base 500ms, cap 8s, ±20% jitter, max 3
+    // attempts). 429 and 4xx fail-fast because the existing retryable
+    // flag already discriminates them. The attempt lambda is the
+    // original single-call body; each retry creates fresh
+    // assembler/decoder so a partial stream from the prior attempt
+    // cannot leak into the next one.
+    const BackoffPolicy retry_policy{};
+    return retry_with_backoff(
+        retry_policy, options.cancellation,
+        [&]() -> Result<ModelResponse> {
+            AnthropicStreamAssembler assembler(trace_options.observer);
+            SseDecoder decoder(
+                [&](const SseEvent& event) { return assembler.consume(event); });
+            std::optional<RuntimeError> stream_error;
+            const HttpChunkObserver consume = [&](std::string_view bytes) {
+                if (cancelled()) return false;
+                const auto result = decoder.feed(bytes);
+                if (!result.has_value()) stream_error = result.error();
+                return result.has_value();
+            };
+            auto response = options.stream
+                ? transport_.post_stream(encoded.value(), consume,
+                                         options.cancellation)
+                : transport_.post(encoded.value(), options.cancellation);
+            if (cancelled() || (!response.has_value() &&
+                                response.error().code == ErrorCode::Cancelled)) {
+                return failure<ModelResponse>(ErrorCode::Cancelled,
+                                              "provider request cancelled");
+            }
+            if (stream_error) return Result<ModelResponse>::failure(*stream_error);
+            if (!response.has_value()) {
+                if (response.error().code == ErrorCode::RequestTimeout) {
+                    return failure<ModelResponse>(ErrorCode::RequestTimeout,
+                                                  "provider request timed out", true);
+                }
+                if (response.error().code == ErrorCode::ProtocolFailure) {
+                    return failure<ModelResponse>(ErrorCode::ProtocolFailure,
+                                                  "provider stream is invalid");
+                }
+                return failure<ModelResponse>(ErrorCode::TransportFailure,
+                                              "provider transport failed", true);
+            }
+            if (response.value().status < 200 || response.value().status >= 300) {
+                return failure<ModelResponse>(
+                    ErrorCode::HttpFailure,
+                    "provider returned a non-success status",
+                    response.value().status >= 500);
+            }
+            if (options.stream &&
+                http_response_is_event_stream(response.value())) {
+                const auto framed = decoder.finish();
+                if (!framed.has_value()) {
+                    return Result<ModelResponse>::failure(framed.error());
+                }
+                const auto assembled = assembler.finish();
+                if (!assembled.has_value()) {
+                    return Result<ModelResponse>::failure(assembled.error());
+                }
+                response.value().body = assembled.value();
+            }
+            return decode_response(response.value(), options.stream);
+        },
+        [&trace_id](std::size_t attempt,
+                    std::chrono::steady_clock::time_point) {
+            (void)attempt;
+            if (!trace_id.empty()) {
+                emit_latency_sample(trace_id, kStageProviderRetry);
+            }
+        });
 }
 
 }  // namespace agent

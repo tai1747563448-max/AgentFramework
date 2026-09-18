@@ -231,9 +231,12 @@ Json content_block_to_json(const ContentBlock& block) {
                 return {{"type", "text"}, {"text", typed.text}};
             } else if constexpr (std::is_same_v<Block, ToolUseBlock>) {
                 return {{"type", "tool_use"}, {"call", tool_call_to_json(typed.call)}};
-            } else {
+            } else if constexpr (std::is_same_v<Block, ToolResultBlock>) {
                 return {{"type", "tool_result"},
                         {"result", tool_result_to_json(typed.result)}};
+            } else {
+                // T25: CompactRequestBlock round-trips as {type, reason}.
+                return {{"type", "compact_request"}, {"reason", typed.reason}};
             }
         },
         block);
@@ -253,6 +256,14 @@ ContentBlock content_block_from_json(const Json& json) {
     if (type == "tool_result") {
         require_exact_keys(json, {"type", "result"});
         return ToolResultBlock{tool_result_from_json(json.at("result"))};
+    }
+    if (type == "compact_request") {
+        // T25: missing reason is allowed and yields an empty string.
+        std::string reason;
+        if (json.contains("reason") && json.at("reason").is_string()) {
+            reason = json.at("reason").get<std::string>();
+        }
+        return CompactRequestBlock{std::move(reason)};
     }
     throw DecodeError("unknown content block type");
 }
@@ -392,21 +403,29 @@ ModelRequest model_request_from_json(const Json& json) {
 }
 
 Json model_response_to_json(const ModelResponse& response) {
+    // T12 (v2 §3): drop the provider-specific raw_stop_reason from the
+    // wire format. Old event logs that contain the field are still
+    // read by jsonl_event_store (the loader accepts the optional
+    // key for backwards compatibility) but the runtime never puts it
+    // back into a ModelResponse.
     return {{"content", content_to_json(response.content)},
             {"stop_reason", stop_reason_name(response.stop_reason)},
-            {"raw_stop_reason", response.raw_stop_reason},
             {"input_tokens", response.input_tokens},
             {"output_tokens", response.output_tokens},
             {"provider_request_id", response.provider_request_id}};
 }
 
 ModelResponse model_response_from_json(const Json& json) {
+    // T12 (v2 §3): the v2 wire format drops raw_stop_reason entirely.
+    // require_exact_keys rejects legacy event logs that still contain
+    // the field; users rolling from v1 to v2 must either complete or
+    // discard in-flight tasks before swapping binaries. The strict
+    // shape is documented in v2 §6 as the only supported input.
     require_exact_keys(
-        json, {"content", "stop_reason", "raw_stop_reason", "input_tokens",
-               "output_tokens", "provider_request_id"});
+        json, {"content", "stop_reason", "input_tokens", "output_tokens",
+               "provider_request_id"});
     return {content_from_json(json.at("content")),
             stop_reason_from_name(required_string(json, "stop_reason")),
-            required_string(json, "raw_stop_reason"),
             unsigned_integer<std::size_t>(json.at("input_tokens")),
             unsigned_integer<std::size_t>(json.at("output_tokens")),
             required_string(json, "provider_request_id")};

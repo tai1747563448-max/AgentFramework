@@ -301,7 +301,8 @@ Result<std::string> SessionEngine::turn_system_prompt(
 
 RunRequest SessionEngine::turn_request(const SessionState& state,
                                         std::string system_prompt,
-                                        const RuntimePresentationOptions& presentation) const {
+                                        const RuntimePresentationOptions& presentation,
+                                        bool dry_run) const {
     const auto& pending = *state.pending_turn;
     return {pending.user_text,
             state.workspace_utf8,
@@ -310,7 +311,8 @@ RunRequest SessionEngine::turn_request(const SessionState& state,
             state.messages,
             pending.task_id,
             SessionTaskLink{state.session_id, pending.turn_index},
-            presentation};
+            presentation,
+            dry_run};
 }
 
 SessionTurnResult SessionEngine::finalize_turn(
@@ -386,7 +388,8 @@ SessionTurnResult SessionEngine::submit_turn(
     const std::string& user_text,
     RuntimeProgressObserver observer,
     bool use_memory,
-    const RuntimePresentationOptions& requested_presentation) {
+    const RuntimePresentationOptions& requested_presentation,
+    bool dry_run) {
     auto presentation = requested_presentation;
     if (const auto error = validate_context_settings(context_); error.has_value())
         return {std::nullopt, std::nullopt, error};
@@ -464,7 +467,7 @@ SessionTurnResult SessionEngine::submit_turn(
         prepared.error = pending.error();
         return prepared;
     }
-    auto runtime = run_task_(turn_request(pending.value(), std::move(prompt.value()), presentation), observer);
+    auto runtime = run_task_(turn_request(pending.value(), std::move(prompt.value()), presentation, dry_run), observer);
     auto result = finalize_turn(std::move(pending.value()), std::move(runtime));
     result.compacted = prepared.compacted;
     result.warning = std::move(prepared.warning);

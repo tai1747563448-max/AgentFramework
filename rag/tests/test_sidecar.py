@@ -18,7 +18,11 @@ from agent_rag.hybrid_retriever import (  # type: ignore[import-not-found]
     RetrievalResult,
 )
 from agent_rag import sidecar as sidecar_module  # type: ignore[import-not-found]
-from agent_rag.protocol import ProtocolError, parse_v2_message  # type: ignore[import-not-found]
+from agent_rag.protocol import (  # type: ignore[import-not-found]
+    ProtocolError,
+    parse_v2_message,
+    parse_v3_message,
+)
 from agent_rag.sidecar import (  # type: ignore[import-not-found]
     LoadedRuntime,
     run_sidecar,
@@ -138,6 +142,8 @@ class ScriptedRetriever:
 class Factory:
     retriever: ScriptedRetriever
     calls: int = 0
+    embedding_ready: bool = True
+    index_ready: bool = True
 
     def __call__(self, root: Path) -> LoadedRuntime:
         assert root.is_absolute()
@@ -155,6 +161,8 @@ class Factory:
                 "dimensions": 1024,
                 "device": "cpu",
             },
+            index_ready=self.index_ready,
+            embedding_ready=self.embedding_ready,
         )
 
 
@@ -400,3 +408,131 @@ def test_default_runtime_load_failure_marks_the_active_progress_phase_failed(
     assert failed["status"] == "failed"
     assert lines[2] == "rag sidecar initialization failed"
     assert "SENTINEL" not in errors.getvalue()
+
+
+# T5: ready frames now carry `index_ready` and `embedding_ready`. The
+# sidecar advertises both as true by default and a v3 client can read
+# either combination.
+def test_sidecar_emits_v3_ready_with_capability_fields(tmp_path: Path) -> None:
+    code, output, _, _ = _run(tmp_path, [])
+    assert code == 0
+    ready = output[0]
+    assert ready["op"] == "ready"
+    assert ready["schema_version"] == 3
+    assert ready["payload"]["index_ready"] is True
+    assert ready["payload"]["embedding_ready"] is True
+
+
+def test_sidecar_prepare_op_reports_negotiated_capabilities(
+    tmp_path: Path,
+) -> None:
+    prepare_request = (
+        json.dumps(
+            {
+                "schema_version": 3,
+                "request_id": REQUEST_ONE,
+                "op": "prepare",
+                "payload": {"capabilities": ["index", "embedding"]},
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+    code, output, _, _ = _run(tmp_path, [prepare_request])
+    assert code == 0
+    result = output[1]
+    assert result["op"] == "prepare_result"
+    assert result["schema_version"] == 3
+    assert result["payload"]["requested"] == ["index", "embedding"]
+    assert result["payload"]["capabilities"] == {
+        "index": True,
+        "embedding": True,
+    }
+
+
+def test_sidecar_refuses_semantic_query_without_embedding_ready(
+    tmp_path: Path,
+) -> None:
+    factory = Factory(ScriptedRetriever())
+    factory.embedding_ready = False
+    output = io.BytesIO()
+    errors = io.StringIO()
+    query_request = (
+        json.dumps(
+            {
+                "schema_version": 3,
+                "request_id": REQUEST_ONE,
+                "op": "query",
+                "payload": {
+                    "query": "tax",
+                    "top_k": 6,
+                    "max_total_bytes": 32768,
+                    "mode": "dense",
+                },
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+    code = run_sidecar(
+        tmp_path.resolve(),
+        io.BytesIO(b"".join([query_request])),
+        output,
+        errors,
+        runtime_factory=factory,
+    )
+    decoded = [json.loads(line) for line in output.getvalue().decode("utf-8").splitlines()]
+    assert code == 0
+    assert decoded[0]["op"] == "ready"
+    assert decoded[0]["payload"]["embedding_ready"] is False
+    assert decoded[1]["op"] == "error"
+    assert decoded[1]["payload"]["code"] == "EmbeddingUnavailable"
+
+
+def test_sidecar_error_uses_request_schema_version(tmp_path: Path) -> None:
+    bad_v3 = (
+        b'{"schema_version":3,"request_id":"req-11111111111111111111111111111111",'
+        b'"op":"bogus","payload":{}}\n'
+    )
+    code, output, _, _ = _run(tmp_path, [bad_v3])
+    assert code == 0
+    error = output[1]
+    assert error["schema_version"] == 3
+    assert error["payload"]["code"] == "InvalidRequest"
+
+
+def test_sidecar_v2_error_keeps_v2_envelope(tmp_path: Path) -> None:
+    bad_v2 = (
+        b'{"schema_version":2,"request_id":"req-11111111111111111111111111111111",'
+        b'"op":"bogus","payload":{}}\n'
+    )
+    code, output, _, _ = _run(tmp_path, [bad_v2])
+    assert code == 0
+    assert output[1]["schema_version"] == 2
+
+
+def test_v2_decoder_rejects_v3_query_request() -> None:
+    request = (
+        b'{"schema_version":3,"request_id":"req-11111111111111111111111111111111",'
+        b'"op":"query","payload":{"query":"x","top_k":1,"max_total_bytes":1,"mode":"hybrid"}}'
+    )
+    with pytest.raises(ProtocolError):
+        parse_v2_message(request)
+
+
+def test_v3_decoder_rejects_v2_query_request() -> None:
+    request = (
+        b'{"schema_version":2,"request_id":"req-11111111111111111111111111111111",'
+        b'"op":"query","payload":{"query":"x","top_k":1,"max_total_bytes":1,"mode":"hybrid"}}'
+    )
+    with pytest.raises(ProtocolError):
+        parse_v3_message(request)
+
+
+def test_v3_decoder_rejects_v3_prepare_with_unknown_capability() -> None:
+    request = (
+        b'{"schema_version":3,"request_id":"req-11111111111111111111111111111111",'
+        b'"op":"prepare","payload":{"capabilities":["quantum"]}}'
+    )
+    with pytest.raises(ProtocolError):
+        parse_v3_message(request)

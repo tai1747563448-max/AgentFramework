@@ -2,6 +2,7 @@
 
 #include "adapters/json/value_json.h"
 #include "domain/session_state.h"
+#include "ports/stop_reason_codec.h"
 
 #include <nlohmann/json.hpp>
 #include <cmath>
@@ -111,7 +112,7 @@ inline nlohmann::json transcript(const std::vector<CommittedSessionTurn>& turns)
 inline const std::string* terminal_text(const ModelResponse& response) {
     if ((response.stop_reason != StopReason::EndTurn &&
          response.stop_reason != StopReason::StopSequence) ||
-        !is_known_stop_reason_pair(response.stop_reason, response.raw_stop_reason) ||
+        !is_known_stop_reason(response.stop_reason) ||
         response.content.size() != 1) return nullptr;
     const auto* text = std::get_if<TextBlock>(&response.content.front());
     return text != nullptr && valid_text(text->text, true) ? &text->text : nullptr;

@@ -1,10 +1,15 @@
 #include "cli/terminal_presenter.h"
 #include "cli/terminal_text.h"
+#include "cli/theme.h"
+#include "domain/latency_trace.h"
+#include "domain/value.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <iomanip>
 #include <ostream>
 #include <sstream>
+#include <vector>
 
 namespace agent {
 namespace {
@@ -32,11 +37,38 @@ std::string fit_line(const std::string& text, std::size_t width) {
     return text.substr(0, offset);
 }
 
+// T08: format a token count as e.g. "1.2k", "340", "12.3k". Used by the
+// status line so large contexts stay readable.
+std::string compact_count(std::size_t value) {
+    if (value < 1000) return std::to_string(value);
+    char buffer[32];
+    const double scaled = static_cast<double>(value) / 1000.0;
+    if (value < 10000) {
+        std::snprintf(buffer, sizeof(buffer), "%.1fk", scaled);
+    } else {
+        std::snprintf(buffer, sizeof(buffer), "%.0fk", scaled);
+    }
+    return buffer;
+}
+
+// T08: render the running token/cost line. Stays on a single status row;
+// the live spinner stays on top, this row sits underneath.
+std::string usage_line(std::size_t input, std::size_t output, double usd) {
+    char buffer[96];
+    std::snprintf(buffer, sizeof(buffer),
+                  "tok in %s / out %s / $%.3f",
+                  compact_count(input).c_str(),
+                  compact_count(output).c_str(), usd);
+    return buffer;
+}
+
 }  // namespace
 
 TerminalPresenter::TerminalPresenter(std::ostream& output, bool dynamic,
-                                     std::function<std::size_t()> columns)
-    : output_(output), dynamic_(dynamic), columns_(std::move(columns)) {}
+                                     std::function<std::size_t()> columns,
+                                     ThemeId theme_id)
+    : output_(output), dynamic_(dynamic), columns_(std::move(columns)),
+      theme_id_(theme_id) {}
 
 TerminalPresenter::~TerminalPresenter() {
     try { clear_status(); close_partial_line(); restore_cursor(); } catch (...) {}
@@ -49,6 +81,7 @@ void TerminalPresenter::begin() {
     sanitizer_ = StreamingTerminalText{};
     rendered_.clear();
     phase_.clear();
+    rendered_emitted_ = false;
     if (dynamic_) output_ << "\x1b[?25l";
 }
 
@@ -82,6 +115,15 @@ void TerminalPresenter::phase(const std::string& label) {
 }
 
 void TerminalPresenter::progress(const RuntimeProgress& progress) {
+    // T08: refresh accumulators before any UI work. input_ takes the max of
+    // what was reported because the provider returns cumulative input per
+    // response; output_ and usd_ sum up because the provider returns per-
+    // response deltas for those.
+    if (progress.usage_delta.input_delta > input_tokens_) {
+        input_tokens_ = progress.usage_delta.input_delta;
+    }
+    output_tokens_ += progress.usage_delta.output_delta;
+    usd_total_ += progress.usage_delta.usd;
     switch (progress.event_kind) {
     case EventKind::ContextPreparationStarted: phase("Preparing context..."); break;
     case EventKind::ModelCallStarted: {
@@ -114,6 +156,27 @@ void TerminalPresenter::progress(const RuntimeProgress& progress) {
         phase_ += progress.tool_name.empty() ? "." : ": " + single_line(progress.tool_name);
         const auto columns = columns_ ? columns_() : 80;
         output_ << (dynamic_ ? fit_line(phase_, columns > 1 ? columns - 1 : 0) : phase_) << '\n';
+        // T09: render the unified diff lines under the tool summary. '+'
+        // lines get green, '-' lines get red, header lines ('--- ' /
+        // '+++ ') get dim. CJK widths follow the same fit_line rule so
+        // the columns budget stays accurate even with non-ASCII content.
+        for (const auto& line : progress.diff_lines) {
+            std::string prefix;
+            std::string body = line;
+            if (!body.empty() && (body.front() == '+' || body.front() == '-' ||
+                                  body.front() == ' ')) {
+                prefix = body.substr(0, 1);
+                body = body.substr(1);
+            }
+            const char* colour = "\x1b[2m";  // dim for header lines
+            if (prefix == "+") colour = "\x1b[32m";
+            else if (prefix == "-") colour = "\x1b[31m";
+            output_ << colour << prefix << "\x1b[0m"
+                    << (dynamic_
+                            ? fit_line(body, columns > 4 ? columns - 4 : 0)
+                            : body)
+                    << '\n';
+        }
         output_.flush();
         break;
     }
@@ -127,6 +190,15 @@ void TerminalPresenter::write_text(const std::string& text) {
     output_ << text;
     partial_line_ = text.back() != '\n';
     output_.flush();
+    // T0 latency trace hook. Emit first_text_rendered the first time we
+    // successfully write actual model content to the terminal. Status
+    // messages and tick animations do not count; only an actual text chunk
+    // does. The round/task identifier is provided through the previous
+    // text() callback via the rendered_emitted_ latch below.
+    if (!rendered_emitted_) {
+        rendered_emitted_ = true;
+        emit_latency_sample(pending_request_id_, kStageFirstTextRendered);
+    }
 }
 
 void TerminalPresenter::text(const RuntimeTextUpdate& update) {
@@ -139,6 +211,12 @@ void TerminalPresenter::text(const RuntimeTextUpdate& update) {
         sanitizer_ = StreamingTerminalText{};
         rendered_.clear();
         preview_ = false;
+        // A new model round restarts the first-text rendering latch so the
+        // next actual write emits a fresh sample for the new turn.
+        rendered_emitted_ = false;
+        pending_request_id_ = update.task_id;
+    } else if (pending_request_id_.empty()) {
+        pending_request_id_ = update.task_id;
     }
     const auto safe = update.event.kind == ModelStreamEventKind::TextBlockEnd
         ? sanitizer_.finish() : sanitizer_.append(update.event.text);
@@ -154,13 +232,26 @@ void TerminalPresenter::text(const RuntimeTextUpdate& update) {
 
 void TerminalPresenter::tick(std::chrono::milliseconds elapsed) {
     if (!active_ || !dynamic_ || partial_line_) return;
-    static constexpr char frames[] = "|/-\\";
+    const auto& theme = theme_for(theme_id_);
     std::ostringstream status;
-    status << frames[(elapsed.count() / 100) % 4] << ' '
+    status << theme.spinner_frames[(elapsed.count() / 100) % theme.spinner_frames.size()] << ' '
            << (phase_.empty() ? "Preparing context..." : phase_) << "  "
            << std::fixed << std::setprecision(1) << (elapsed.count() / 1000.0) << "s";
     const auto columns = columns_ ? columns_() : 80;
-    output_ << "\r\x1b[2K" << fit_line(status.str(), columns > 1 ? columns - 1 : 0);
+    // T08: the running token/cost line replaces the single tick row when
+    // any usage has been observed. The token row is moved to its own line
+    // under the spinner so the spinner frame still animates smoothly.
+    if (output_tokens_ > 0 || input_tokens_ > 0) {
+        std::ostringstream combined;
+        combined << status.str() << "\n\r\x1b[2K"
+                 << usage_line(input_tokens_, output_tokens_, usd_total_);
+        const auto budget = columns > 1 ? columns - 1 : 0;
+        output_ << "\r\x1b[2K"
+                << fit_line(combined.str(), budget);
+    } else {
+        output_ << "\r\x1b[2K"
+                << fit_line(status.str(), columns > 1 ? columns - 1 : 0);
+    }
     status_visible_ = true;
     output_.flush();
 }

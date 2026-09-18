@@ -1,5 +1,7 @@
 #include "adapters/anthropic/cpr_http_transport.h"
 
+#include "domain/latency_trace.h"
+
 #include <cpr/cpr.h>
 
 #include <chrono>
@@ -29,9 +31,28 @@ Result<HttpResponse> perform(const HttpRequest& request,
         session.SetBody(cpr::Body{request.body});
         session.SetTimeout(cpr::Timeout{std::chrono::milliseconds(request.timeout_ms)});
         session.SetRedirect(cpr::Redirect{false});
+        // Latency trace state. The trace id falls back to the request URL
+        // host so unidentified callers still produce samples; real callers
+        // should populate HttpRequest::latency_request_id with the task id.
+        const std::string trace_id = !request.latency_request_id.empty()
+            ? request.latency_request_id
+            : std::string("transport-") + request.url;
+        bool request_send_emitted = false;
+        bool first_text_emitted = false;
+        // The progress callback fires once per progress event. We use it as
+        // the earliest observable signal that cpr has handed the request to
+        // the transport (TCP connect / TLS handshake / first byte on the
+        // wire) and emit the request_send sample at that moment. The same
+        // callback still serves as the cancellation observer.
         session.SetProgressCallback(cpr::ProgressCallback{
             [&](cpr::cpr_pf_arg_t, cpr::cpr_pf_arg_t, cpr::cpr_pf_arg_t,
-                cpr::cpr_pf_arg_t, intptr_t) { return !cancelled(); }});
+                cpr::cpr_pf_arg_t, intptr_t) {
+                if (!request_send_emitted) {
+                    request_send_emitted = true;
+                    emit_latency_sample(trace_id, kStageRequestSend);
+                }
+                return !cancelled();
+            }});
 
         HttpResponse streamed{0, {}, {}};
         std::size_t header_bytes = 0;

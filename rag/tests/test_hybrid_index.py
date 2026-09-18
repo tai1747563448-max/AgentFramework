@@ -15,7 +15,11 @@ RAG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(RAG_ROOT))
 
 from agent_rag.chunker import ChunkRecord, DocumentSource  # type: ignore[import-not-found]
-from agent_rag.embedding import BGE_M3_MODEL  # type: ignore[import-not-found]
+from agent_rag.embedding import (  # type: ignore[import-not-found]
+    BACKEND_SENTENCE_TRANSFORMERS,
+    BGE_M3_MODEL,
+    PRECISION_FLOAT32,
+)
 from agent_rag.hybrid_index import (  # type: ignore[import-not-found]
     HybridIndexError,
     build_index_from_chunks,
@@ -37,9 +41,19 @@ class DeterministicEmbedding:
     model = BGE_M3_MODEL
     dimensions = 4
     tokenizer = WordTokenizer()
+    backend = BACKEND_SENTENCE_TRANSFORMERS
+    precision = PRECISION_FLOAT32
 
-    def __init__(self, revision: str = "revision-a") -> None:
+    def __init__(
+        self,
+        revision: str = "revision-a",
+        *,
+        backend: str = BACKEND_SENTENCE_TRANSFORMERS,
+        precision: str = PRECISION_FLOAT32,
+    ) -> None:
         self.revision = revision
+        self.backend = backend
+        self.precision = precision
         self.calls: list[list[str]] = []
 
     def encode(self, texts: list[str], *, batch_size: int = 16) -> np.ndarray:
@@ -238,3 +252,75 @@ def test_failed_build_preserves_published_index(tmp_path: Path) -> None:
         build_index_from_chunks(root, documents, [changed, chunks[1]], FailingEmbedding())
 
     assert {name: (root / name).read_bytes() for name in before} == before
+
+
+def test_schema3_index_publishes_row_count_and_sum_token_count(tmp_path: Path) -> None:
+    documents, chunks = _fixtures()
+    summary = build_index_from_chunks(
+        tmp_path / "index", documents, chunks, DeterministicEmbedding()
+    )
+    vector_metadata = json.loads(summary.vector_metadata.read_text(encoding="utf-8"))
+    assert vector_metadata["schema_version"] == 3
+    assert vector_metadata["row_count"] == len(chunks)
+    expected_total = sum(chunk.token_count for chunk in chunks)
+    assert vector_metadata["sum_token_count"] == expected_total
+    connection = sqlite3.connect(summary.database)
+    try:
+        index_names = {
+            str(name[0])
+            for name in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+        assert "chunks_vector_row_cover" in index_names
+        assert (
+            connection.execute(
+                "SELECT value FROM metadata WHERE key = 'row_count'"
+            ).fetchone()[0]
+            == str(len(chunks))
+        )
+        assert (
+            connection.execute(
+                "SELECT value FROM metadata WHERE key = 'sum_token_count'"
+            ).fetchone()[0]
+            == str(expected_total)
+        )
+    finally:
+        connection.close()
+
+
+def test_schema3_build_rejects_invalid_token_count(tmp_path: Path) -> None:
+    documents, chunks = _fixtures()
+    bad = replace(chunks[0], token_count=0)
+    with pytest.raises(HybridIndexError, match="chunk metadata is invalid"):
+        build_index_from_chunks(
+            tmp_path / "index", documents, [bad, chunks[1]], DeterministicEmbedding()
+        )
+
+
+def test_legacy_schema2_metadata_remains_readable_on_disk(tmp_path: Path) -> None:
+    """Schema 2 packs are not auto-upgraded by the index writer.  Their
+    on-disk layout must remain readable and stable."""
+    documents, chunks = _fixtures()
+    summary = build_index_from_chunks(
+        tmp_path / "index", documents, chunks, DeterministicEmbedding()
+    )
+    vector_metadata = json.loads(summary.vector_metadata.read_text(encoding="utf-8"))
+    legacy_metadata = {
+        key: value
+        for key, value in vector_metadata.items()
+        if key not in {"row_count", "sum_token_count"}
+    }
+    legacy_metadata["schema_version"] = 2
+    summary.vector_metadata.write_text(
+        json.dumps(legacy_metadata, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+        newline="",
+    )
+    rebuilt = build_index_from_chunks(
+        tmp_path / "index", documents, chunks, DeterministicEmbedding()
+    )
+    rebuilt_metadata = json.loads(rebuilt.vector_metadata.read_text(encoding="utf-8"))
+    assert rebuilt_metadata["schema_version"] == 3
+    assert rebuilt_metadata["row_count"] == len(chunks)
+

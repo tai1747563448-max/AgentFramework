@@ -204,16 +204,26 @@ bool parse_json(const std::string& line, nlohmann::json& decoded) {
     }
 }
 
-bool exact_envelope(const nlohmann::json& value, const char* op,
-                    const std::string& request_id) {
+// T5: a ready-frame envelope that requires a specific schema version.
+// Each decoder rejects every other version, which is what the plan
+// asks for: "v3 decoder must not consume v2 frames (and vice versa)".
+bool exact_envelope_version(const nlohmann::json& value, const char* op,
+                            const std::string& request_id,
+                            std::int64_t schema_version) {
     return exact_keys(value, {"schema_version", "request_id", "op", "payload"}) &&
            value.at("schema_version").is_number_integer() &&
-           value.at("schema_version").get<std::int64_t>() == 2 &&
+           value.at("schema_version").get<std::int64_t>() == schema_version &&
            value.at("request_id").is_string() &&
            value.at("request_id").get_ref<const std::string&>() == request_id &&
            request_id_is_valid(request_id) && value.at("op").is_string() &&
            value.at("op").get_ref<const std::string&>() == op &&
            value.at("payload").is_object();
+}
+
+bool exact_envelope(const nlohmann::json& value, const char* op,
+                    const std::string& request_id,
+                    std::int64_t schema_version) {
+    return exact_envelope_version(value, op, request_id, schema_version);
 }
 
 bool positive_rank_or_null(const nlohmann::json& value) {
@@ -312,13 +322,27 @@ bool valid_item(const nlohmann::json& item) {
                                metadata.at("neighbor_of").get_ref<const std::string&>());
 }
 
+bool validate_core_ready_fields(const ReadyInfo& ready) {
+    return pack_id_is_valid(ready.pack_id) &&
+           ready.retrieval_revision.size() == 74U &&
+           ready.retrieval_revision.rfind("retrieval-", 0) == 0 &&
+           lower_hex(ready.retrieval_revision.substr(10), 64) &&
+           canonical_date(ready.snapshot_date) &&
+           ready.document_count == kExpectedDocuments &&
+           ready.chunk_count >= ready.document_count &&
+           ready.model == "BAAI/bge-m3" && lower_hex(ready.revision, 40) &&
+           ready.dimensions == kExpectedDimensions &&
+           (ready.device == "cpu" || ready.device == "cuda");
+}
+
 }  // namespace
 
-Result<ReadyInfo> decode_ready(const std::string& line) {
+Result<ReadyInfo> decode_v2_ready(const std::string& line) {
     try {
         nlohmann::json value;
         if (!parse_json(line, value) ||
-            !exact_envelope(value, "ready", kServerRequestId)) {
+            !exact_envelope(value, "ready", kServerRequestId,
+                            kProtocolVersionV2)) {
             return failure<ReadyInfo>();
         }
         const auto& payload = value.at("payload");
@@ -346,20 +370,88 @@ Result<ReadyInfo> decode_ready(const std::string& line) {
             payload.at("model").get<std::string>(),
             payload.at("revision").get<std::string>(),
             payload.at("dimensions").get<std::int64_t>(),
-            payload.at("device").get<std::string>()};
-        if (!pack_id_is_valid(result.pack_id) ||
-            result.retrieval_revision.size() != 74U ||
-            result.retrieval_revision.rfind("retrieval-", 0) != 0 ||
-            !lower_hex(result.retrieval_revision.substr(10), 64) ||
-            !canonical_date(result.snapshot_date) ||
-            result.document_count != kExpectedDocuments ||
-            result.chunk_count < result.document_count ||
-            result.model != "BAAI/bge-m3" || !lower_hex(result.revision, 40) ||
-            result.dimensions != kExpectedDimensions ||
-            (result.device != "cpu" && result.device != "cuda")) {
+            payload.at("device").get<std::string>(),
+            true,
+            true};
+        if (!validate_core_ready_fields(result)) {
             return failure<ReadyInfo>();
         }
         return Result<ReadyInfo>::success(std::move(result));
+    } catch (...) {
+        return failure<ReadyInfo>();
+    }
+}
+
+Result<ReadyInfo> decode_v3_ready(const std::string& line) {
+    try {
+        nlohmann::json value;
+        if (!parse_json(line, value) ||
+            !exact_envelope(value, "ready", kServerRequestId,
+                            kProtocolVersionV3)) {
+            return failure<ReadyInfo>();
+        }
+        const auto& payload = value.at("payload");
+        if (!exact_keys(payload,
+                        {"pack_id", "snapshot_date", "document_count",
+                         "retrieval_revision", "chunk_count", "model", "revision", "dimensions",
+                         "device", "index_ready", "embedding_ready"}) ||
+            !payload.at("pack_id").is_string() ||
+            !payload.at("retrieval_revision").is_string() ||
+            !payload.at("snapshot_date").is_string() ||
+            !payload.at("document_count").is_number_integer() ||
+            !payload.at("chunk_count").is_number_integer() ||
+            !payload.at("model").is_string() ||
+            !payload.at("revision").is_string() ||
+            !payload.at("dimensions").is_number_integer() ||
+            !payload.at("device").is_string() ||
+            !payload.at("index_ready").is_boolean() ||
+            !payload.at("embedding_ready").is_boolean()) {
+            return failure<ReadyInfo>();
+        }
+        ReadyInfo result{
+            payload.at("pack_id").get<std::string>(),
+            payload.at("retrieval_revision").get<std::string>(),
+            payload.at("snapshot_date").get<std::string>(),
+            payload.at("document_count").get<std::int64_t>(),
+            payload.at("chunk_count").get<std::int64_t>(),
+            payload.at("model").get<std::string>(),
+            payload.at("revision").get<std::string>(),
+            payload.at("dimensions").get<std::int64_t>(),
+            payload.at("device").get<std::string>(),
+            payload.at("index_ready").get<bool>(),
+            payload.at("embedding_ready").get<bool>()};
+        if (!validate_core_ready_fields(result)) {
+            return failure<ReadyInfo>();
+        }
+        // T5: the v3 ready frame MUST assert at least one usable
+        // capability. Decoding a frame that says "nothing is ready"
+        // lets the orchestrator start a turn on a broken sidecar.
+        if (!result.index_ready && !result.embedding_ready) {
+            return failure<ReadyInfo>();
+        }
+        return Result<ReadyInfo>::success(std::move(result));
+    } catch (...) {
+        return failure<ReadyInfo>();
+    }
+}
+
+Result<ReadyInfo> decode_ready(const std::string& line) {
+    // T5: the unified entry point. It auto-detects the schema version
+    // so a binary that ships with the v3 decoder can still talk to a
+    // legacy pack, but a v3 ready frame sent to a v2-only client is
+    // rejected because the decoder it routes to requires an exact
+    // version match.
+    try {
+        nlohmann::json value;
+        if (!parse_json(line, value) ||
+            !value.is_object() || !value.contains("schema_version") ||
+            !value.at("schema_version").is_number_integer()) {
+            return failure<ReadyInfo>();
+        }
+        const auto version = value.at("schema_version").get<std::int64_t>();
+        if (version == kProtocolVersionV2) return decode_v2_ready(line);
+        if (version == kProtocolVersionV3) return decode_v3_ready(line);
+        return failure<ReadyInfo>();
     } catch (...) {
         return failure<ReadyInfo>();
     }
@@ -381,7 +473,19 @@ Result<EvidencePack> decode_query_result(const std::string& line,
         }
         nlohmann::json value;
         if (!parse_json(line, value) ||
-            !exact_envelope(value, "query_result", expected_request_id) ||
+            !value.is_object() || !value.contains("schema_version") ||
+            !value.at("schema_version").is_number_integer()) {
+            return failure<EvidencePack>();
+        }
+        const auto version = value.at("schema_version").get<std::int64_t>();
+        // T5: query_result decoding accepts either protocol version so
+        // the same orchestrator code can drive legacy and new packs.
+        // The error path below uses the same version so the client
+        // and server agree on the envelope.
+        if (version != kProtocolVersionV2 && version != kProtocolVersionV3) {
+            return failure<EvidencePack>();
+        }
+        if (!exact_envelope(value, "query_result", expected_request_id, version) ||
             !exact_keys(value.at("payload"), {"items", "outcome"}) ||
             !value.at("payload").at("items").is_array() ||
             !value.at("payload").at("outcome").is_string() ||
@@ -398,6 +502,12 @@ Result<EvidencePack> decode_query_result(const std::string& line,
             (outcome == "matched") != has_items) {
             return failure<EvidencePack>();
         }
+        // T5: `authoritative_no_match` may only come from a defined
+        // authoritative mapping. Init failure, semantic miss, and
+        // timeout are reported as transport / protocol failures and
+        // never set this flag, so the runtime cannot present an
+        // authoritative no-match message unless the sidecar proved
+        // the citation was checked.
         result.authoritative_no_match = outcome == "authoritative_no_match";
         result.tool_use_forbidden = has_items;
         std::size_t total_bytes = 0;

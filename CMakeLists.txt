@@ -47,34 +47,48 @@ target_include_directories(dotenv_header_only INTERFACE
 add_library(agent_kernel STATIC
     src/domain/value.cpp
     src/domain/evidence_validation.cpp
+    src/domain/latency_trace.cpp
     src/domain/runtime_event.cpp
     src/domain/session_event.cpp
     src/domain/memory_event.cpp
+    src/domain/task_type.cpp
+    src/ports/stop_reason_codec.cpp
     src/application/state_reducer.cpp
     src/application/session_reducer.cpp
     src/application/memory_reducer.cpp
     src/application/memory_policy.cpp
     src/application/memory_retriever.cpp
     src/application/memory_engine.cpp
+    src/application/memory_maintenance_scheduler.cpp
     src/application/model_context_compactor.cpp
     src/application/model_memory_consolidator.cpp
+    src/application/retrieval_policy.cpp
     src/application/session_engine.cpp
     src/application/runtime_engine.cpp
+    src/application/hook_chain.cpp
     src/application/task_evaluator.cpp
     src/application/benchmark_statistics.cpp
+    src/application/streaming_tool_scheduler.cpp
+    src/services/dangerous_patterns.cpp
+    src/services/cost_tracker.cpp
     src/adapters/json/value_json.cpp
+    src/adapters/json/strict_json.cpp
+    src/adapters/rag/task_evidence_cache.cpp
     src/adapters/anthropic/cpr_http_transport.cpp
     src/adapters/anthropic/sse_decoder.cpp
     src/adapters/anthropic/anthropic_stream_assembler.cpp
     src/adapters/anthropic/anthropic_messages_client.cpp
+    src/adapters/anthropic/model_client_factory.cpp
     src/adapters/persistence/event_json.cpp
     src/adapters/persistence/session_event_json.cpp
     src/adapters/persistence/memory_event_json.cpp
     src/adapters/persistence/jsonl_memory_store.cpp
+    src/adapters/persistence/markdown_memory_store.cpp
     src/adapters/persistence/jsonl_event_store.cpp
     src/adapters/persistence/jsonl_session_store.cpp)
 target_include_directories(agent_kernel PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_link_libraries(agent_kernel PUBLIC nlohmann_json::nlohmann_json PRIVATE cpr::cpr)
+target_link_libraries(agent_kernel PUBLIC nlohmann_json::nlohmann_json
+    Threads::Threads PRIVATE cpr::cpr)
 if(MSVC)
     target_compile_options(agent_kernel PRIVATE /W4 /permissive- /utf-8)
 endif()
@@ -88,25 +102,48 @@ add_library(agent_runtime STATIC
     src/adapters/workspace/workspace_tool_gateway.cpp
     src/adapters/process/direct_process_runner.cpp
     src/adapters/process/reproc_jsonl_process.cpp
+    src/adapters/sandbox/bubblewrap_sandbox.cpp
+    src/adapters/sandbox/job_object_sandbox.cpp
+    src/adapters/sandbox/no_op_sandbox.cpp
+    src/adapters/sandbox/sandbox_factory.cpp
+    src/adapters/sandbox/sandbox_profile.cpp
+    src/adapters/sandbox/seatbelt_sandbox.cpp
+    src/adapters/permission/static_permission.cpp
+    src/adapters/mcp/json_rpc.cpp
+    src/adapters/mcp/stdio_client.cpp
+    src/adapters/mcp/server_registry.cpp
+    src/adapters/mcp/mcp_tool_gateway.cpp
     src/adapters/rag/rag_protocol.cpp
+    src/adapters/rag/verified_pack_lease.cpp
     src/adapters/rag/native_rag_pack_verifier.cpp
     src/adapters/rag/persistent_rag_knowledge_provider.cpp
     src/adapters/build/cmake_tool_gateway.cpp
     src/adapters/tools/composite_tool_gateway.cpp
+    src/ports/tool_gateway.cpp
     src/adapters/system/system_clock.cpp
     src/adapters/system/random_id_generator.cpp
     src/adapters/system/signal_cancellation.cpp
     src/config/runtime_config.cpp
+    src/config/setting_source.cpp
+    src/services/compact/compact_chain.cpp
+    src/services/compact/cheap_stages.cpp
+    src/services/compact/model_stages.cpp
     src/cli/terminal_text.cpp
     src/cli/streaming_terminal_text.cpp
     src/cli/terminal_capabilities.cpp
     src/cli/terminal_presenter.cpp
+    src/cli/picker.cpp
     src/cli/interactive_cli.cpp
-    src/cli/cli_app.cpp)
+    src/cli/cli_app.cpp
+    src/commands/registry.cpp
+    src/composition/engine.cpp)
 target_include_directories(agent_runtime PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(agent_runtime
     PUBLIC agent_kernel Threads::Threads
     PRIVATE dotenv_header_only reproc++)
+if(WIN32)
+    target_link_libraries(agent_runtime PRIVATE bcrypt)
+endif()
 if(MSVC)
     target_compile_options(agent_runtime PRIVATE /W4 /permissive- /utf-8)
     target_compile_definitions(agent_runtime PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -185,18 +222,31 @@ endfunction()
 add_agent_test(domain_primitives_tests tests/domain/value_result_test.cpp)
 add_agent_test(evidence_validation_tests tests/domain/evidence_validation_test.cpp)
 add_agent_test(runtime_event_tests tests/domain/runtime_event_test.cpp)
+add_agent_test(operation_context_tests tests/ports/operation_context_test.cpp)
 add_agent_test(state_reducer_tests tests/application/state_reducer_test.cpp)
 add_agent_test(session_reducer_tests tests/application/session_reducer_test.cpp)
 add_agent_test(memory_reducer_tests tests/application/memory_reducer_test.cpp)
 add_agent_test(memory_policy_tests tests/application/memory_policy_test.cpp)
 add_agent_test(memory_retriever_tests tests/application/memory_retriever_test.cpp)
 add_agent_test(memory_engine_tests tests/application/memory_engine_test.cpp)
+add_agent_test(memory_maintenance_scheduler_tests
+    tests/application/memory_maintenance_scheduler_test.cpp)
 add_agent_test(model_context_compactor_tests tests/application/model_context_compactor_test.cpp)
 add_agent_test(model_memory_consolidator_tests tests/application/model_memory_consolidator_test.cpp)
 add_agent_test(memory_event_json_tests tests/adapters/memory_event_json_test.cpp)
+add_agent_test(retrieval_policy_tests tests/application/retrieval_policy_test.cpp)
 add_agent_test(jsonl_memory_store_tests tests/adapters/jsonl_memory_store_test.cpp)
+add_agent_test(markdown_memory_store_tests tests/adapters/markdown_memory_store_test.cpp)
+target_link_libraries(markdown_memory_store_tests PRIVATE agent_runtime)
+add_agent_test(strict_json_tests tests/adapters/strict_json_test.cpp)
 add_agent_test(session_engine_tests tests/application/session_engine_test.cpp)
 add_agent_test(runtime_engine_tests tests/application/runtime_engine_test.cpp)
+add_agent_test(continue_reason_tests tests/application/continue_reason_test.cpp)
+add_agent_test(engine_tests tests/composition/engine_test.cpp)
+target_link_libraries(engine_tests PRIVATE agent_runtime)
+add_agent_test(streaming_tool_scheduler_tests tests/application/streaming_tool_scheduler_test.cpp)
+target_link_libraries(streaming_tool_scheduler_tests PRIVATE agent_runtime)
+add_agent_test(hook_chain_tests tests/application/hook_chain_test.cpp)
 add_agent_test(task_evaluator_tests tests/application/task_evaluator_test.cpp)
 add_agent_test(benchmark_statistics_tests
     tests/application/benchmark_statistics_test.cpp)
@@ -218,6 +268,10 @@ add_agent_test(interactive_cli_tests tests/cli/interactive_cli_test.cpp)
 target_link_libraries(interactive_cli_tests PRIVATE agent_runtime)
 add_agent_test(terminal_presenter_tests tests/cli/terminal_presenter_test.cpp)
 target_link_libraries(terminal_presenter_tests PRIVATE agent_runtime)
+add_agent_test(theme_tests tests/cli/theme_test.cpp)
+target_link_libraries(theme_tests PRIVATE agent_runtime)
+add_agent_test(picker_tests tests/cli/picker_test.cpp)
+target_link_libraries(picker_tests PRIVATE agent_runtime)
 add_agent_test(signal_cancellation_tests tests/adapters/signal_cancellation_test.cpp)
 target_link_libraries(signal_cancellation_tests PRIVATE agent_runtime)
 add_agent_test(runtime_config_tests tests/config/runtime_config_test.cpp)
@@ -269,6 +323,46 @@ add_dependencies(direct_process_runner_tests process_fixture)
 target_compile_definitions(direct_process_runner_tests PRIVATE
     AGENT_PROCESS_FIXTURE_PATH="$<TARGET_FILE:process_fixture>"
     _CRT_SECURE_NO_WARNINGS)
+add_agent_test(sandbox_profile_tests tests/adapters/sandbox_profile_test.cpp)
+target_link_libraries(sandbox_profile_tests PRIVATE agent_runtime)
+add_agent_test(bubblewrap_sandbox_tests tests/adapters/bubblewrap_sandbox_test.cpp)
+target_link_libraries(bubblewrap_sandbox_tests PRIVATE agent_runtime)
+add_agent_test(sandbox_factory_tests tests/adapters/sandbox_factory_test.cpp)
+target_link_libraries(sandbox_factory_tests PRIVATE agent_runtime)
+add_agent_test(static_permission_tests tests/adapters/static_permission_tests.cpp)
+target_link_libraries(static_permission_tests PRIVATE agent_runtime)
+add_agent_test(stop_reason_codec_tests tests/ports/stop_reason_codec_tests.cpp)
+target_link_libraries(stop_reason_codec_tests PRIVATE agent_kernel)
+add_agent_test(mcp_json_rpc_tests tests/adapters/mcp_json_rpc_tests.cpp)
+target_link_libraries(mcp_json_rpc_tests PRIVATE agent_runtime)
+add_agent_test(mcp_stdio_client_tests tests/adapters/mcp_stdio_client_tests.cpp)
+target_link_libraries(mcp_stdio_client_tests PRIVATE
+    agent_runtime Threads::Threads)
+add_dependencies(mcp_stdio_client_tests mcp_fixture_copy)
+target_compile_definitions(mcp_stdio_client_tests PRIVATE
+    AGENT_MCP_FIXTURE_PATH="${CMAKE_BINARY_DIR}/mcp_fixture.py"
+    _CRT_SECURE_NO_WARNINGS)
+add_agent_test(mcp_server_registry_tests
+    tests/adapters/mcp_server_registry_tests.cpp)
+target_link_libraries(mcp_server_registry_tests PRIVATE
+    agent_runtime Threads::Threads)
+add_dependencies(mcp_server_registry_tests mcp_fixture_copy)
+target_compile_definitions(mcp_server_registry_tests PRIVATE
+    AGENT_MCP_FIXTURE_PATH="${CMAKE_BINARY_DIR}/mcp_fixture.py"
+    _CRT_SECURE_NO_WARNINGS)
+add_custom_target(mcp_fixture_copy ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/rag/tests/mcp_fixture.py"
+        "${CMAKE_BINARY_DIR}/mcp_fixture.py"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/rag/tests/mcp_fixture.py")
+add_agent_test(task_type_tests tests/domain/task_type_tests.cpp)
+target_link_libraries(task_type_tests PRIVATE agent_kernel)
+add_agent_test(dangerous_patterns_tests tests/services/dangerous_patterns_test.cpp)
+target_link_libraries(dangerous_patterns_tests PRIVATE agent_kernel)
+add_agent_test(cost_tracker_tests tests/services/cost_tracker_test.cpp)
+target_link_libraries(cost_tracker_tests PRIVATE agent_kernel)
+add_agent_test(command_registry_tests tests/commands/registry_test.cpp)
+target_link_libraries(command_registry_tests PRIVATE agent_runtime)
 add_agent_test(reproc_jsonl_process_tests
     tests/adapters/reproc_jsonl_process_test.cpp)
 target_link_libraries(reproc_jsonl_process_tests PRIVATE
@@ -281,8 +375,13 @@ target_link_libraries(rag_protocol_tests PRIVATE agent_runtime)
 add_agent_test(native_rag_pack_verifier_tests
     tests/adapters/native_rag_pack_verifier_test.cpp)
 target_link_libraries(native_rag_pack_verifier_tests PRIVATE agent_runtime)
+add_agent_test(verified_pack_lease_tests
+    tests/adapters/verified_pack_lease_test.cpp)
+target_link_libraries(verified_pack_lease_tests PRIVATE agent_runtime)
 add_agent_test(persistent_rag_knowledge_provider_tests
     tests/adapters/persistent_rag_knowledge_provider_test.cpp)
+add_agent_test(task_evidence_cache_tests
+    tests/adapters/task_evidence_cache_test.cpp)
 target_link_libraries(persistent_rag_knowledge_provider_tests PRIVATE agent_runtime)
 add_agent_test(composite_tool_gateway_tests tests/adapters/composite_tool_gateway_test.cpp)
 target_link_libraries(composite_tool_gateway_tests PRIVATE agent_runtime)

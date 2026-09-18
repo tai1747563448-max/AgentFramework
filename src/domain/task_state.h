@@ -27,6 +27,14 @@ struct RuntimeBudgets {
     std::size_t max_tool_calls{64};
     std::int64_t max_task_time_ms{1'800'000};
     std::int64_t model_timeout_ms{120'000};
+    // T01: maximum number of pending tool calls AwaitingTool will
+    // dispatch in a single pass. Read-only tools (concurrency_safe=true)
+    // run in parallel via std::async; mutating tools run serially in the
+    // same window. A value of 1 reproduces the pre-T01 single-call
+    // behaviour. The field is appended at the end of RuntimeBudgets so
+    // event_json.cpp's 4-arg aggregate initializer keeps mapping the
+    // existing JSON fields to their original slots.
+    std::size_t max_parallel_tools{4};
 };
 
 struct RuntimeUsage {
@@ -65,7 +73,35 @@ struct TaskState {
     std::vector<ToolResult> pending_tool_results;
     std::optional<std::string> final_text;
     std::optional<RuntimeError> terminal_error;
+    // T17 (v2 §3): marks a task the model has flagged as
+    // background so it should not block the foreground session.
+    // Background tasks still produce durable events but the
+    // session_engine treats their completion as advisory rather
+    // than gating.
+    bool background{false};
 };
+
+// T17 (v2 §3): taxonomy of background tasks the model can spawn.
+// local_bash wraps a host shell command, local_agent schedules
+// a child session that runs to completion in the background,
+// in_process_teammate spawns an in-process state machine for
+// sub-agent collaboration. The enum is forward-compatible with
+// v3's planned ProcessRunner / SessionEngine / RuntimeEngine
+// integrations; T17 only models the data path.
+enum class TaskType {
+    LocalBash,
+    LocalAgent,
+    InProcessTeammate,
+};
+
+const char* task_type_name(TaskType type);
+TaskType parse_task_type(std::string_view text);
+
+// T17 follow-up: stream TaskStatus into ostream-based JSON encoders
+// (/tasks snapshots, debug logs) without dragging the TaskState type
+// into the JSON layer. The string matches the runtime_event JSON
+// encoding so persisted logs and live JSON stay symmetric.
+const char* task_status_name(TaskStatus status);
 
 inline bool is_terminal(TaskStatus status) noexcept {
     return status == TaskStatus::Completed || status == TaskStatus::Failed ||
@@ -107,12 +143,14 @@ inline bool is_valid_session_id(std::string_view session_id) noexcept {
 inline bool has_positive_runtime_budgets(
     const RuntimeBudgets& budgets) noexcept {
     return budgets.max_model_rounds > 0 && budgets.max_tool_calls > 0 &&
+           budgets.max_parallel_tools > 0 &&
            budgets.max_task_time_ms > 0 && budgets.model_timeout_ms > 0;
 }
 
 inline bool operator==(const RuntimeBudgets& left, const RuntimeBudgets& right) {
     return left.max_model_rounds == right.max_model_rounds &&
            left.max_tool_calls == right.max_tool_calls &&
+           left.max_parallel_tools == right.max_parallel_tools &&
            left.max_task_time_ms == right.max_task_time_ms &&
            left.model_timeout_ms == right.model_timeout_ms;
 }
@@ -136,7 +174,8 @@ inline bool operator==(const TaskState& left, const TaskState& right) {
            left.next_tool_index == right.next_tool_index &&
            left.active_tool_call_id == right.active_tool_call_id &&
            left.pending_tool_results == right.pending_tool_results &&
-           left.final_text == right.final_text && left.terminal_error == right.terminal_error;
+           left.final_text == right.final_text && left.terminal_error == right.terminal_error &&
+           left.background == right.background;
 }
 
 }  // namespace agent

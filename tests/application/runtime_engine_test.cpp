@@ -1,6 +1,7 @@
 #include "application/runtime_engine.h"
 #include "application/state_reducer.h"
 #include "ports/cancellation.h"
+#include "ports/operation_context.h"
 #include "ports/clock.h"
 #include "ports/event_store.h"
 #include "ports/id_generator.h"
@@ -126,7 +127,8 @@ public:
         : error_(std::move(error)) {}
 
     agent::Result<agent::EvidencePack> retrieve(
-        const agent::TaskState& state) override {
+        const agent::TaskState& state,
+        const agent::OperationContext& /*context*/) override {
         retrieved_states.push_back(state);
         if (error_.has_value()) {
             return agent::Result<agent::EvidencePack>::failure(*error_);
@@ -321,7 +323,7 @@ agent::RunRequest run_request(std::string issue) {
 }
 
 agent::ModelResponse response(std::vector<agent::ContentBlock> content) {
-    return {std::move(content), agent::StopReason::EndTurn, "end_turn",
+    return {std::move(content), agent::StopReason::EndTurn,
             21, 8, "provider-request-1"};
 }
 
@@ -329,12 +331,14 @@ agent::ModelResponse text_response(std::string text) {
     return response({agent::TextBlock{std::move(text)}});
 }
 
+// T12 (v2 §3): the canonical StopReason is the only stop signal the
+// test fixture emits. Adapter-specific string mapping moved to
+// ports/stop_reason_codec.h where adapter tests exercise it; the
+// runtime-level tests no longer need to forge raw provider tokens.
 agent::ModelResponse stopped_response(std::vector<agent::ContentBlock> content,
-                                      agent::StopReason stop_reason,
-                                      std::string raw_stop_reason) {
+                                      agent::StopReason stop_reason) {
     auto result = response(std::move(content));
     result.stop_reason = stop_reason;
-    result.raw_stop_reason = std::move(raw_stop_reason);
     return result;
 }
 
@@ -351,7 +355,6 @@ agent::ModelResponse tool_response(std::vector<agent::ToolCall> calls) {
     }
     auto result = response(std::move(content));
     result.stop_reason = agent::StopReason::ToolUse;
-    result.raw_stop_reason = "tool_use";
     return result;
 }
 
@@ -545,8 +548,7 @@ TEST_CASE(resume_finishes_an_accepted_terminal_response_without_model_call) {
 
 TEST_CASE(resume_finishes_an_accepted_max_tokens_response_without_model_call) {
     const auto partial = fixtures::stopped_response(
-        {agent::TextBlock{"partial"}}, agent::StopReason::MaxTokens,
-        "max_tokens");
+        {agent::TextBlock{"partial"}}, agent::StopReason::MaxTokens);
     test::EngineFixture<test::FailingEventStore> interrupted(
         test::FakeModel({partial}), test::FakeTools{},
         test::FakeKnowledge(agent::EvidencePack{}),
@@ -721,8 +723,11 @@ TEST_CASE(runtime_progress_type_is_the_safe_projection_with_tool_name) {
     const agent::RuntimeProgress progress{
         "task-00000000000000000000000000000001", 7,
         agent::EventKind::ModelCallSucceeded,
-        agent::TaskStatus::AwaitingModel};
-    const auto& [task_id, sequence, event_kind, status, tool_name] = progress;
+        agent::TaskStatus::AwaitingModel, std::string{},
+        agent::RuntimeUsageDelta{1200, 340, 0.018},
+        {"-old", "+new"}};
+    const auto& [task_id, sequence, event_kind, status, tool_name,
+                 usage_delta, diff_lines] = progress;
 
     static_assert(std::is_same_v<
                   decltype(agent::RuntimeProgress::task_id), std::string>);
@@ -739,6 +744,13 @@ TEST_CASE(runtime_progress_type_is_the_safe_projection_with_tool_name) {
     REQUIRE(event_kind == agent::EventKind::ModelCallSucceeded);
     REQUIRE(status == agent::TaskStatus::AwaitingModel);
     REQUIRE(tool_name.empty());
+    // T08: usage_delta is plumbed through the projection.
+    REQUIRE(usage_delta.input_delta == 1200);
+    REQUIRE(usage_delta.output_delta == 340);
+    REQUIRE(usage_delta.usd > 0.017 && usage_delta.usd < 0.019);
+    REQUIRE(diff_lines.size() == 2);
+    REQUIRE(diff_lines.front() == "-old");
+    REQUIRE(diff_lines.back() == "+new");
 }
 
 TEST_CASE(runtime_preview_arrives_before_acceptance_without_changing_durable_log) {
@@ -1223,9 +1235,8 @@ TEST_CASE(engine_rejects_invalid_or_duplicate_response_tool_calls) {
             results.push_back({call.id, "result", false});
         }
         test::EngineFixture fixture(
-            test::FakeModel({fixtures::stopped_response(
-                                 content, agent::StopReason::ToolUse,
-                                 "tool_use"),
+        test::FakeModel({fixtures::stopped_response(
+                                 content, agent::StopReason::ToolUse),
                              fixtures::text_response("done")}),
             test::FakeTools(std::move(results)),
             test::FakeKnowledge(agent::EvidencePack{}));
@@ -1658,15 +1669,18 @@ TEST_CASE(terminal_guard_persistence_failure_prevents_all_external_calls) {
 }
 
 TEST_CASE(end_turn_and_stop_sequence_are_the_only_text_completion_stops) {
-    const std::vector<std::pair<agent::StopReason, std::string>> cases = {
-        {agent::StopReason::EndTurn, "end_turn"},
-        {agent::StopReason::StopSequence, "stop_sequence"},
+    // T12 (v2 §3): the canonical StopReason enum is the only stop
+    // signal the runtime inspects; the prior raw-string parameter is
+    // gone.
+    const std::vector<agent::StopReason> cases = {
+        agent::StopReason::EndTurn,
+        agent::StopReason::StopSequence,
     };
     for (const auto& item : cases) {
         test::EngineFixture fixture(
             test::FakeModel({fixtures::stopped_response(
                 {agent::TextBlock{"fi"}, agent::TextBlock{"nal"}},
-                item.first, item.second)}),
+                item)}),
             test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
 
         const auto result = fixture.run(fixtures::run_request("finish"));
@@ -1681,43 +1695,31 @@ TEST_CASE(end_turn_and_stop_sequence_are_the_only_text_completion_stops) {
     }
 }
 
-TEST_CASE(engine_rejects_mismatched_canonical_and_raw_stop_reasons) {
-    struct InvalidCase {
-        agent::StopReason stop_reason;
-        const char* raw_stop_reason;
-        std::vector<agent::ContentBlock> content;
-    };
-    const std::vector<InvalidCase> invalid = {
-        {agent::StopReason::MaxTokens, "end_turn", {}},
-        {agent::StopReason::EndTurn, "tool_use",
-         {agent::TextBlock{"done"}}},
-        {agent::StopReason::ToolUse, "stop_sequence",
-         {agent::ToolUseBlock{fixtures::call("call-1", "read")}}},
-        {agent::StopReason::StopSequence, "max_tokens",
-         {agent::TextBlock{"done"}}},
-    };
+TEST_CASE(engine_rejects_unknown_stop_reason) {
+    // T12 (v2 §3): the runtime only sees the canonical StopReason
+    // enum. An Unknown value is the only signal a forged response can
+    // emit from the application layer; mismatched raw strings are an
+    // adapter concern and live in
+    // adapters/anthropic/anthropic_messages_client_test.cpp. The
+    // content arrays are empty because Unknown is rejected before the
+    // response's body is inspected.
+    test::EngineFixture fixture(
+        test::FakeModel({fixtures::stopped_response(
+            {}, agent::StopReason::Unknown)}),
+        test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
+    const auto result = fixture.run(fixtures::run_request("unknown stop"));
 
-    for (const auto& item : invalid) {
-        test::EngineFixture fixture(
-            test::FakeModel({fixtures::stopped_response(
-                item.content, item.stop_reason, item.raw_stop_reason)}),
-            test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
-
-        const auto result = fixture.run(fixtures::run_request("forged stop"));
-
-        REQUIRE(result.state.has_value());
-        REQUIRE(!result.fatal_error.has_value());
-        REQUIRE(result.state->status == agent::TaskStatus::Failed);
-        REQUIRE(result.state->terminal_error.has_value());
-        REQUIRE(result.state->terminal_error->code ==
-                agent::ErrorCode::ProtocolFailure);
-        REQUIRE(fixture.events.count(agent::EventKind::ModelCallFailed) == 1);
-        REQUIRE(fixture.events.count(agent::EventKind::ModelCallSucceeded) == 0);
-        REQUIRE(fixture.events.count(agent::EventKind::TaskCompleted) == 0);
-        REQUIRE(fixture.events.count(agent::EventKind::TaskBudgetExceeded) == 0);
-        REQUIRE(fixture.events.count(agent::EventKind::ToolCallStarted) == 0);
-        REQUIRE(fixture.tools.executed_calls.empty());
-    }
+    REQUIRE(result.state.has_value());
+    REQUIRE(!result.fatal_error.has_value());
+    REQUIRE(result.state->status == agent::TaskStatus::Failed);
+    REQUIRE(result.state->terminal_error.has_value());
+    REQUIRE(result.state->terminal_error->code ==
+            agent::ErrorCode::ProtocolFailure);
+    REQUIRE(fixture.events.count(agent::EventKind::ModelCallFailed) == 1);
+    REQUIRE(fixture.events.count(agent::EventKind::ModelCallSucceeded) == 0);
+    REQUIRE(fixture.events.count(agent::EventKind::TaskCompleted) == 0);
+    REQUIRE(fixture.events.count(agent::EventKind::ToolCallStarted) == 0);
+    REQUIRE(fixture.tools.executed_calls.empty());
 }
 
 TEST_CASE(tool_use_allows_ordered_text_and_tools_but_requires_a_tool_block) {
@@ -1726,7 +1728,7 @@ TEST_CASE(tool_use_allows_ordered_text_and_tools_but_requires_a_tool_block) {
             fixtures::stopped_response(
                 {agent::TextBlock{"checking"},
                  agent::ToolUseBlock{fixtures::call("call-1", "read")}},
-                agent::StopReason::ToolUse, "tool_use"),
+                agent::StopReason::ToolUse),
             fixtures::text_response("done")}),
         test::FakeTools({agent::ToolResult{"call-1", "contents", false}}),
         test::FakeKnowledge(agent::EvidencePack{}));
@@ -1743,7 +1745,7 @@ TEST_CASE(tool_use_allows_ordered_text_and_tools_but_requires_a_tool_block) {
     test::EngineFixture missing_tool(
         test::FakeModel({fixtures::stopped_response(
             {agent::TextBlock{"not actually using a tool"}},
-            agent::StopReason::ToolUse, "tool_use")}),
+            agent::StopReason::ToolUse)}),
         test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
 
     const auto missing_result =
@@ -1762,8 +1764,7 @@ TEST_CASE(tool_use_allows_ordered_text_and_tools_but_requires_a_tool_block) {
 TEST_CASE(max_tokens_without_tools_is_budget_exceeded_after_accepted_response) {
     test::EngineFixture fixture(
         test::FakeModel({fixtures::stopped_response(
-            {agent::TextBlock{"partial"}}, agent::StopReason::MaxTokens,
-            "max_tokens")}),
+            {agent::TextBlock{"partial"}}, agent::StopReason::MaxTokens)}),
         test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
 
     const auto result = fixture.run(fixtures::run_request("long task"));
@@ -1789,7 +1790,7 @@ TEST_CASE(max_tokens_without_tools_is_budget_exceeded_after_accepted_response) {
 TEST_CASE(empty_max_tokens_response_is_accepted_before_exact_budget_terminal) {
     test::EngineFixture fixture(
         test::FakeModel({fixtures::stopped_response(
-            {}, agent::StopReason::MaxTokens, "max_tokens")}),
+            {}, agent::StopReason::MaxTokens)}),
         test::FakeTools{}, test::FakeKnowledge(agent::EvidencePack{}));
 
     const auto result = fixture.run(fixtures::run_request("long task"));
@@ -1824,16 +1825,16 @@ TEST_CASE(model_tool_result_blocks_fail_before_success_or_terminal_routing) {
     const std::vector<agent::ModelResponse> invalid_responses = {
         fixtures::stopped_response(
             {agent::TextBlock{"text"}, tool_result},
-            agent::StopReason::EndTurn, "end_turn"),
+            agent::StopReason::EndTurn),
         fixtures::stopped_response(
             {agent::TextBlock{"text"}, tool_result},
-            agent::StopReason::StopSequence, "stop_sequence"),
+            agent::StopReason::StopSequence),
         fixtures::stopped_response(
             {agent::TextBlock{"partial"}, tool_result},
-            agent::StopReason::MaxTokens, "max_tokens"),
+            agent::StopReason::MaxTokens),
         fixtures::stopped_response(
             {agent::ToolUseBlock{call}, tool_result},
-            agent::StopReason::ToolUse, "tool_use"),
+            agent::StopReason::ToolUse),
     };
     const agent::RuntimeError expected{
         agent::ErrorCode::ProtocolFailure,
@@ -1873,32 +1874,23 @@ TEST_CASE(inconsistent_stop_and_content_rows_fail_directly_as_model_protocol) {
     const auto call = fixtures::call("call-1", "read");
     const std::vector<agent::ModelResponse> invalid_responses = {
         fixtures::stopped_response({agent::TextBlock{"unknown"}},
-                                   agent::StopReason::Unknown,
-                                   "future_stop"),
-        fixtures::stopped_response({}, agent::StopReason::ToolUse,
-                                   "tool_use"),
+                                   agent::StopReason::Unknown),
+        fixtures::stopped_response({}, agent::StopReason::ToolUse),
         fixtures::stopped_response({agent::ToolUseBlock{call}},
-                                   agent::StopReason::EndTurn,
-                                   "end_turn"),
+                                   agent::StopReason::EndTurn),
         fixtures::stopped_response({agent::ToolUseBlock{call}},
-                                   agent::StopReason::StopSequence,
-                                   "stop_sequence"),
+                                   agent::StopReason::StopSequence),
         fixtures::stopped_response({agent::ToolUseBlock{call}},
-                                   agent::StopReason::MaxTokens,
-                                   "max_tokens"),
-        fixtures::stopped_response({}, agent::StopReason::EndTurn,
-                                   "end_turn"),
-        fixtures::stopped_response({}, agent::StopReason::StopSequence,
-                                   "stop_sequence"),
+                                   agent::StopReason::MaxTokens),
+        fixtures::stopped_response({}, agent::StopReason::EndTurn),
+        fixtures::stopped_response({}, agent::StopReason::StopSequence),
         fixtures::stopped_response({agent::TextBlock{""}},
-                                   agent::StopReason::EndTurn,
-                                   "end_turn"),
+                                   agent::StopReason::EndTurn),
         fixtures::stopped_response({agent::TextBlock{""}},
-                                   agent::StopReason::StopSequence,
-                                   "stop_sequence"),
+                                   agent::StopReason::StopSequence),
         fixtures::stopped_response(
             {agent::TextBlock{""}, agent::ToolUseBlock{call}},
-            agent::StopReason::ToolUse, "tool_use"),
+            agent::StopReason::ToolUse),
     };
 
     for (const auto& response : invalid_responses) {

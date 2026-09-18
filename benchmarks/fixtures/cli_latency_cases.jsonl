@@ -1,0 +1,22 @@
+# Fixed scenario set used by benchmarks/cli_latency_benchmark.py.
+#
+# Each line is a JSON object with the keys consumed by Case.from_json:
+#   name         scenario name, used as the run identifier and sample prefix.
+#   prompt       the literal prompt fed to the binary's --once command.
+#   state        "warm" (default) keeps the process and amortises startup;
+#                "process-cold" forces a fresh process and isolated runtime.
+#   iterations   number of times the harness should repeat the case. The spec
+#                requires >=50 offline / >=40 online; this file is the floor
+#                used by unit tests so the harness stays reproducible without
+#                needing provider credentials.
+#
+# Keep this file deterministic: tests in
+# tests/benchmark/cli_latency_benchmark_test.py load it and assert the schema.
+{"name":"greeting_short_warm","prompt":"hi","state":"warm","iterations":5}
+{"name":"non_regulatory_programming_warm","prompt":"Write a Python function that reverses a list without using the reversed builtin.","state":"warm","iterations":5}
+{"name":"cfr_exact_reference_warm","prompt":"What does 14 CFR 25.1309 require?","state":"warm","iterations":5}
+{"name":"cfr_exact_reference_cold","prompt":"What does 14 CFR 25.1309 require?","state":"process-cold","iterations":2}
+{"name":"cfr_semantic_warm","prompt":"Summarise FAA rules about equipment, systems, and installations.","state":"warm","iterations":5}
+{"name":"second_turn_warm","prompt":"Now list the categories of equipment covered.","state":"warm","iterations":5}
+{"name":"cancel_long_warm","prompt":"Walk me through every paragraph of 14 CFR part 25 subpart F in detail.","state":"warm","iterations":2}
+{"name":"sidecar_recovery_warm","prompt":"What does 14 CFR 25.1309 require?","state":"warm","iterations":3}

@@ -15,8 +15,9 @@ constexpr const char* kRequestId =
 const std::string kRetrievalRevision = "retrieval-" + std::string(64, 'e');
 
 nlohmann::json envelope(std::string op, nlohmann::json payload,
-                        std::string request_id = kRequestId) {
-    return {{"schema_version", 2},
+                        std::string request_id = kRequestId,
+                        std::int64_t schema_version = 2) {
+    return {{"schema_version", schema_version},
             {"request_id", std::move(request_id)},
             {"op", std::move(op)},
             {"payload", std::move(payload)}};
@@ -35,6 +36,23 @@ nlohmann::json ready() {
          {"dimensions", 1024},
          {"device", "cpu"}},
         "req-00000000000000000000000000000000");
+}
+
+nlohmann::json ready_v3(bool index_ready = true, bool embedding_ready = true) {
+    return envelope(
+        "ready",
+        {{"pack_id", "pack-cccccccccccccccccccccccccccccccc"},
+         {"retrieval_revision", kRetrievalRevision},
+         {"snapshot_date", "2026-09-03"},
+         {"document_count", 30'000},
+         {"chunk_count", 45'000},
+         {"model", "BAAI/bge-m3"},
+         {"revision", "dddddddddddddddddddddddddddddddddddddddd"},
+         {"dimensions", 1024},
+         {"device", "cpu"},
+         {"index_ready", index_ready},
+         {"embedding_ready", embedding_ready}},
+        "req-00000000000000000000000000000000", 3);
 }
 
 nlohmann::json evidence(std::string content = "Legal evidence") {
@@ -60,10 +78,12 @@ nlohmann::json evidence(std::string content = "Legal evidence") {
           {"neighbor_of", nullptr}}}};
 }
 
-nlohmann::json query(nlohmann::json item = evidence()) {
+nlohmann::json query(nlohmann::json item = evidence(),
+                    std::int64_t schema_version = 2) {
     return envelope("query_result",
                     {{"outcome", "matched"},
-                     {"items", nlohmann::json::array({item})}});
+                     {"items", nlohmann::json::array({item})}},
+                    kRequestId, schema_version);
 }
 
 void require_protocol_failure(const agent::Result<agent::EvidencePack>& result) {
@@ -236,4 +256,61 @@ TEST_CASE(rag_protocol_rejects_empty_oversized_and_non_utf8_content) {
     REQUIRE(agent::rag::decode_query_result(
         fixtures::query(fixtures::evidence(std::string(8'192, 'x'))).dump(),
         fixtures::kRequestId, fixtures::kRetrievalRevision, 6, 32'768).has_value());
+}
+
+// T5: v3 ready frames advertise `index_ready` and `embedding_ready`
+// separately. The decoder must accept either combination (as long as
+// at least one is true) and reject a frame that says "neither".
+TEST_CASE(rag_protocol_decodes_v3_ready_with_either_capability) {
+    for (const auto& [index_ready, embedding_ready] :
+         std::vector<std::pair<bool, bool>>{{true, false},
+                                            {false, true},
+                                            {true, true}}) {
+        const auto ready = agent::rag::decode_v3_ready(
+            fixtures::ready_v3(index_ready, embedding_ready).dump());
+        REQUIRE(ready.has_value());
+        REQUIRE(ready.value().index_ready == index_ready);
+        REQUIRE(ready.value().embedding_ready == embedding_ready);
+    }
+}
+
+TEST_CASE(rag_protocol_rejects_v3_ready_with_no_capability) {
+    auto empty = fixtures::ready_v3(false, false);
+    const auto decoded = agent::rag::decode_v3_ready(empty.dump());
+    REQUIRE(!decoded.has_value());
+    REQUIRE(decoded.error().code == agent::ErrorCode::ProtocolFailure);
+    REQUIRE(decoded.error().message == "invalid rag protocol response");
+    // T5: the unified `decode_ready` must agree.
+    REQUIRE(!agent::rag::decode_ready(empty.dump()).has_value());
+}
+
+TEST_CASE(rag_protocol_rejects_v3_decoder_with_v2_ready_frame) {
+    // T5: the v3 decoder must not consume a v2 frame, and the v2
+    // decoder must not consume a v3 frame.
+    const auto v2_frame = fixtures::ready().dump();
+    REQUIRE(!agent::rag::decode_v3_ready(v2_frame).has_value());
+
+    const auto v3_frame = fixtures::ready_v3().dump();
+    REQUIRE(!agent::rag::decode_v2_ready(v3_frame).has_value());
+}
+
+TEST_CASE(rag_protocol_query_result_decodes_v3_envelope) {
+    const auto v3_query = fixtures::query(fixtures::evidence(), 3).dump();
+    const auto decoded = agent::rag::decode_query_result(
+        v3_query, fixtures::kRequestId, fixtures::kRetrievalRevision, 6,
+        32'768);
+    REQUIRE(decoded.has_value());
+    REQUIRE(decoded.value().items.size() == 1);
+}
+
+TEST_CASE(rag_protocol_rejects_unknown_schema_version) {
+    auto response = fixtures::query();
+    response["schema_version"] = 4;
+    fixtures::require_protocol_failure(agent::rag::decode_query_result(
+        response.dump(), fixtures::kRequestId,
+        fixtures::kRetrievalRevision, 6, 32'768));
+
+    auto ready = fixtures::ready();
+    ready["schema_version"] = 4;
+    REQUIRE(!agent::rag::decode_ready(ready.dump()).has_value());
 }

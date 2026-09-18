@@ -22,6 +22,11 @@ struct ModelCallOptions {
     bool stream{false};
     const Cancellation* cancellation{nullptr};
     ModelStreamObserver observer;
+    // Optional latency trace request id. Carried by AnthropicMessagesClient
+    // into the HttpRequest so cpr_http_transport can attribute the
+    // first_text_received sample to the right turn without coupling to the
+    // runtime engine.
+    std::string latency_request_id;
 };
 
 }  // namespace agent

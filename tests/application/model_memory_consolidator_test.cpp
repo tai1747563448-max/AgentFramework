@@ -10,7 +10,7 @@ namespace {
 class RecordingModel final : public agent::ModelClient {
 public:
     agent::ModelResponse response{{agent::TextBlock{R"({"memories":[]})"}},
-                                  agent::StopReason::EndTurn, "end_turn"};
+                                  agent::StopReason::EndTurn};
     std::vector<agent::ModelRequest> requests;
     bool fail{false};
     bool throws{false};
@@ -72,7 +72,6 @@ TEST_CASE(consolidator_accepts_empty_array_and_all_known_categories) {
     agent::ModelMemoryConsolidator consolidator(model, {100});
     REQUIRE(consolidator.consolidate(input()).value().empty());
     model.response.stop_reason = agent::StopReason::StopSequence;
-    model.response.raw_stop_reason = "stop_sequence";
     model.text(R"({"memories":[{"category":"preference","scope":"workspace","content":"中文"},{"category":"decision","scope":"workspace","content":"d"},{"category":"fact","scope":"workspace","content":"f"},{"category":"workflow","scope":"workspace","content":"w"},{"category":"constraint","scope":"workspace","content":"c"}]})");
     const auto result = consolidator.consolidate(input());
     REQUIRE(result.has_value());

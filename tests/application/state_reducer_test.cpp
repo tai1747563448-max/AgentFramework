@@ -77,32 +77,14 @@ agent::RuntimeEvent model_started(const std::string& task_id,
 agent::RuntimeEvent model_succeeded(const std::string& task_id,
                                     std::uint64_t sequence,
                                     std::vector<agent::ContentBlock> content,
-                                    agent::StopReason stop_reason,
-                                    std::optional<std::string> raw_stop_reason =
-                                        std::nullopt) {
-    if (!raw_stop_reason.has_value()) {
-        switch (stop_reason) {
-        case agent::StopReason::EndTurn:
-            raw_stop_reason = "end_turn";
-            break;
-        case agent::StopReason::ToolUse:
-            raw_stop_reason = "tool_use";
-            break;
-        case agent::StopReason::MaxTokens:
-            raw_stop_reason = "max_tokens";
-            break;
-        case agent::StopReason::StopSequence:
-            raw_stop_reason = "stop_sequence";
-            break;
-        case agent::StopReason::Unknown:
-            raw_stop_reason = "unknown";
-            break;
-        }
-    }
+                                    agent::StopReason stop_reason) {
+    // T12 (v2 §3): ModelResponse no longer carries raw_stop_reason;
+    // the canonical StopReason is the only stop signal the reducer
+    // inspects. Adapter-specific string mapping lives in
+    // ports/stop_reason_codec.h.
     return event(task_id, sequence,
                  agent::ModelCallSucceededPayload{
-                     {std::move(content), stop_reason,
-                      std::move(*raw_stop_reason), 11, 5, "request-1"}});
+                     {std::move(content), stop_reason, 11, 5, "request-1"}});
 }
 
 agent::ToolCall first_call() {
@@ -672,7 +654,14 @@ TEST_CASE(replay_binds_every_stop_reason_to_its_content_shape) {
             std::optional<agent::RuntimeError>{budget_error});
 }
 
-TEST_CASE(replay_rejects_mismatched_canonical_and_raw_stop_reasons) {
+TEST_CASE(replay_rejects_unknown_canonical_stop_reason) {
+    // T12 (v2 §3): the runtime/reducer can only reject forged
+    // responses when they carry an unknown canonical StopReason. The
+    // raw provider string is an adapter concern and lives in
+    // adapters/anthropic/anthropic_messages_client_test.cpp. We keep
+    // the cross-content / stop_reason matrix rejection here, but
+    // drop the (stop_reason, raw_stop_reason) mismatch matrix because
+    // the raw field is no longer on ModelResponse.
     const std::string task = "stop-pair-forgery";
     const auto prefix = std::vector<agent::RuntimeEvent>{
         fixtures::task_started(task, 1, "issue"),
@@ -683,43 +672,17 @@ TEST_CASE(replay_rejects_mismatched_canonical_and_raw_stop_reasons) {
     const auto started = agent::replay_events(prefix);
     REQUIRE(started.has_value());
 
-    struct InvalidCase {
-        agent::StopReason stop_reason;
-        const char* raw_stop_reason;
-        std::vector<agent::ContentBlock> content;
-    };
-    const std::vector<InvalidCase> invalid = {
-        {agent::StopReason::MaxTokens, "end_turn", {}},
-        {agent::StopReason::EndTurn, "tool_use",
-         {agent::TextBlock{"done"}}},
-        {agent::StopReason::ToolUse, "stop_sequence",
-         {agent::ToolUseBlock{fixtures::first_call()}}},
-        {agent::StopReason::StopSequence, "max_tokens",
-         {agent::TextBlock{"done"}}},
-    };
+    const auto forged = fixtures::model_succeeded(
+        task, 5, {}, agent::StopReason::Unknown);
+    const auto reduced = agent::reduce_event(started.value(), forged);
+    REQUIRE(!reduced.has_value());
+    REQUIRE(reduced.error().code == agent::ErrorCode::InvalidTransition);
 
-    for (const auto& item : invalid) {
-        const auto forged = fixtures::model_succeeded(
-            task, 5, item.content, item.stop_reason,
-            std::string{item.raw_stop_reason});
-        const auto reduced = agent::reduce_event(started.value(), forged);
-        REQUIRE(!reduced.has_value());
-        REQUIRE(reduced.error().code == agent::ErrorCode::InvalidTransition);
-
-        auto trace = prefix;
-        trace.push_back(forged);
-        if (item.stop_reason == agent::StopReason::MaxTokens) {
-            trace.push_back(fixtures::event(
-                task, 6,
-                agent::TaskBudgetExceededPayload{
-                    "max_tokens",
-                    {agent::ErrorCode::BudgetExceeded,
-                     "model output token budget exceeded", false}}));
-        }
-        const auto replayed = agent::replay_events(trace);
-        REQUIRE(!replayed.has_value());
-        REQUIRE(replayed.error().code == agent::ErrorCode::InvalidTransition);
-    }
+    auto trace = prefix;
+    trace.push_back(forged);
+    const auto replayed = agent::replay_events(trace);
+    REQUIRE(!replayed.has_value());
+    REQUIRE(replayed.error().code == agent::ErrorCode::InvalidTransition);
 }
 
 TEST_CASE(replay_rejects_invalid_or_duplicate_response_tool_calls) {

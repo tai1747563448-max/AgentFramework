@@ -2,10 +2,14 @@
 
 #include "application/session_engine.h"
 #include "cli/cli_app.h"
+#include "cli/theme.h"
 #include "domain/memory_state.h"
 
+#include <chrono>
+#include <cstdint>
 #include <functional>
 #include <iosfwd>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -25,11 +29,22 @@ struct InteractiveSessionCommands {
     std::function<Result<std::vector<MemoryEntry>>(const std::string&)> memories;
     std::function<Result<MemoryEntry>(const std::string&, const std::string&)> remember;
     std::function<Result<void>(const std::string&)> forget;
-    std::function<Result<void>(const std::string&)> consolidate;
+    // request_maintenance is the non-blocking foreground entry point. It
+    // accepts the session id and the highest committed through_sequence the
+    // CLI has observed. The scheduler may discard older requests.
+    std::function<void(const std::string&, std::uint64_t)> request_maintenance;
+    // drain_for_exit is called once during CLI shutdown. It must never block
+    // longer than the timeout it is given.
+    std::function<void(std::chrono::milliseconds)> drain_for_exit;
+    std::function<std::optional<std::uint64_t>(const std::string&)> pending_through;
     std::function<SessionTurnResult(
         const std::string&, const std::string&,
         const RuntimeProgressObserver&, bool,
         const RuntimePresentationOptions&)> submit_presented;
+    std::function<SessionTurnResult(
+        const std::string&, const std::string&,
+        const RuntimeProgressObserver&, bool,
+        const RuntimePresentationOptions&, bool dry_run)> submit_presented_dry;
     std::function<SessionTurnResult(
         const std::string&, const RuntimeProgressObserver&, bool,
         const RuntimePresentationOptions&)> recover_presented;
@@ -38,12 +53,26 @@ struct InteractiveSessionCommands {
     std::function<void()> cancel_turn;
     std::function<bool()> cancellation_requested;
     std::function<void(std::function<void(const std::string&)>)> set_phase_observer;
+    // T11: returns the current permission state as a small JSON
+    // document so /permissions can print it without depending on the
+    // underlying StaticPermission type. Empty string means the
+    // runtime was assembled without a Permission and the CLI prints a
+    // "not configured" message instead.
+    std::function<std::string()> permission_state_text;
+    // T17 (v2 §3): returns the active (non-terminal) task list as
+    // a small JSON document so /tasks can print it without reaching
+    // into SessionEngine internals. The snapshot is rebuilt on
+    // every REPL tick so background task state is always live.
+    std::function<std::string()> active_tasks_text;
 };
 
 struct InteractiveUiOptions {
     bool dynamic{false};
     bool stream{true};
     std::function<std::size_t()> columns;
+    // T18: theme selection forwarded to TerminalPresenter so forks
+    // can pick a low-glyph vocabulary without rebuilding the runtime.
+    ThemeId theme_id{ThemeId::Claude};
 };
 
 class InteractiveCli {
@@ -61,13 +90,20 @@ public:
 
 private:
     SessionTurnResult execute_turn(const std::string& session_id,
-                                  const std::string& text, bool recover);
+                                  const std::string& text, bool recover,
+                                  bool dry_run = false);
     void show_header(const SessionState& session);
     void show_status(const SessionState& session);
     bool render_turn(const SessionTurnResult& result,
                      SessionState& session);
     void consolidate(const SessionState& session);
     Result<std::vector<MemoryEntry>> eligible_memories(const SessionState& session);
+    // T10: drive the /plan confirm loop. Returns the user's chosen text
+    // (committed to the session if 'y', edited via subsequent prompts if
+    // 'edit', discarded on 'n'). Returns std::nullopt if the user wants
+    // to abort the whole flow.
+    std::optional<std::string> confirm_plan_buffer(
+        const std::string& session_id, const std::string& plan_text);
 
     InteractiveSessionCommands commands_;
     std::string model_;
@@ -78,6 +114,9 @@ private:
     bool memory_available_;
     bool memory_on_;
     InteractiveUiOptions ui_;
+    // T10: stores the model output of a /plan turn while the user
+    // decides whether to commit, edit, or discard.
+    std::string plan_buffer_;
 };
 
 }  // namespace agent

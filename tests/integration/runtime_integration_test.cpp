@@ -12,6 +12,7 @@
 #include "cli/cli_app.h"
 #include "ports/cancellation.h"
 #include "ports/clock.h"
+#include "ports/operation_context.h"
 #include "ports/id_generator.h"
 #include "ports/model_client.h"
 #include "ports/process_runner.h"
@@ -91,7 +92,8 @@ public:
 class PoisonedKnowledge final : public agent::KnowledgeProvider {
 public:
     agent::Result<agent::EvidencePack> retrieve(
-        const agent::TaskState&) override {
+        const agent::TaskState&,
+        const agent::OperationContext& /*context*/) override {
         agent::EvidencePack pack;
         pack.items.push_back(
             {"doc-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-chunk-0000000000000001",
@@ -112,7 +114,8 @@ public:
 class AuthoritativeNoMatchKnowledge final : public agent::KnowledgeProvider {
 public:
     agent::Result<agent::EvidencePack> retrieve(
-        const agent::TaskState&) override {
+        const agent::TaskState&,
+        const agent::OperationContext& /*context*/) override {
         agent::EvidencePack pack;
         pack.authoritative_no_match = true;
         return agent::Result<agent::EvidencePack>::success(std::move(pack));
