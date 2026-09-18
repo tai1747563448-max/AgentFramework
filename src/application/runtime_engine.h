@@ -82,6 +82,45 @@ struct RuntimeUsageDelta {
     double usd{0.0};
 };
 
+// T06 (v2 §3): every `continue` inside RuntimeEngine::continue_task
+// carries one of these reason labels. The runtime emits a trace
+// sample tagged with the reason so post-mortem traces can answer
+// "why did this turn cycle the loop?" without grepping through event
+// payloads. Trace consumers filter on reason to bucket loops by
+// state-machine shape (model call, tool call, compaction, cancel).
+enum class ContinueReason {
+    InitialCreate,
+    ContextPrepared,
+    ContextFailed,
+    KnowledgeNoMatch,
+    AwaitingModelNextRound,
+    AwaitingToolNext,
+    ToolsCompletedRound,
+    ModelResponseAccepted,
+    CompactionSucceeded,
+    CancelledByUser,
+    BudgetExceeded,
+    InvariantFailure,
+};
+
+inline const char* continue_reason_name(ContinueReason reason) {
+    switch (reason) {
+    case ContinueReason::InitialCreate:           return "initial_create";
+    case ContinueReason::ContextPrepared:         return "context_prepared";
+    case ContinueReason::ContextFailed:           return "context_failed";
+    case ContinueReason::KnowledgeNoMatch:        return "knowledge_no_match";
+    case ContinueReason::AwaitingModelNextRound:  return "awaiting_model_next";
+    case ContinueReason::AwaitingToolNext:        return "awaiting_tool_next";
+    case ContinueReason::ToolsCompletedRound:     return "tools_completed";
+    case ContinueReason::ModelResponseAccepted:   return "model_response_accepted";
+    case ContinueReason::CompactionSucceeded:     return "compaction_succeeded";
+    case ContinueReason::CancelledByUser:         return "cancelled_by_user";
+    case ContinueReason::BudgetExceeded:          return "budget_exceeded";
+    case ContinueReason::InvariantFailure:        return "invariant_failure";
+    }
+    return "unknown";
+}
+
 struct RuntimeProgress {
     std::string task_id;
     std::uint64_t sequence;

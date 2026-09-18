@@ -239,6 +239,7 @@ target_link_libraries(markdown_memory_store_tests PRIVATE agent_runtime)
 add_agent_test(strict_json_tests tests/adapters/strict_json_test.cpp)
 add_agent_test(session_engine_tests tests/application/session_engine_test.cpp)
 add_agent_test(runtime_engine_tests tests/application/runtime_engine_test.cpp)
+add_agent_test(continue_reason_tests tests/application/continue_reason_test.cpp)
 add_agent_test(hook_chain_tests tests/application/hook_chain_test.cpp)
 add_agent_test(task_evaluator_tests tests/application/task_evaluator_test.cpp)
 add_agent_test(benchmark_statistics_tests

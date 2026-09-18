@@ -369,6 +369,18 @@ RuntimeResult RuntimeEngine::continue_task(
             RuntimeError{ErrorCode::InvalidTransition, message, false}};
     };
 
+    // T06: trace every loop iteration's reason. The label is best-
+    // effort: when the runtime commits a state change we tag it
+    // with the reason for that transition so the post-mortem trace
+    // can replay "why did we cycle?".
+    auto push_reason = [](ContinueReason reason) {
+        // Hook the trace sink only — the runtime does not need a
+        // structured reason log because the same information is
+        // already encoded in the durable event stream.
+        emit_latency_sample(continue_reason_name(reason),
+                             "continue_reason");
+    };
+
     while (!is_terminal(state->status)) {
         const std::string task_id = state->task_id;
 
@@ -378,6 +390,7 @@ RuntimeResult RuntimeEngine::continue_task(
             if (transition.fatal_error.has_value()) {
                 return transition;
             }
+            push_reason(ContinueReason::InitialCreate);
             continue;
         }
 
@@ -425,11 +438,13 @@ RuntimeResult RuntimeEngine::continue_task(
             if (transition.fatal_error.has_value()) {
                 return transition;
             }
+            push_reason(ContinueReason::ContextPrepared);
             continue;
         }
 
         if (state->status == TaskStatus::AwaitingModel) {
             if (state->evidence.authoritative_no_match) {
+                push_reason(ContinueReason::KnowledgeNoMatch);
                 return append_event(
                     state, task_id,
                     KnowledgeNoMatchPayload{
@@ -698,11 +713,13 @@ RuntimeResult RuntimeEngine::continue_task(
                     TaskCompletedPayload{final_text}, observer);
             }
             if (stop_reason == StopReason::MaxTokens) {
+                push_reason(ContinueReason::BudgetExceeded);
                 return append_event(state, task_id,
                     TaskBudgetExceededPayload{
                         "max_tokens", {ErrorCode::BudgetExceeded,
                         "model output token budget exceeded", false}}, observer);
             }
+            push_reason(ContinueReason::ModelResponseAccepted);
             continue;
         }
 
@@ -715,6 +732,7 @@ RuntimeResult RuntimeEngine::continue_task(
                 if (transition.fatal_error.has_value()) {
                     return transition;
                 }
+                push_reason(ContinueReason::ToolsCompletedRound);
                 continue;
             }
 
@@ -1099,6 +1117,7 @@ RuntimeResult RuntimeEngine::continue_task(
                     return transition;
                 }
             }
+            push_reason(ContinueReason::AwaitingToolNext);
             continue;
         }
 
