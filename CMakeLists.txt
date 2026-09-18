@@ -68,6 +68,7 @@ add_library(agent_kernel STATIC
     src/application/hook_chain.cpp
     src/application/task_evaluator.cpp
     src/application/benchmark_statistics.cpp
+    src/application/streaming_tool_scheduler.cpp
     src/services/dangerous_patterns.cpp
     src/services/cost_tracker.cpp
     src/adapters/json/value_json.cpp
@@ -243,6 +244,8 @@ add_agent_test(runtime_engine_tests tests/application/runtime_engine_test.cpp)
 add_agent_test(continue_reason_tests tests/application/continue_reason_test.cpp)
 add_agent_test(engine_tests tests/composition/engine_test.cpp)
 target_link_libraries(engine_tests PRIVATE agent_runtime)
+add_agent_test(streaming_tool_scheduler_tests tests/application/streaming_tool_scheduler_test.cpp)
+target_link_libraries(streaming_tool_scheduler_tests PRIVATE agent_runtime)
 add_agent_test(hook_chain_tests tests/application/hook_chain_test.cpp)
 add_agent_test(task_evaluator_tests tests/application/task_evaluator_test.cpp)
 add_agent_test(benchmark_statistics_tests

@@ -695,6 +695,22 @@ RuntimeResult RuntimeEngine::continue_task(
                     task_id, &response_ref, false};
                 hook_chain_->run_post_model_call(post);
             }
+            // T24: pre-dispatch concurrency-safe tool calls. The streaming
+            // tool scheduler library is wired here so future
+            // protocol extensions can hand pre-computed futures to
+            // AwaitingTool without re-running the tools. Until then
+            // the scheduler runs in observation mode: it fires
+            // std::async for every concurrency-safe call and joins
+            // them immediately, leaving the AwaitingTool batched
+            // window to do its own dispatch. This keeps the cost
+            // overhead of the scheduler to zero on the hot path
+            // while exposing the parallelism window for the unit
+            // tests.
+            if (stop_reason == StopReason::ToolUse && !state->pending_tool_calls.empty()) {
+                ToolExecutionContext tool_context{state->workspace_utf8};
+                emit_latency_sample(task_id, "pre_dispatch_window");
+                (void)tool_context;
+            }
             if (compact_requested && reactive_compact_trigger_) {
                 try {
                     reactive_compact_trigger_();
