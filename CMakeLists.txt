@@ -100,6 +100,7 @@ add_library(agent_runtime STATIC
     src/adapters/rag/persistent_rag_knowledge_provider.cpp
     src/adapters/build/cmake_tool_gateway.cpp
     src/adapters/tools/composite_tool_gateway.cpp
+    src/ports/tool_gateway.cpp
     src/adapters/system/system_clock.cpp
     src/adapters/system/random_id_generator.cpp
     src/adapters/system/signal_cancellation.cpp

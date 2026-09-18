@@ -41,4 +41,22 @@ Result<ToolResult> CompositeToolGateway::execute(
     return route->second->execute(call, context);
 }
 
+bool CompositeToolGateway::tool_is_concurrency_safe(
+    const std::string& name) const {
+    const auto route = routes_.find(name);
+    if (route == routes_.end()) {
+        return false;
+    }
+    return route->second->tool_is_concurrency_safe(name);
+}
+
+bool CompositeToolGateway::tool_is_read_only(
+    const std::string& name) const {
+    const auto route = routes_.find(name);
+    if (route == routes_.end()) {
+        return false;
+    }
+    return route->second->tool_is_read_only(name);
+}
+
 }  // namespace agent

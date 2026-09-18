@@ -19,6 +19,11 @@ public:
         const ToolCall& call,
         const ToolExecutionContext& context) override;
 
+    bool tool_is_concurrency_safe(
+        const std::string& name) const override;
+    bool tool_is_read_only(
+        const std::string& name) const override;
+
 private:
     std::vector<ToolDefinition> definitions_;
     std::unordered_map<std::string, ToolGateway*> routes_;
