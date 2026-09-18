@@ -321,7 +321,7 @@ RuntimeResult RuntimeEngine::run(
     }
 
     return continue_task(state, request.system_prompt, started_at_ms,
-                         observer, request.presentation);
+                         observer, request.presentation, request.dry_run);
 }
 
 RuntimeResult RuntimeEngine::resume(
@@ -351,7 +351,8 @@ RuntimeResult RuntimeEngine::continue_task(
     const std::string& system_prompt,
     std::int64_t started_at_ms,
     RuntimeProgressObserver& observer,
-    RuntimePresentationOptions presentation) {
+    RuntimePresentationOptions presentation,
+    bool dry_run) {
     const auto invariant_failure = [&](const char* message) {
         return RuntimeResult{
             state,
@@ -489,6 +490,13 @@ RuntimeResult RuntimeEngine::continue_task(
                     // Retrieved articles are untrusted data. A model may quote or
                     // summarize them, but it cannot turn their contents into an
                     // executable capability request.
+                    definitions.clear();
+                }
+                if (dry_run) {
+                    // T10: /plan mode. Strip tool definitions so the model
+                    // is forced to respond with plain text. The user
+                    // confirms the plan before the runtime is asked to
+                    // execute anything.
                     definitions.clear();
                 }
 
@@ -633,6 +641,11 @@ RuntimeResult RuntimeEngine::continue_task(
             }
             if (stop_reason == StopReason::EndTurn ||
                 stop_reason == StopReason::StopSequence) {
+                // T10: dry_run plans are reported to the caller through
+                // TaskCompletedPayload just like a real completion. The
+                // AwaitingTool path is unreachable because the plan never
+                // emits tool_use blocks (the model is instructed via the
+                // system prompt to write a plan instead of running tools).
                 return append_event(state, task_id,
                     TaskCompletedPayload{final_text}, observer);
             }

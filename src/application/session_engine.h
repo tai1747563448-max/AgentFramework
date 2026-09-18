@@ -72,7 +72,8 @@ public:
         const std::string& user_text,
         RuntimeProgressObserver observer,
         bool use_memory = true,
-        const RuntimePresentationOptions& presentation = {});
+        const RuntimePresentationOptions& presentation = {},
+        bool dry_run = false);
     SessionTurnResult recover_pending_turn(
         const std::string& session_id,
         RuntimeProgressObserver observer,
@@ -88,7 +89,8 @@ private:
                                            RuntimePresentationOptions& presentation) const;
     RunRequest turn_request(const SessionState& state,
                              std::string system_prompt,
-                             const RuntimePresentationOptions& presentation) const;
+                             const RuntimePresentationOptions& presentation,
+                             bool dry_run = false) const;
     SessionTurnResult finalize_turn(SessionState state,
                                     RuntimeResult runtime);
 

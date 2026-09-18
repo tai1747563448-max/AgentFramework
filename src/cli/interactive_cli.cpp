@@ -165,7 +165,8 @@ InteractiveCli::InteractiveCli(InteractiveSessionCommands commands,
 
 SessionTurnResult InteractiveCli::execute_turn(const std::string& session_id,
                                                const std::string& text,
-                                               bool recover) {
+                                               bool recover,
+                                               bool dry_run) {
     TurnLifecycle lifecycle(commands_);
     const auto channel = std::make_shared<TurnChannel>();
     RuntimePresentationOptions presentation;
@@ -214,9 +215,17 @@ SessionTurnResult InteractiveCli::execute_turn(const std::string& session_id,
                     ? commands_.recover_presented(session_id, observer, memory_on_, presentation)
                     : commands_.recover(session_id, observer, memory_on_);
             } else {
-                result = commands_.submit_presented
-                    ? commands_.submit_presented(session_id, text, observer, memory_on_, presentation)
-                    : commands_.submit(session_id, text, observer, memory_on_);
+                if (dry_run && commands_.submit_presented_dry) {
+                    result = commands_.submit_presented_dry(
+                        session_id, text, observer, memory_on_, presentation,
+                        true);
+                } else if (commands_.submit_presented) {
+                    result = commands_.submit_presented(
+                        session_id, text, observer, memory_on_, presentation);
+                } else {
+                    result = commands_.submit(session_id, text, observer,
+                                               memory_on_);
+                }
             }
         } catch (...) {
             result.error = RuntimeError{ErrorCode::DependencyUnavailable,
@@ -543,6 +552,36 @@ int InteractiveCli::run() {
             }
             continue;
         }
+        // T10: /plan takes the rest of the line as the plan request. It
+        // runs a dry_run turn, captures the model's response into
+        // plan_buffer, then drives the confirm loop (y/n/edit).
+        if (command_argument(line, "/plan", argument)) {
+            if (argument.empty()) {
+                error_ << "plan requires a request\n";
+                continue;
+            }
+            const auto result = execute_turn(current.session_id, argument,
+                                             false, true);
+            if (!result.task.has_value() ||
+                result.task->status != agent::TaskStatus::Completed ||
+                !result.task->final_text.has_value()) {
+                error_ << "plan generation failed\n";
+                render_turn(result, current);
+                continue;
+            }
+            plan_buffer_ = *result.task->final_text;
+            output_ << "\n--- plan (review before commit) ---\n"
+                    << render_terminal_text(plan_buffer_) << "\n";
+            const auto committed_text =
+                confirm_plan_buffer(current.session_id, plan_buffer_);
+            if (committed_text.has_value() && !committed_text->empty()) {
+                const auto commit_result = execute_turn(
+                    current.session_id, *committed_text, false);
+                render_turn(commit_result, current);
+            }
+            plan_buffer_.clear();
+            continue;
+        }
         if (!line.empty() && line.front() == '/') {
             error_ << "unknown command\n";
             continue;
@@ -550,6 +589,43 @@ int InteractiveCli::run() {
 
         const auto result = execute_turn(current.session_id, line, false);
         render_turn(result, current);
+    }
+}
+
+std::optional<std::string> InteractiveCli::confirm_plan_buffer(
+    const std::string& session_id, const std::string& plan_text) {
+    (void)session_id;
+    while (true) {
+        output_ << "\nCommit this plan? [y/n/edit]: ";
+        output_.flush();
+        std::string answer;
+        if (!std::getline(input_, answer)) {
+            return std::nullopt;
+        }
+        answer = trim(std::move(answer));
+        if (answer == "y" || answer == "yes") {
+            return plan_text;
+        }
+        if (answer == "n" || answer == "no") {
+            output_ << "Plan discarded.\n";
+            return std::nullopt;
+        }
+        if (answer == "edit") {
+            output_ << "Enter edited plan (finish with a single '.' on "
+                       "its own line):\n";
+            output_.flush();
+            std::string edited;
+            std::string line;
+            while (std::getline(input_, line)) {
+                if (line == ".") break;
+                if (!edited.empty()) edited.push_back('\n');
+                edited += line;
+            }
+            output_ << "\n--- edited plan ---\n"
+                    << render_terminal_text(edited) << "\n";
+            return edited;
+        }
+        output_ << "please answer y, n, or edit\n";
     }
 }
 

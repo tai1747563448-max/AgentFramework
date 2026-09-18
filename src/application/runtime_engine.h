@@ -44,6 +44,10 @@ struct RunRequest {
     std::optional<std::string> requested_task_id;
     std::optional<SessionTaskLink> session_link;
     RuntimePresentationOptions presentation;
+    // T10: when true, the runtime refuses to enter AwaitingTool and stops
+    // at the first EndTurn response. The plan is the model's plain text
+    // output; the user confirms with `y` to actually run it.
+    bool dry_run{false};
 };
 
 struct ResumeRequest {
@@ -121,7 +125,8 @@ private:
                                 const std::string& system_prompt,
                                 std::int64_t started_at_ms,
                                 RuntimeProgressObserver& observer,
-                                RuntimePresentationOptions presentation);
+                                RuntimePresentationOptions presentation,
+                                bool dry_run = false);
 
     ModelClient& model_;
     ToolGateway& tools_;

@@ -41,6 +41,10 @@ struct InteractiveSessionCommands {
         const RuntimeProgressObserver&, bool,
         const RuntimePresentationOptions&)> submit_presented;
     std::function<SessionTurnResult(
+        const std::string&, const std::string&,
+        const RuntimeProgressObserver&, bool,
+        const RuntimePresentationOptions&, bool dry_run)> submit_presented_dry;
+    std::function<SessionTurnResult(
         const std::string&, const RuntimeProgressObserver&, bool,
         const RuntimePresentationOptions&)> recover_presented;
     std::function<void()> begin_turn;
@@ -71,13 +75,20 @@ public:
 
 private:
     SessionTurnResult execute_turn(const std::string& session_id,
-                                  const std::string& text, bool recover);
+                                  const std::string& text, bool recover,
+                                  bool dry_run = false);
     void show_header(const SessionState& session);
     void show_status(const SessionState& session);
     bool render_turn(const SessionTurnResult& result,
                      SessionState& session);
     void consolidate(const SessionState& session);
     Result<std::vector<MemoryEntry>> eligible_memories(const SessionState& session);
+    // T10: drive the /plan confirm loop. Returns the user's chosen text
+    // (committed to the session if 'y', edited via subsequent prompts if
+    // 'edit', discarded on 'n'). Returns std::nullopt if the user wants
+    // to abort the whole flow.
+    std::optional<std::string> confirm_plan_buffer(
+        const std::string& session_id, const std::string& plan_text);
 
     InteractiveSessionCommands commands_;
     std::string model_;
@@ -88,6 +99,9 @@ private:
     bool memory_available_;
     bool memory_on_;
     InteractiveUiOptions ui_;
+    // T10: stores the model output of a /plan turn while the user
+    // decides whether to commit, edit, or discard.
+    std::string plan_buffer_;
 };
 
 }  // namespace agent

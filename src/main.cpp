@@ -497,6 +497,19 @@ int run_agent(std::vector<std::string> args) {
                 return session_engine.submit_turn(
                     session_id, text, observer, use_memory, presentation);
             };
+            // T10: dry-run variant. Forwards to session_engine with
+            // dry_run=true so the runtime strips tool definitions and the
+            // model produces a plan-only text response.
+            commands.submit_presented_dry = [&, current_session_id]
+                (const std::string& session_id, const std::string& text,
+                 const agent::RuntimeProgressObserver& observer, bool use_memory,
+                 const agent::RuntimePresentationOptions& presentation,
+                 bool dry_run) {
+                *current_session_id = session_id;
+                return session_engine.submit_turn(
+                    session_id, text, observer, use_memory, presentation,
+                    dry_run);
+            };
             commands.recover_presented = [&, current_session_id]
                 (const std::string& session_id,
                  const agent::RuntimeProgressObserver& observer, bool use_memory,
