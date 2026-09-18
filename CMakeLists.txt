@@ -63,6 +63,7 @@ add_library(agent_kernel STATIC
     src/application/retrieval_policy.cpp
     src/application/session_engine.cpp
     src/application/runtime_engine.cpp
+    src/application/hook_chain.cpp
     src/application/task_evaluator.cpp
     src/application/benchmark_statistics.cpp
     src/adapters/json/value_json.cpp
@@ -217,6 +218,7 @@ add_agent_test(jsonl_memory_store_tests tests/adapters/jsonl_memory_store_test.c
 add_agent_test(strict_json_tests tests/adapters/strict_json_test.cpp)
 add_agent_test(session_engine_tests tests/application/session_engine_test.cpp)
 add_agent_test(runtime_engine_tests tests/application/runtime_engine_test.cpp)
+add_agent_test(hook_chain_tests tests/application/hook_chain_test.cpp)
 add_agent_test(task_evaluator_tests tests/application/task_evaluator_test.cpp)
 add_agent_test(benchmark_statistics_tests
     tests/application/benchmark_statistics_test.cpp)

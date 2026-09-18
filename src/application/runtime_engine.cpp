@@ -1,6 +1,7 @@
 #include "application/runtime_engine.h"
 
 #include "application/state_reducer.h"
+#include "application/hook_chain.h"
 #include "domain/evidence_validation.h"
 #include "domain/latency_trace.h"
 #include "ports/cancellation.h"
@@ -176,7 +177,8 @@ RuntimeEngine::RuntimeEngine(ModelClient& model,
                              IdGenerator& ids,
                              Cancellation& cancellation,
                              std::string model_name,
-                             std::function<void()> reactive_compact_trigger)
+                             std::function<void()> reactive_compact_trigger,
+                             std::shared_ptr<HookChain> hook_chain)
     : model_(model),
       tools_(tools),
       knowledge_(knowledge),
@@ -185,7 +187,8 @@ RuntimeEngine::RuntimeEngine(ModelClient& model,
       ids_(ids),
       cancellation_(cancellation),
       model_name_(std::move(model_name)),
-      reactive_compact_trigger_(std::move(reactive_compact_trigger)) {}
+      reactive_compact_trigger_(std::move(reactive_compact_trigger)),
+      hook_chain_(std::move(hook_chain)) {}
 
 RuntimeResult RuntimeEngine::append_event(std::optional<TaskState>& state,
                                           const std::string& task_id,
@@ -702,7 +705,7 @@ RuntimeResult RuntimeEngine::continue_task(
             // touching the batched window so the event log stays
             // linear.
             if (state->active_tool_call_id.has_value()) {
-                const ToolCall call =
+                ToolCall call =
                     state->pending_tool_calls.at(state->next_tool_index);
                 if (*state->active_tool_call_id != call.id) {
                     return invariant_failure(
@@ -713,6 +716,29 @@ RuntimeResult RuntimeEngine::continue_task(
                 if (transition.fatal_error.has_value() ||
                     is_terminal(state->status)) {
                     return transition;
+                }
+                // T13: preToolUse hook chain. A deny causes an immediate
+                // failed result with denial_reason; a mutate rewrites
+                // the call before execute(). The chain runs synchronously
+                // on the calling thread so concurrent dispatch is safe.
+                if (hook_chain_) {
+                    HookPreToolUse pre{
+                        state->session_link.has_value()
+                            ? state->session_link->session_id
+                            : std::string{},
+                        task_id, &call, false, {}};
+                    hook_chain_->run_pre_tool_use(pre);
+                    if (pre.denied) {
+                        auto denied_result = ToolResult{
+                            call.id,
+                            std::string("hook denied: ") + pre.denial_reason,
+                            true};
+                        return append_event(
+                            state, task_id,
+                            ToolCallSucceededPayload{
+                                std::move(denied_result)},
+                            observer);
+                    }
                 }
                 auto tool_result = tools_.execute(
                     call, ToolExecutionContext{state->workspace_utf8});
@@ -731,6 +757,18 @@ RuntimeResult RuntimeEngine::continue_task(
                              "tool result ID does not match active tool call",
                              false}},
                         observer);
+                }
+                // T13: postToolUse hook chain. Hooks may rewrite the
+                // result content; the mutated flag lets the reducer know
+                // to track the rewrite.
+                if (hook_chain_) {
+                    HookPostToolUse post{
+                        state->session_link.has_value()
+                            ? state->session_link->session_id
+                            : std::string{},
+                        task_id, call,
+                        &tool_result.value(), false};
+                    hook_chain_->run_post_tool_use(post);
                 }
                 return append_event(
                     state, task_id,
@@ -782,6 +820,32 @@ RuntimeResult RuntimeEngine::continue_task(
                 }
             }
 
+            // T13: preToolUse hooks run synchronously on the calling
+            // thread, before partition, so a denied call never enters
+            // the dispatch pool. A mutate-rewrite is reflected in the
+            // local copy used by execute(). The hook chain is shared
+            // across the parallel and serial dispatch so the same hook
+            // sees every call in the window.
+            std::vector<bool> pre_denied(window_size, false);
+            std::vector<std::string> pre_denial_reason(window_size);
+            if (hook_chain_) {
+                const auto session_id =
+                    state->session_link.has_value()
+                        ? state->session_link->session_id
+                        : std::string{};
+                for (std::size_t offset = 0; offset < window_size; ++offset) {
+                    ToolCall& call =
+                        state->pending_tool_calls.at(state->next_tool_index +
+                                                     offset);
+                    HookPreToolUse pre{session_id, task_id, &call, false, {}};
+                    hook_chain_->run_pre_tool_use(pre);
+                    if (pre.denied) {
+                        pre_denied[offset] = true;
+                        pre_denial_reason[offset] = pre.denial_reason;
+                    }
+                }
+            }
+
             // Partition the window: tools that opted into
             // concurrency_safe run in parallel; everything else
             // (replace_text / write_file and any future mutating tool)
@@ -797,6 +861,7 @@ RuntimeResult RuntimeEngine::continue_task(
             serial_offsets.reserve(window_size);
             const ToolExecutionContext tool_context{state->workspace_utf8};
             for (std::size_t offset = 0; offset < window_size; ++offset) {
+                if (pre_denied[offset]) continue;  // skip pre-denied
                 const ToolCall& call = state->pending_tool_calls.at(
                     state->next_tool_index + offset);
                 if (tools_.tool_is_concurrency_safe(call.name)) {
@@ -834,6 +899,20 @@ RuntimeResult RuntimeEngine::continue_task(
                     state->next_tool_index + offset);
                 results[offset] = tools_.execute(call, tool_context);
             }
+            // Pre-denied slots: synthesise a failed result that flows
+            // through the same event-writing path as a real gateway
+            // failure.
+            for (std::size_t offset = 0; offset < window_size; ++offset) {
+                if (!pre_denied[offset]) continue;
+                const ToolCall& call = state->pending_tool_calls.at(
+                    state->next_tool_index + offset);
+                ToolResult denied{call.id,
+                                  std::string("hook denied: ") +
+                                      pre_denial_reason[offset],
+                                  true};
+                results[offset] = Result<ToolResult>::success(
+                    std::move(denied));
+            }
 
             // Emit ToolCallSucceeded / ToolCallFailed in
             // next_tool_index order so the reducer advances
@@ -841,7 +920,7 @@ RuntimeResult RuntimeEngine::continue_task(
             for (std::size_t offset = 0; offset < window_size; ++offset) {
                 const ToolCall& call = state->pending_tool_calls.at(
                     state->next_tool_index + offset);
-                const auto& tool_result = results[offset];
+                auto& tool_result = results[offset];
                 if (!tool_result.has_value() || !tool_result->has_value()) {
                     transition = append_event(
                         state, task_id,
@@ -864,6 +943,20 @@ RuntimeResult RuntimeEngine::continue_task(
                              false}},
                         observer);
                 } else {
+                    // T13: postToolUse hook chain rewrites may run after
+                    // dispatch completes. Hooks may mutate the content
+                    // (e.g. redacting secrets); the mutated flag is left
+                    // as a future hook for the reducer to track the
+                    // rewrite in trace samples.
+                    if (hook_chain_) {
+                        const auto session_id =
+                            state->session_link.has_value()
+                                ? state->session_link->session_id
+                                : std::string{};
+                        HookPostToolUse post{session_id, task_id, call,
+                                             &tool_result->value(), false};
+                        hook_chain_->run_post_tool_use(post);
+                    }
                     transition = append_event(
                         state, task_id,
                         ToolCallSucceededPayload{

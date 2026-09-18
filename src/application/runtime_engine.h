@@ -4,10 +4,12 @@
 #include "domain/runtime_event.h"
 #include "domain/model_stream_event.h"
 #include "domain/task_state.h"
+#include "application/hook_chain.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -100,7 +102,8 @@ public:
                   IdGenerator& ids,
                   Cancellation& cancellation,
                   std::string model_name = {},
-                  std::function<void()> reactive_compact_trigger = {});
+                  std::function<void()> reactive_compact_trigger = {},
+                  std::shared_ptr<HookChain> hook_chain = {});
 
     const std::string& model_name() const noexcept { return model_name_; }
 
@@ -142,6 +145,12 @@ private:
     // CompactChain::ReactiveCompact::trigger(); tests can install
     // their own callback to assert the trigger fired.
     std::function<void()> reactive_compact_trigger_;
+    // T13: optional declarative hook chain. When non-null,
+    // AwaitingTool runs each ToolCall through preToolUse / postToolUse
+    // before / after the gateway execute() call. Other hooks
+    // (preModelCall / postModelCall) are reserved for T11 Permission
+    // and T19 Cost-tracker.
+    std::shared_ptr<HookChain> hook_chain_;
 };
 
 }  // namespace agent
