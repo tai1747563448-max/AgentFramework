@@ -2,6 +2,7 @@
 #include "adapters/process/reproc_jsonl_process.h"
 #include "adapters/rag/persistent_rag_knowledge_provider.h"
 #include "adapters/workspace/workspace_tool_gateway.h"
+#include "application/retrieval_policy.h"
 #include "application/runtime_engine.h"
 #include "application/state_reducer.h"
 #include "ports/cancellation.h"
@@ -122,6 +123,10 @@ agent::RagConfig rag_config(const std::filesystem::path& root) {
     config.top_k = 3;
     config.startup_timeout_ms = 30'000;
     config.query_timeout_ms = 10'000;
+    // T5: the Auto policy skips retrieval for turns without a
+    // regulatory signal. This suite exercises the retrieval path
+    // end-to-end, so pin the policy to Always.
+    config.retrieval_policy = agent::RetrievalPolicy::Always;
     return config;
 }
 

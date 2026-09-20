@@ -142,6 +142,9 @@ std::vector<agent::RuntimeEvent> completed_text_trace(const std::string& task_id
 std::vector<agent::RuntimeEvent> completed_two_tool_trace(const std::string& task_id) {
     const auto call_1 = first_call();
     const auto call_2 = second_call();
+    // T01 batched dispatch: the runtime emits both Started events
+    // before any Succeeded arrives. Match that shape so the replay
+    // reducer accepts the trace.
     return {
         task_started(task_id, 1, "inspect and build"),
         context_started(task_id, 2),
@@ -154,8 +157,8 @@ std::vector<agent::RuntimeEvent> completed_two_tool_trace(const std::string& tas
                          agent::ToolUseBlock{call_2}},
                         agent::StopReason::ToolUse),
         tool_started(task_id, 6, call_1),
-        tool_succeeded(task_id, 7, first_result()),
-        tool_started(task_id, 8, call_2),
+        tool_started(task_id, 7, call_2),
+        tool_succeeded(task_id, 8, first_result()),
         tool_succeeded(task_id, 9, second_result()),
         context_started(task_id, 10),
         context_prepared(task_id, 11, "source-2"),
@@ -294,12 +297,16 @@ TEST_CASE(replay_stops_at_first_schema_error) {
 
 TEST_CASE(reducer_rejects_context_start_until_all_tools_are_processed) {
     const auto events = fixtures::completed_two_tool_trace("task-tools");
-    const auto state = fixtures::replay_prefix(events, 7);
+    // Replay up to and including the first Succeeded (sequence 8): at
+    // this point one tool result is recorded and one is still in the
+    // dispatch window, so the reducer must refuse any context-start
+    // event that would skip the remaining work.
+    const auto state = fixtures::replay_prefix(events, 8);
     auto result = agent::reduce_event(
         state, fixtures::context_started("task-tools", state.last_sequence + 1));
     REQUIRE(!result.has_value());
     REQUIRE(result.error().code == agent::ErrorCode::InvalidTransition);
-    REQUIRE(state.last_sequence == 7);
+    REQUIRE(state.last_sequence == 8);
     REQUIRE(state.next_tool_index == 1);
     REQUIRE(state.pending_tool_results.size() == 1);
 }

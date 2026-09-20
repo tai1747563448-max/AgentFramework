@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -14,6 +15,7 @@
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -270,6 +272,18 @@ Result<SessionEvents> access_session_log(
     };
     auto leaf = open_leaf(OPEN_EXISTING);
     bool created = false;
+    // A reader holds the log with FILE_SHARE_READ (denying writers) for
+    // the duration of its read. Background transcript reads release the
+    // file within microseconds; a foreground append should ride that
+    // out instead of failing spuriously. Reads keep failing fast — only
+    // the append path retries briefly.
+    if (!leaf.valid() && append != nullptr && busy_file_error(GetLastError())) {
+        for (int attempt = 0; attempt < 20; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            leaf = open_leaf(OPEN_EXISTING);
+            if (leaf.valid() || !busy_file_error(GetLastError())) break;
+        }
+    }
     if (!leaf.valid()) {
         auto error = GetLastError();
         if (busy_file_error(error)) {

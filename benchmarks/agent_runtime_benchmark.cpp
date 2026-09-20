@@ -10,6 +10,7 @@
 #include "ports/id_generator.h"
 #include "ports/knowledge_provider.h"
 #include "ports/model_client.h"
+#include "ports/operation_context.h"
 #include "ports/tool_gateway.h"
 #include "benchmark_provenance.h"
 

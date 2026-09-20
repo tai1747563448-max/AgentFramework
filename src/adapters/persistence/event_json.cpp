@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <cstdio>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -416,14 +417,20 @@ Json model_response_to_json(const ModelResponse& response) {
 }
 
 ModelResponse model_response_from_json(const Json& json) {
-    // T12 (v2 §3): the v2 wire format drops raw_stop_reason entirely.
-    // require_exact_keys rejects legacy event logs that still contain
-    // the field; users rolling from v1 to v2 must either complete or
-    // discard in-flight tasks before swapping binaries. The strict
-    // shape is documented in v2 §6 as the only supported input.
-    require_exact_keys(
-        json, {"content", "stop_reason", "input_tokens", "output_tokens",
-               "provider_request_id"});
+    // V1 logs carry an additional raw_stop_reason string for legacy
+    // observability. It is tolerated (and ignored) so old traces stay
+    // replayable, but any other unknown key is still rejected.
+    require_object(json);
+    const bool has_raw_stop_reason = json.contains("raw_stop_reason");
+    if (json.size() != (has_raw_stop_reason ? 6u : 5u) ||
+        !json.contains("content") || !json.contains("stop_reason") ||
+        !json.contains("input_tokens") || !json.contains("output_tokens") ||
+        !json.contains("provider_request_id")) {
+        throw DecodeError("unexpected object keys");
+    }
+    if (has_raw_stop_reason && !json.at("raw_stop_reason").is_string()) {
+        throw DecodeError("invalid raw_stop_reason");
+    }
     return {content_from_json(json.at("content")),
             stop_reason_from_name(required_string(json, "stop_reason")),
             unsigned_integer<std::size_t>(json.at("input_tokens")),
@@ -439,14 +446,29 @@ Json budgets_to_json(const RuntimeBudgets& budgets) {
 }
 
 RuntimeBudgets budgets_from_json(const Json& json) {
-    require_exact_keys(
-        json, {"max_model_rounds", "max_tool_calls", "max_task_time_ms",
-               "model_timeout_ms"});
+    // Accept both the historical four-field shape (pre max_parallel_tools)
+    // and the current five-field shape. The legacy fixture format used
+    // in jsonl_event_store_tests pre-dates the parallel-tools field.
+    require_object(json);
+    const bool has_parallel = json.contains("max_parallel_tools");
+    const std::size_t required = has_parallel ? 5 : 4;
+    if (json.size() != required) {
+        throw DecodeError("unexpected object keys");
+    }
+    if (!json.contains("max_model_rounds") || !json.contains("max_tool_calls") ||
+        !json.contains("max_task_time_ms") || !json.contains("model_timeout_ms") ||
+        (required == 5 && !json.contains("max_parallel_tools"))) {
+        throw DecodeError("missing object key");
+    }
     RuntimeBudgets budgets{
         unsigned_integer<std::size_t>(json.at("max_model_rounds")),
         unsigned_integer<std::size_t>(json.at("max_tool_calls")),
         signed_integer(json.at("max_task_time_ms")),
         signed_integer(json.at("model_timeout_ms"))};
+    if (has_parallel) {
+        budgets.max_parallel_tools =
+            unsigned_integer<std::size_t>(json.at("max_parallel_tools"));
+    }
     if (!has_positive_runtime_budgets(budgets)) {
         throw DecodeError("runtime budgets must be positive");
     }

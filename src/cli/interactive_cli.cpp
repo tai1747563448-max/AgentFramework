@@ -575,6 +575,15 @@ int InteractiveCli::run() {
             } else if (!memory_available_) {
                 error_ << "memory is unavailable; enable it in configuration\n";
             } else {
+                // Let any catch-up consolidation requested at startup
+                // settle before the forget lands. Without this bounded
+                // wait the forget can race an in-flight batch: the
+                // scheduler invalidates it and the same candidates get
+                // re-derived later, so the forget would appear to run
+                // before the consolidation in the persisted log.
+                if (commands_.drain_for_exit) {
+                    commands_.drain_for_exit(std::chrono::milliseconds(2'000));
+                }
                 bool forgotten = false;
                 try { forgotten = commands_.forget(argument).has_value(); } catch (...) {}
                 if (forgotten) output_ << "Forgotten: " << render_terminal_text(argument) << '\n';

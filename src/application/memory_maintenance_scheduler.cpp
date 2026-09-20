@@ -1,5 +1,6 @@
 #include "application/memory_maintenance_scheduler.h"
 
+#include "application/consolidation_policy.h"
 #include "application/memory_engine.h"
 #include "ports/clock.h"
 
@@ -14,6 +15,7 @@ MemoryMaintenanceScheduler::MemoryMaintenanceScheduler(
     Config config)
     : engine_(engine),
       consolidator_(std::move(consolidator)),
+      policy_(std::make_unique<ConsolidationPolicy>()),
       config_(std::move(config)) {
     if (config_.worker_threads == 0) config_.worker_threads = 1;
     if (config_.worker_timeout <= std::chrono::milliseconds(0))
@@ -28,11 +30,20 @@ MemoryMaintenanceScheduler::~MemoryMaintenanceScheduler() {
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         stopping_ = true;
-        // Wake any worker that is blocked in extract_candidates. The worker
-        // checks the cancel flag before and after each step; flipping it here
-        // ensures an in-flight worker drops its result before commit. The
-        // destructor's `drain_for_exit` then bounds the wait so a stuck model
-        // cannot deadlock process exit.
+    }
+    state_changed_.notify_all();
+    // Give queued work (e.g. the consolidation requested by /exit) a
+    // bounded window to finish before shutdown. Workers keep processing
+    // the queue while `stopping_` is set; the queue only stops being
+    // served once it is empty.
+    drain_for_exit(std::chrono::seconds(2));
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        // Anything still in flight at the deadline gets asked to drop
+        // its result so join() below cannot hang on a stuck model. This
+        // must happen AFTER the drain: flipping the flag first would
+        // also abort requests that were merely queued, silently losing
+        // the exit-time consolidation pass.
         for (auto& entry : sessions_) {
             if (entry.second.inflight_cancel) {
                 entry.second.inflight_cancel->store(true);
@@ -40,7 +51,6 @@ MemoryMaintenanceScheduler::~MemoryMaintenanceScheduler() {
         }
     }
     state_changed_.notify_all();
-    drain_for_exit(std::chrono::seconds(2));
     for (auto& worker : workers_) {
         if (worker.joinable()) worker.join();
     }
@@ -303,6 +313,23 @@ void MemoryMaintenanceScheduler::worker_loop() {
             state_changed_.notify_all();
         }
     }
+}
+
+ConsolidationPolicy::Decision MemoryMaintenanceScheduler::evaluate_consolidation(
+    const ConsolidationTriggers& triggers,
+    const std::string& last_consolidated_at_utc,
+    std::size_t tokens_since_last_consolidation,
+    double topic_divergence) {
+    if (!policy_) {
+        return {false, ConsolidationPolicy::Reason::DisabledByConfig,
+                "scheduler has no policy"};
+    }
+    const auto decision = policy_->evaluate(
+        triggers, last_consolidated_at_utc,
+        tokens_since_last_consolidation,
+        std::chrono::system_clock::now(),
+        topic_divergence);
+    return decision;
 }
 
 } // namespace agent

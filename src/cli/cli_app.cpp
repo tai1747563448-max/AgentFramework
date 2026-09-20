@@ -405,6 +405,9 @@ int CliApp::execute(const std::vector<std::string>& args) {
         }
         const auto verified = verify_(std::filesystem::u8path(args[3]));
         if (!verified.has_value()) {
+            // The verify callback's error detail may embed provider or
+            // filesystem content; the CLI intentionally surfaces only
+            // the generic message so nothing sensitive leaks.
             error_ << "event log validation failed\n";
             return ExitCode::InvalidEventLog;
         }

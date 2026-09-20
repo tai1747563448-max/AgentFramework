@@ -70,9 +70,18 @@ add_library(agent_kernel STATIC
     src/application/session_reducer.cpp
     src/application/memory_reducer.cpp
     src/application/memory_policy.cpp
+    src/application/consolidation_policy.cpp
     src/application/memory_retriever.cpp
     src/application/memory_engine.cpp
     src/application/memory_maintenance_scheduler.cpp
+    src/application/period_manager.cpp
+    src/application/period_probe.cpp
+    src/application/session_summarizer.cpp
+    src/application/refinement_pass.cpp
+    src/application/inverted_index.cpp
+    src/application/retrieval_coefficient.cpp
+    src/application/session_compressor.cpp
+    src/application/forgetting_policy.cpp
     src/application/model_context_compactor.cpp
     src/application/model_memory_consolidator.cpp
     src/application/retrieval_policy.cpp
@@ -97,6 +106,7 @@ add_library(agent_kernel STATIC
     src/adapters/persistence/memory_event_json.cpp
     src/adapters/persistence/jsonl_memory_store.cpp
     src/adapters/persistence/markdown_memory_store.cpp
+    src/adapters/persistence/jsonl_period_store.cpp
     src/adapters/persistence/jsonl_event_store.cpp
     src/adapters/persistence/jsonl_session_store.cpp)
 target_include_directories(agent_kernel PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -250,16 +260,26 @@ add_agent_test(state_reducer_tests tests/application/state_reducer_test.cpp)
 add_agent_test(session_reducer_tests tests/application/session_reducer_test.cpp)
 add_agent_test(memory_reducer_tests tests/application/memory_reducer_test.cpp)
 add_agent_test(memory_policy_tests tests/application/memory_policy_test.cpp)
+add_agent_test(consolidation_trigger_tests tests/application/consolidation_trigger_test.cpp)
 add_agent_test(memory_retriever_tests tests/application/memory_retriever_test.cpp)
 add_agent_test(memory_engine_tests tests/application/memory_engine_test.cpp)
 add_agent_test(memory_maintenance_scheduler_tests
     tests/application/memory_maintenance_scheduler_test.cpp)
+add_agent_test(period_manager_tests tests/application/period_manager_test.cpp)
+add_agent_test(period_probe_tests tests/application/period_probe_test.cpp)
+add_agent_test(session_summarizer_tests tests/application/session_summarizer_test.cpp)
+add_agent_test(refinement_pass_tests tests/application/refinement_pass_test.cpp)
+add_agent_test(inverted_index_tests tests/application/inverted_index_test.cpp)
+add_agent_test(retrieval_coefficient_tests tests/application/retrieval_coefficient_test.cpp)
+add_agent_test(session_compressor_tests tests/application/session_compressor_test.cpp)
+add_agent_test(forgetting_policy_tests tests/application/forgetting_policy_test.cpp)
 add_agent_test(model_context_compactor_tests tests/application/model_context_compactor_test.cpp)
 add_agent_test(model_memory_consolidator_tests tests/application/model_memory_consolidator_test.cpp)
 add_agent_test(memory_event_json_tests tests/adapters/memory_event_json_test.cpp)
 add_agent_test(retrieval_policy_tests tests/application/retrieval_policy_test.cpp)
 add_agent_test(jsonl_memory_store_tests tests/adapters/jsonl_memory_store_test.cpp)
 add_agent_test(markdown_memory_store_tests tests/adapters/markdown_memory_store_test.cpp)
+add_agent_test(jsonl_period_store_tests tests/adapters/jsonl_period_store_test.cpp)
 target_link_libraries(markdown_memory_store_tests PRIVATE agent_runtime)
 add_agent_test(strict_json_tests tests/adapters/strict_json_test.cpp)
 add_agent_test(session_engine_tests tests/application/session_engine_test.cpp)
