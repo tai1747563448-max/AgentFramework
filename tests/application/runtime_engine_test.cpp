@@ -239,24 +239,37 @@ private:
 
 class FakeCancellation final : public agent::Cancellation {
 public:
-    explicit FakeCancellation(bool requested = false) : requested_(requested) {}
-    explicit FakeCancellation(std::vector<bool> requested_values)
-        : requested_values_(std::move(requested_values)) {}
+    explicit FakeCancellation(bool is_cancelled = false)
+        : is_cancelled_(is_cancelled) {}
+    explicit FakeCancellation(std::vector<bool> is_cancelled_values)
+        : is_cancelled_values_(std::move(is_cancelled_values)) {}
 
-    bool requested() const noexcept override {
-        if (!requested_values_.empty()) {
-            const auto index = next_requested_ < requested_values_.size()
-                                   ? next_requested_++
-                                   : requested_values_.size() - 1;
-            return requested_values_.at(index);
+    // The Cancellation port guarantees that is_cancelled() returns
+    // true after cancel() has been called, regardless of which
+    // construction mode the fixture is in. Production adapters
+    // (SignalCancellation) honour this by binding both methods to
+    // the same flag. Mirror that contract here: cancel() is checked
+    // FIRST so a scripted sequence cannot silently override an
+    // explicit cancel call. Tests that want pure script-mode
+    // behaviour without an implicit cancel simply never call
+    // cancel() on the fixture.
+    bool is_cancelled() const noexcept override {
+        if (is_cancelled_) return true;
+        if (!is_cancelled_values_.empty()) {
+            const auto index = next_is_cancelled_ <
+                                       is_cancelled_values_.size()
+                                   ? next_is_cancelled_++
+                                   : is_cancelled_values_.size() - 1;
+            return is_cancelled_values_.at(index);
         }
-        return requested_;
+        return false;
     }
+    void cancel() noexcept override { is_cancelled_ = true; }
 
 private:
-    bool requested_{false};
-    std::vector<bool> requested_values_;
-    mutable std::size_t next_requested_{0};
+    bool is_cancelled_{false};
+    std::vector<bool> is_cancelled_values_;
+    mutable std::size_t next_is_cancelled_{0};
 };
 
 template <typename Store = MemoryEventStore>

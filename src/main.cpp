@@ -474,8 +474,8 @@ int run_agent(std::vector<std::string> args) {
             cancellation.end_turn();
             commands.begin_turn = [&] { cancellation.begin_turn(); };
             commands.end_turn = [&] { cancellation.end_turn(); };
-            commands.cancel_turn = [&] { cancellation.request_cancel(); };
-            commands.cancellation_requested = [&] { return cancellation.requested(); };
+            commands.cancel_turn = [&] { cancellation.cancel(); };
+            commands.cancellation_requested = [&] { return cancellation.is_cancelled(); };
             commands.set_phase_observer = [&](std::function<void(const std::string&)> observer) {
                 diagnostics.observe(std::move(observer));
             };

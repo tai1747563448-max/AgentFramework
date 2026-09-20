@@ -6,14 +6,14 @@
 TEST_CASE(signal_cancellation_second_turn_resets_cancelled_first_turn) {
     agent::SignalCancellation cancellation;
     cancellation.begin_turn();
-    REQUIRE(!cancellation.requested());
-    cancellation.request_cancel();
-    REQUIRE(cancellation.requested());
+    REQUIRE(!cancellation.is_cancelled());
+    cancellation.cancel();
+    REQUIRE(cancellation.is_cancelled());
     cancellation.end_turn();
     cancellation.begin_turn();
-    REQUIRE(!cancellation.requested());
+    REQUIRE(!cancellation.is_cancelled());
     std::raise(SIGINT);
-    REQUIRE(cancellation.requested());
+    REQUIRE(cancellation.is_cancelled());
     cancellation.end_turn();
 }
 

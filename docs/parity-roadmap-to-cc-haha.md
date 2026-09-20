@@ -64,7 +64,7 @@
 ### T02 Provider 重试 + 退避（代码细节）
 
 - **问题陈述**：`AnthropicMessagesClient::complete`（`anthropic_messages_client.cpp:402-411`）在 status >= 500 时直接 `retryable=true` 写进 RuntimeError 返回，**无重试**。529（overloaded）/ 5xx 抖动让 turn 直接失败，session 重放成本高。
-- **改后方案**：`complete`/`post_stream` 套 `retry_with_backoff`（base=500ms、cap=8s、jitter=±20%、max=3）；`status >= 500 || error.code == TransportFailure` 参与重试；**429 fail-fast**（不与 5xx 同策略）；每次重试前检查 `options.cancellation->requested()`；每次重试向 `LatencyTraceSink` 上报 `kStageRetry`。
+- **改后方案**：`complete`/`post_stream` 套 `retry_with_backoff`（base=500ms、cap=8s、jitter=±20%、max=3）；`status >= 500 || error.code == TransportFailure` 参与重试；**429 fail-fast**（不与 5xx 同策略）；每次重试前检查 `options.cancellation->is_cancelled()`；每次重试向 `LatencyTraceSink` 上报 `kStageRetry`。
 - **验收**：单元测试 mock 500/502/503/529 序列，最终成功且总延迟落入 [base, base*7]；trace 日志可按 `kStageRetry` 过滤统计。
 > 范本：cc-haha `src/services/api/withRetry.ts`（取 backoff 算法，不取其 feature flag 机制）。
 

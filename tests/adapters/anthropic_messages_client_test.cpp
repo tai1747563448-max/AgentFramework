@@ -271,7 +271,8 @@ namespace streaming_fixtures {
 
 class AtomicCancellation final : public agent::Cancellation {
 public:
-    bool requested() const noexcept override { return cancelled.load(); }
+    bool is_cancelled() const noexcept override { return cancelled.load(); }
+    void cancel() noexcept override { cancelled.store(true); }
     std::atomic<bool> cancelled{false};
 };
 
@@ -286,7 +287,7 @@ public:
         const agent::HttpRequest&, const agent::HttpChunkObserver& observer,
         const agent::Cancellation* cancellation) override {
         for (std::size_t position = 0; position < body_.size(); position += fragment_size_) {
-            if (cancellation && cancellation->requested()) {
+            if (cancellation && cancellation->is_cancelled()) {
                 return agent::Result<agent::HttpResponse>::failure(
                     {agent::ErrorCode::Cancelled, "cancelled", false});
             }

@@ -54,12 +54,12 @@ public:
     virtual Result<HttpResponse> post(const HttpRequest& request) = 0;
     virtual Result<HttpResponse> post(const HttpRequest& request,
                                      const Cancellation* cancellation) {
-        if (cancellation && cancellation->requested()) {
+        if (cancellation && cancellation->is_cancelled()) {
             return Result<HttpResponse>::failure(
                 {ErrorCode::Cancelled, "HTTP request cancelled", false});
         }
         auto response = post(request);
-        if (cancellation && cancellation->requested()) {
+        if (cancellation && cancellation->is_cancelled()) {
             return Result<HttpResponse>::failure(
                 {ErrorCode::Cancelled, "HTTP request cancelled", false});
         }

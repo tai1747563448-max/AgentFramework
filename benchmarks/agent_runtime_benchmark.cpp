@@ -137,8 +137,13 @@ public:
 
 class EmptyKnowledge final : public agent::KnowledgeProvider {
 public:
+    // T2 context signature: KnowledgeProvider::retrieve now takes an
+    // OperationContext so the provider can short-circuit on
+    // cancellation / deadline. The benchmark doesn't care, so it
+    // accepts the parameter and ignores it.
     agent::Result<agent::EvidencePack> retrieve(
-        const agent::TaskState&) override {
+        const agent::TaskState&,
+        const agent::OperationContext&) override {
         return agent::Result<agent::EvidencePack>::success({});
     }
 };
@@ -187,22 +192,33 @@ private:
 
 class NeverCancelled final : public agent::Cancellation {
 public:
-    bool requested() const noexcept override {
+    bool is_cancelled() const noexcept override {
         return false;
     }
+    void cancel() noexcept override {}
 };
 
 agent::ModelResponse text_response(std::string request_id) {
+    // T12 (v2 §3): the v2 ModelResponse shape drops the provider-
+    // specific raw_stop_reason positional slot, so the constructor
+    // takes (content, stop_reason, input_tokens, output_tokens,
+    // provider_request_id). The benchmark used to pass a literal
+    // "end_turn" as the second positional slot; with raw_stop_reason
+    // gone the same slot is now StopReason::EndTurn (the codec
+    // mapping already happens inside the adapter).
     return {{agent::TextBlock{"benchmark-complete"}},
-            agent::StopReason::EndTurn, "end_turn", 8, 2,
+            agent::StopReason::EndTurn, 8, 2,
             std::move(request_id)};
 }
 
 agent::ModelResponse tool_response() {
     agent::ToolCall call{
         "call-benchmark-1", "benchmark_noop", agent::Value::object({})};
+    // See text_response above — v2 ModelResponse no longer carries
+    // raw_stop_reason, so the literal "tool_use" placeholder has to
+    // be dropped here as well.
     return {{agent::ToolUseBlock{std::move(call)}},
-            agent::StopReason::ToolUse, "tool_use", 8, 2,
+            agent::StopReason::ToolUse, 8, 2,
             "benchmark-tool-request"};
 }
 

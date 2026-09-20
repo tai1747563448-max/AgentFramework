@@ -76,9 +76,8 @@ private:
 
 class FakeCancellation final : public agent::Cancellation {
 public:
-    bool requested() const noexcept override {
-        return false;
-    }
+    bool is_cancelled() const noexcept override { return false; }
+    void cancel() noexcept override {}
 };
 
 // Substitute only release-pack/model loading. Pipes, v2 sidecar, hybrid
@@ -127,8 +126,12 @@ agent::RagConfig rag_config(const std::filesystem::path& root) {
 }
 
 agent::ModelResponse final_response() {
+    // T12 (v2 §3): the v2 ModelResponse shape drops the provider-
+    // specific raw_stop_reason positional slot. The literal "end_turn"
+    // that used to occupy that slot must be dropped; the StopReason
+    // enum value carries the canonical mapping now.
     return {{agent::TextBlock{u8"已根据本地知识回答"}},
-            agent::StopReason::EndTurn, "end_turn", 20, 8,
+            agent::StopReason::EndTurn, 20, 8,
             "provider-request-rag-integration"};
 }
 
@@ -153,7 +156,7 @@ TEST_CASE(persistent_rag_round_trip_persists_replays_and_blocks_bad_index) {
     const auto config = fixtures::rag_config(pack_root);
     agent::PersistentRagKnowledgeProvider knowledge(process, verifier, config);
     agent::TaskState query_state;
-    query_state.issue = u8"parseIssue 中文 warning";
+    query_state.issue = u8"parseIssue 中文 法规";
     const auto first = knowledge.retrieve(query_state);
     REQUIRE(first.has_value());
     REQUIRE(first.value().items.size() == 1);

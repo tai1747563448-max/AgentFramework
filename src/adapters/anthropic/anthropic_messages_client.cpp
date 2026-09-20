@@ -360,7 +360,7 @@ Result<ModelResponse> AnthropicMessagesClient::complete(
 
 Result<ModelResponse> AnthropicMessagesClient::complete(
     const ModelRequest& request, const ModelCallOptions& options) {
-    const auto cancelled = [&] { return options.cancellation && options.cancellation->requested(); };
+    const auto cancelled = [&] { return options.cancellation && options.cancellation->is_cancelled(); };
     if (cancelled()) {
         return failure<ModelResponse>(ErrorCode::Cancelled, "provider request cancelled");
     }

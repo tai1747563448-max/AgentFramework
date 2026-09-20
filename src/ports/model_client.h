@@ -13,12 +13,12 @@ public:
     virtual Result<ModelResponse> complete(const ModelRequest& request) = 0;
     virtual Result<ModelResponse> complete(const ModelRequest& request,
                                            const ModelCallOptions& options) {
-        if (options.cancellation && options.cancellation->requested()) {
+        if (options.cancellation && options.cancellation->is_cancelled()) {
             return Result<ModelResponse>::failure(
                 {ErrorCode::Cancelled, "model request cancelled", false});
         }
         auto response = complete(request);
-        if (options.cancellation && options.cancellation->requested()) {
+        if (options.cancellation && options.cancellation->is_cancelled()) {
             return Result<ModelResponse>::failure(
                 {ErrorCode::Cancelled, "model request cancelled", false});
         }

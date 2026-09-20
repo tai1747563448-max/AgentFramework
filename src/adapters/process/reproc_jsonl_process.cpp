@@ -91,10 +91,39 @@ std::map<std::string, std::string> safe_environment() {
         "USERNAME"};
     std::map<std::string, std::string> result;
     for (const auto* name : names) {
+#if defined(_WIN32)
+        // T17 / locale note: std::getenv on Windows returns the value
+        // in the active ANSI code page (CP936 / GBK on Chinese
+        // locales). Subprocesses inherited through reproc expect
+        // UTF-8 on the wire; piping GBK bytes through turns paths
+        // like "C:\Users\张三\jsonl-进程" into the wrong codepoints
+        // and the child process fails to start with
+        // ERROR_BAD_EXE_FORMAT or ENOENT. _wgetenv gives us the
+        // native UTF-16, which we round-trip through WideCharToMultiByte
+        // with CP_UTF8 so the environment the child sees is valid
+        // UTF-8. On non-Windows hosts std::getenv is already UTF-8.
+        const wchar_t* wide = _wgetenv(
+            std::wstring(name, name + std::strlen(name)).c_str());
+        if (wide != nullptr) {
+            const int needed = WideCharToMultiByte(
+                CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+            if (needed > 0) {
+                std::string utf8(static_cast<std::size_t>(needed - 1),
+                                 '\0');
+                const int written = WideCharToMultiByte(
+                    CP_UTF8, 0, wide, -1, &utf8[0], needed, nullptr,
+                    nullptr);
+                if (written > 0) {
+                    result.emplace(name, std::move(utf8));
+                }
+            }
+        }
+#else
         const char* value = std::getenv(name);
         if (value != nullptr) {
             result.emplace(name, value);
         }
+#endif
     }
     return result;
 }

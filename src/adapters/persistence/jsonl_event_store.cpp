@@ -302,8 +302,13 @@ Result<void> secure_flush_log(const std::filesystem::path& runtime_root,
                                 std::filesystem::u8path(task_id))) {
         return persistence_failure("event path escapes runtime root");
     }
+    // FlushFileBuffers needs write-data access; a handle carrying only
+    // FILE_WRITE_ATTRIBUTES opens fine but every flush on it fails with
+    // ERROR_ACCESS_DENIED. FILE_APPEND_DATA is both sufficient and the
+    // same right secure_append_line requests, so the flush handle and the
+    // append handle never disagree about what writing means here.
     UniqueHandle leaf(CreateFileW(
-        path.c_str(), FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+        path.c_str(), FILE_READ_ATTRIBUTES | FILE_APPEND_DATA,
         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
     if (!leaf.valid()) {
