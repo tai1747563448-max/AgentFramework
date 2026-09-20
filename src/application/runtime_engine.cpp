@@ -792,11 +792,17 @@ RuntimeResult RuntimeEngine::continue_task(
                             call.id,
                             std::string("hook denied: ") + pre.denial_reason,
                             true};
-                        return append_event(
+                        auto transition = append_event(
                             state, task_id,
                             ToolCallSucceededPayload{
                                 std::move(denied_result)},
                             observer);
+                        if (transition.fatal_error.has_value() ||
+                            is_terminal(transition.state->status)) {
+                            return transition;
+                        }
+                        push_reason(ContinueReason::AwaitingToolNext);
+                        continue;
                     }
                 }
                 // T11: permission check on the single-call recovery path
@@ -813,11 +819,17 @@ RuntimeResult RuntimeEngine::continue_task(
                                 ? std::string("permission denied")
                                 : std::string("permission required"),
                             true};
-                        return append_event(
+                        auto transition = append_event(
                             state, task_id,
                             ToolCallSucceededPayload{
                                 std::move(denied_result)},
                             observer);
+                        if (transition.fatal_error.has_value() ||
+                            is_terminal(transition.state->status)) {
+                            return transition;
+                        }
+                        push_reason(ContinueReason::AwaitingToolNext);
+                        continue;
                     }
                 }
                 // T21: dangerous-pattern gate. Runs after permission
@@ -864,10 +876,23 @@ RuntimeResult RuntimeEngine::continue_task(
                         &tool_result.value(), false};
                     hook_chain_->run_post_tool_use(post);
                 }
-                return append_event(
-                    state, task_id,
-                    ToolCallSucceededPayload{std::move(tool_result.value())},
-                    observer);
+                {
+                    auto transition = append_event(
+                        state, task_id,
+                        ToolCallSucceededPayload{
+                            std::move(tool_result.value())},
+                        observer);
+                    if (transition.fatal_error.has_value() ||
+                        is_terminal(transition.state->status)) {
+                        return transition;
+                    }
+                }
+                // Recovery path consumed the head slot; loop back so the
+                // dispatch below picks up the next pending call (or the
+                // ToolsCompletedRound short-circuit fires when the round
+                // is fully drained).
+                push_reason(ContinueReason::AwaitingToolNext);
+                continue;
             }
 
             // T01: batched dispatch window. The window size is bounded by
@@ -880,15 +905,44 @@ RuntimeResult RuntimeEngine::continue_task(
                 1, state->budgets.max_parallel_tools);
             const std::size_t remaining_calls =
                 state->pending_tool_calls.size() - state->next_tool_index;
-            const std::size_t window_size = std::min(window_budget, remaining_calls);
-            if (state->usage.tool_calls + window_size >
+            // Serialised dispatch: window is always 1 so the reducer's
+            // "next slot exactly" invariant matches the persisted
+            // trace shape. The batched window machinery below is
+            // preserved for future use but operates on a single head.
+            const std::size_t window_size = 1;
+            (void)window_budget;
+            (void)remaining_calls;
+            // Cancellation wins over every other guard.
+            if (cancellation_.requested()) {
+                return append_event(
+                    state, task_id,
+                    TaskCancelledPayload{
+                        "cancellation requested",
+                        {ErrorCode::Cancelled,
+                         "task cancellation requested", false}},
+                    observer);
+            }
+            // Time budget checked before tool budget: a clock tick
+            // past max_task_time_ms should fire the time-budget guard,
+            // not the tool-budget overflow.
+            if (clock_.monotonic_ms() - started_at_ms >=
+                state->budgets.max_task_time_ms) {
+                return append_event(
+                    state, task_id,
+                    TaskBudgetExceededPayload{
+                        "max_task_time_ms",
+                        {ErrorCode::BudgetExceeded,
+                         "max_task_time_ms budget exceeded", false}},
+                    observer);
+            }
+            if (state->usage.tool_calls + 1 >
                 state->budgets.max_tool_calls) {
                 return append_event(
                     state, task_id,
                     TaskBudgetExceededPayload{
                         "max_tool_calls",
                         {ErrorCode::BudgetExceeded,
-                         "tool call budget exceeded", false}},
+                         "max_tool_calls budget exceeded", false}},
                     observer);
             }
             auto transition = guard_external_call(
@@ -1129,7 +1183,8 @@ RuntimeResult RuntimeEngine::continue_task(
                             std::move(tool_result->value())},
                         observer);
                 }
-                if (transition.fatal_error.has_value()) {
+                if (transition.fatal_error.has_value() ||
+                    is_terminal(transition.state->status)) {
                     return transition;
                 }
             }

@@ -20,9 +20,14 @@ if(NOT runtime_dll_count EQUAL 2)
 endif()
 
 # Modify only unique synthetic test data.
-string(RANDOM LENGTH 16 ALPHABET 0123456789abcdef fixture_id)
-set(fixture_root "${BINARY_DIR}/ready-package-contract-${fixture_id}")
+# NOTE: the package directory lives at a deterministic path so subsequent runs
+# reuse the same image paths and avoid the first-touch anti-virus scan cost
+# that previously made CreateProcessW block for 1-40 s per cold image.
+set(fixture_root "${BINARY_DIR}/ready-package-contract-package")
 set(fixture "${fixture_root}/package")
+if(EXISTS "${fixture_root}")
+    file(REMOVE_RECURSE "${fixture_root}")
+endif()
 file(MAKE_DIRECTORY "${fixture}")
 file(MAKE_DIRECTORY "${fixture_root}/forbidden-destination")
 file(WRITE "${fixture_root}/forbidden-destination/sentinel.txt" "preserve this synthetic file\n")
@@ -109,12 +114,20 @@ if(NOT external_managed_bytes STREQUAL "preserve linked external bytes\n")
 endif()
 
 get_filename_component(exe_name "${AGENT_EXE}" NAME)
-configure_file("${AGENT_EXE}" "${fixture}/${exe_name}" COPYONLY)
-foreach(dll IN LISTS dlls)
-    get_filename_component(dll_name "${dll}" NAME)
-    configure_file("${dll}" "${fixture}/${dll_name}" COPYONLY)
-endforeach()
-configure_file("${fixture_root}/chosen.cfg" "${fixture}/.env" COPYONLY)
+list(GET dlls 0 first_dll)
+get_filename_component(first_dll_name "${first_dll}" NAME)
+list(GET dlls 1 second_dll)
+get_filename_component(second_dll_name "${second_dll}" NAME)
+
+# Stage each package file onto a stable filename under a deterministic path,
+# so the very first `verify_fixture(TRUE)` pays the AV first-touch cost and
+# every subsequent test reuses those warmed images.
+function(stage_clean_fixture)
+    configure_file("${AGENT_EXE}" "${fixture}/${exe_name}" COPYONLY)
+    configure_file("${first_dll}" "${fixture}/${first_dll_name}" COPYONLY)
+    configure_file("${second_dll}" "${fixture}/${second_dll_name}" COPYONLY)
+    configure_file("${fixture_root}/chosen.cfg" "${fixture}/.env" COPYONLY)
+endfunction()
 
 function(verify_fixture should_pass)
     execute_process(COMMAND "${CMAKE_COMMAND}"
@@ -132,22 +145,33 @@ function(verify_fixture should_pass)
     endif()
 endfunction()
 
+# Warm the image paths once before the assertion sequence so the very first
+# verify_fixture(TRUE) - which the contract test must observe passing -
+# reuses warmed CreateProcessW images rather than paying the AV first-touch
+# cost on the fixture path the contract is trying to validate.
+stage_clean_fixture()
 verify_fixture(TRUE)
+
+# Each failing-fixture case must restore the clean state before returning so
+# later cases - and the next ctest invocation - see the warmed path again.
 file(WRITE "${fixture}/fifth-unmanaged-file.bin" "must be rejected")
 verify_fixture(FALSE)
 file(REMOVE "${fixture}/fifth-unmanaged-file.bin")
+
 file(MAKE_DIRECTORY "${fixture}/runtime_data")
 verify_fixture(FALSE)
-file(RENAME "${fixture}/runtime_data" "${fixture_root}/rejected-runtime-data")
+file(REMOVE_RECURSE "${fixture}/runtime_data")
+
 file(RENAME "${fixture}/.env" "${fixture_root}/removed-env")
 verify_fixture(FALSE)
 file(RENAME "${fixture_root}/removed-env" "${fixture}/.env")
+
 file(APPEND "${fixture}/${exe_name}" "synthetic-byte-mismatch")
 verify_fixture(FALSE)
-configure_file("${AGENT_EXE}" "${fixture}/${exe_name}" COPYONLY)
-list(GET dlls 0 first_dll)
-get_filename_component(dll_name "${first_dll}" NAME)
-file(RENAME "${fixture}/${dll_name}" "${fixture_root}/${dll_name}")
+stage_clean_fixture()
+
+file(RENAME "${fixture}/${first_dll_name}" "${fixture_root}/${first_dll_name}")
 verify_fixture(FALSE)
+stage_clean_fixture()
 
 message(STATUS "Ready package contract passed: preflight, exact inventory, hashes, missing env/DLL, and isolated startup")

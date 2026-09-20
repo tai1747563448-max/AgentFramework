@@ -223,14 +223,14 @@ private:
     static agent::ModelResponse tool_response(agent::ToolCall call,
                                               std::string request_id) {
         return {{agent::ToolUseBlock{std::move(call)}},
-                agent::StopReason::ToolUse, "tool_use", 20, 8,
+                agent::StopReason::ToolUse, 20, 8,
                 std::move(request_id)};
     }
 
     static agent::ModelResponse final_response() {
         return {{agent::TextBlock{
                      "Fixed calculator addition and verified calculator.correct."}},
-                agent::StopReason::EndTurn, "end_turn", 30, 10,
+                agent::StopReason::EndTurn, 30, 10,
                 "provider-final"};
     }
 

@@ -214,7 +214,7 @@ agent::RunRequest run_request(std::string issue,
 
 agent::ModelResponse text_response(std::string text) {
     return {{agent::TextBlock{std::move(text)}}, agent::StopReason::EndTurn,
-            "end_turn", 5, 3, "provider-request-integration"};
+            5, 3, "provider-request-integration"};
 }
 
 agent::ToolCall list_call(std::string id, std::string path) {
@@ -260,7 +260,7 @@ agent::ToolCall build_call(std::string id) {
 agent::ModelResponse tool_response(agent::ToolCall call,
                                    std::string request_id) {
     return {{agent::ToolUseBlock{std::move(call)}},
-            agent::StopReason::ToolUse, "tool_use", 5, 3,
+            agent::StopReason::ToolUse, 5, 3,
             std::move(request_id)};
 }
 
@@ -684,7 +684,10 @@ TEST_CASE(provider_secret_never_reaches_cli_events_or_errors) {
          "--issue", u8"验证秘密边界"});
 
     REQUIRE(code == agent::ExitCode::TaskFailed);
-    REQUIRE(http.post_calls == 1);
+    // T02 retries retryable TransportFailure up to max_attempts (3);
+    // the fake returns a retryable failure every time, so all three
+    // attempts must have run before the terminal error surfaced.
+    REQUIRE(http.post_calls == 3);
     REQUIRE(http.received_expected_credential);
     REQUIRE(captured_result.has_value());
     REQUIRE(captured_result->state.has_value());

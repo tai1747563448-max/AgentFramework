@@ -16,6 +16,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <limits>
@@ -91,10 +92,31 @@ std::map<std::string, std::string> safe_environment() {
         "USERNAME"};
     std::map<std::string, std::string> result;
     for (const auto* name : names) {
+#if defined(_WIN32)
+        // std::getenv returns ANSI bytes on Windows; a PATH containing
+        // non-ASCII directories would then be invalid UTF-8 and make
+        // reproc's UTF-8 -> UTF-16 conversion fail. Read the wide form
+        // instead and convert to UTF-8 ourselves.
+        const std::wstring wide_name(name, name + std::strlen(name));
+        const wchar_t* wide_value = _wgetenv(wide_name.c_str());
+        if (wide_value == nullptr) {
+            continue;
+        }
+        const int size = WideCharToMultiByte(CP_UTF8, 0, wide_value, -1,
+                                             nullptr, 0, nullptr, nullptr);
+        if (size <= 0) {
+            continue;
+        }
+        std::string utf8(static_cast<std::size_t>(size - 1), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, wide_value, -1, utf8.data(), size,
+                            nullptr, nullptr);
+        result.emplace(name, std::move(utf8));
+#else
         const char* value = std::getenv(name);
         if (value != nullptr) {
             result.emplace(name, value);
         }
+#endif
     }
     return result;
 }

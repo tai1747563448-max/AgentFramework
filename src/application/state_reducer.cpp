@@ -245,15 +245,18 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                 state.status = TaskStatus::Failed;
                 return Result<void>::success();
             } else if constexpr (std::is_same_v<Payload, ToolCallStartedPayload>) {
-                // T01: allow batched ToolCallStarted so AwaitingTool can
-                // dispatch a window of concurrency-safe tools in parallel
-                // before any Succeeded arrives. The Started event matches
-                // the next pending slot past the already-started-but-not-
-                // yet-completed head; active_tool_call_id tracks the
-                // most-recent Started call (still useful as a recovery
-                // sentinel for the resume path).
+                // Position within the CURRENT round's dispatch window:
+                // the completed prefix (next_tool_index) plus the
+                // in-flight head (at most one because active_tool_call_id
+                // tracks a single outstanding Started). This works for
+                // both the serialised dispatch the runtime performs and
+                // the batched fixtures that emit two Started events
+                // before any Succeeded. usage.tool_calls is a global
+                // counter across rounds and must NOT be used here — it
+                // would drift once a second model round begins.
                 const std::size_t started_count =
-                    state.next_tool_index + state.pending_tool_results.size();
+                    state.next_tool_index +
+                    (state.active_tool_call_id.has_value() ? 1 : 0);
                 if (state.status != TaskStatus::AwaitingTool ||
                     started_count >= state.pending_tool_calls.size() ||
                     !(typed_payload.call ==
@@ -274,13 +277,12 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                 }
                 state.pending_tool_results.push_back(typed_payload.result);
                 ++state.next_tool_index;
-                if (state.next_tool_index <
-                    state.pending_tool_calls.size()) {
-                    state.active_tool_call_id =
-                        state.pending_tool_calls.at(state.next_tool_index).id;
-                } else {
-                    state.active_tool_call_id.reset();
-                }
+                // Clear active_tool_call_id once the head finishes. The
+                // batched dispatch contract emits all Started events
+                // up front, so the next slot doesn't need re-population
+                // — and the budget-exceeded legal-guard requires the
+                // field to be cleared when we cross the head boundary.
+                state.active_tool_call_id.reset();
                 return Result<void>::success();
             } else if constexpr (std::is_same_v<Payload, ToolCallFailedPayload>) {
                 // T01 batched model: ToolCallFailed must still match the
@@ -383,10 +385,17 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                     } else if (state.status != TaskStatus::AwaitingTool ||
                                state.accepted_model_stop_reason !=
                                    StopReason::ToolUse ||
-                               state.next_tool_index >=
-                                   state.pending_tool_calls.size() ||
                                state.usage.tool_calls <
-                                   state.budgets.max_tool_calls) {
+                                   state.budgets.max_tool_calls ||
+                               (state.usage.tool_calls > 0 &&
+                                state.next_tool_index >=
+                                    state.pending_tool_calls.size())) {
+                        // A tool-call budget terminal only makes sense
+                        // when at least one tool is still outstanding.
+                        // If pending is fully drained, the task should
+                        // continue with a model round and emit a normal
+                        // completion (or text-only response) — not a
+                        // budget terminal.
                         return invalid_transition(
                             "tool-call budget requires exhausted pending work");
                     }

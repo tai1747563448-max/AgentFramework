@@ -32,6 +32,11 @@ class OfflineEmbedding:
     model = "BAAI/bge-m3"
     revision = "d" * 40
     dimensions = 1024
+    # Schema 3 (T6) backend/precision identity: the offline stand-in
+    # mimics the sentence-transformers float32 BGE-M3 baseline so the
+    # index identity gate accepts it.
+    backend = "sentence_transformers"
+    precision = "float32"
     tokenizer = WordTokenizer()
 
     def encode(self, texts, *, batch_size=16):

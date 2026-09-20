@@ -479,8 +479,13 @@ Result<ProcessOutput> run_native(const ProcessRequest& request,
     }
     UniqueHandle process_handle(process.hProcess);
     UniqueHandle thread_handle(process.hThread);
-    if (AssignProcessToJobObject(job.get(), process_handle.get()) == FALSE ||
-        ResumeThread(thread_handle.get()) == static_cast<DWORD>(-1)) {
+    const BOOL assigned =
+        AssignProcessToJobObject(job.get(), process_handle.get());
+    DWORD resumed = 0;
+    if (assigned != FALSE) {
+        resumed = ResumeThread(thread_handle.get());
+    }
+    if (assigned == FALSE || resumed == static_cast<DWORD>(-1)) {
         TerminateProcess(process_handle.get(), 1);
         return Result<ProcessOutput>::failure(execution_failure());
     }

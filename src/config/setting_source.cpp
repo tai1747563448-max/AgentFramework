@@ -26,10 +26,13 @@ const char* setting_source_name(SettingSource source) {
 
 std::optional<std::pair<std::string, SettingSource>>
 LayeredSettings::resolve(const std::string& key) const {
-    // Walk in reverse so the highest-priority layer wins.
+    // Walk in reverse so the highest-priority layer wins. An
+    // explicitly-set empty value is surfaced rather than skipped so
+    // the strict validators (exact 0/1 flags, positive integers) can
+    // reject it instead of silently falling back to a lower layer.
     for (auto it = layers_.rbegin(); it != layers_.rend(); ++it) {
         const auto found = it->values.find(key);
-        if (found != it->values.end() && !found->second.empty()) {
+        if (found != it->values.end()) {
             return std::make_pair(found->second, it->source);
         }
     }
@@ -41,7 +44,7 @@ LayeredSettings::resolve_all(const std::string& key) const {
     std::vector<std::pair<std::string, SettingSource>> hits;
     for (auto it = layers_.rbegin(); it != layers_.rend(); ++it) {
         const auto found = it->values.find(key);
-        if (found != it->values.end() && !found->second.empty()) {
+        if (found != it->values.end()) {
             hits.emplace_back(found->second, it->source);
         }
     }
@@ -269,12 +272,15 @@ Result<LayeredSettings> build_layered_settings(
 
     // Env: walk known_setting_keys so we surface the same set the
     // loader consumes, regardless of what the process env contains.
+    // Explicitly-set empty values are preserved so the strict
+    // validators (exact 0/1 flags, positive integers) can reject
+    // them; silently dropping them here would mask config errors.
     SettingLayer env_layer;
     env_layer.source = SettingSource::Env;
     env_layer.label = "environment";
     for (const auto& key : known_setting_keys()) {
         const auto v = environment.get(key);
-        if (v.has_value() && !v->empty()) {
+        if (v.has_value()) {
             env_layer.values[key] = *v;
         }
     }

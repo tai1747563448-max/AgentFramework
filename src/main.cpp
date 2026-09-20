@@ -210,8 +210,7 @@ int run_agent(std::vector<std::string> args) {
                     auto loaded = local_events.read_file(path);
                     if (!loaded.has_value()) {
                         return agent::Result<agent::TaskState>::failure(
-                            {agent::ErrorCode::PersistenceFailure,
-                             "event log validation failed", false});
+                            loaded.error());
                     }
                     return agent::replay_events(loaded.value());
                 };
@@ -229,8 +228,7 @@ int run_agent(std::vector<std::string> args) {
                     auto loaded = local_events.read_file(path);
                     if (!loaded.has_value()) {
                         return agent::Result<agent::TaskEvaluation>::failure(
-                            {agent::ErrorCode::PersistenceFailure,
-                             "event log evaluation failed", false});
+                            loaded.error());
                     }
                     return agent::evaluate_task_events(loaded.value());
                 };
@@ -367,8 +365,7 @@ int run_agent(std::vector<std::string> args) {
             auto loaded = events.read_file(path);
             if (!loaded.has_value()) {
                 return agent::Result<agent::TaskState>::failure(
-                    {agent::ErrorCode::PersistenceFailure,
-                     "event log validation failed", false});
+                    loaded.error());
             }
             return agent::replay_events(loaded.value());
         };
@@ -537,12 +534,23 @@ int run_agent(std::vector<std::string> args) {
                 }
                 return loaded;
             };
+            // The scheduler documented contract: the owning session's
+            // foreground request pre-empts background maintenance so a
+            // transcript read cannot collide with the turn's writes to
+            // the session log. Queued requests are dropped; in-flight
+            // workers drop their results at the next step boundary.
+            const auto preempt_for_turn = [&](const std::string& session_id) {
+                if (maintenance_scheduler) {
+                    maintenance_scheduler->preempt(session_id);
+                }
+            };
             commands.submit = [&, current_session_id]
                 (const std::string& session_id,
                  const std::string& text,
                  const agent::RuntimeProgressObserver& observer,
                  bool use_memory) {
                 *current_session_id = session_id;
+                preempt_for_turn(session_id);
                 return session_engine.submit_turn(
                     session_id, text, observer, use_memory);
             };
@@ -551,6 +559,7 @@ int run_agent(std::vector<std::string> args) {
                  const agent::RuntimeProgressObserver& observer,
                  bool use_memory) {
                 *current_session_id = session_id;
+                preempt_for_turn(session_id);
                 return session_engine.recover_pending_turn(
                     session_id, observer, use_memory);
             };
@@ -559,6 +568,7 @@ int run_agent(std::vector<std::string> args) {
                  const agent::RuntimeProgressObserver& observer, bool use_memory,
                  const agent::RuntimePresentationOptions& presentation) {
                 *current_session_id = session_id;
+                preempt_for_turn(session_id);
                 return session_engine.submit_turn(
                     session_id, text, observer, use_memory, presentation);
             };
@@ -571,6 +581,7 @@ int run_agent(std::vector<std::string> args) {
                  const agent::RuntimePresentationOptions& presentation,
                  bool dry_run) {
                 *current_session_id = session_id;
+                preempt_for_turn(session_id);
                 return session_engine.submit_turn(
                     session_id, text, observer, use_memory, presentation,
                     dry_run);
@@ -580,6 +591,7 @@ int run_agent(std::vector<std::string> args) {
                  const agent::RuntimeProgressObserver& observer, bool use_memory,
                  const agent::RuntimePresentationOptions& presentation) {
                 *current_session_id = session_id;
+                preempt_for_turn(session_id);
                 return session_engine.recover_pending_turn(
                     session_id, observer, use_memory, presentation);
             };

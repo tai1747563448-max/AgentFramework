@@ -10,6 +10,7 @@
 #include "ports/id_generator.h"
 #include "ports/knowledge_provider.h"
 #include "ports/model_client.h"
+#include "ports/operation_context.h"
 #include "ports/tool_gateway.h"
 #include "benchmark_provenance.h"
 
@@ -138,7 +139,8 @@ public:
 class EmptyKnowledge final : public agent::KnowledgeProvider {
 public:
     agent::Result<agent::EvidencePack> retrieve(
-        const agent::TaskState&) override {
+        const agent::TaskState&,
+        const agent::OperationContext&) override {
         return agent::Result<agent::EvidencePack>::success({});
     }
 };
@@ -194,7 +196,7 @@ public:
 
 agent::ModelResponse text_response(std::string request_id) {
     return {{agent::TextBlock{"benchmark-complete"}},
-            agent::StopReason::EndTurn, "end_turn", 8, 2,
+            agent::StopReason::EndTurn, 8, 2,
             std::move(request_id)};
 }
 
@@ -202,7 +204,7 @@ agent::ModelResponse tool_response() {
     agent::ToolCall call{
         "call-benchmark-1", "benchmark_noop", agent::Value::object({})};
     return {{agent::ToolUseBlock{std::move(call)}},
-            agent::StopReason::ToolUse, "tool_use", 8, 2,
+            agent::StopReason::ToolUse, 8, 2,
             "benchmark-tool-request"};
 }
 

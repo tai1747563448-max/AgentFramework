@@ -1,5 +1,7 @@
 #pragma once
 
+#include "application/consolidation_policy.h"
+#include "application/memory_policy.h"
 #include "domain/memory_event.h"
 #include "domain/result.h"
 #include "ports/memory_consolidator.h"
@@ -107,6 +109,16 @@ public:
     // For tests: number of currently-running workers.
     std::size_t active_workers() const;
 
+    // T1 (stage 1): drive the consolidation trigger policy. If the
+    // decision says "fire", this forwards to request_maintenance which
+    // already knows how to enqueue a background worker. Returns the
+    // decision for the caller (CLI/tests) to surface.
+    ConsolidationPolicy::Decision evaluate_consolidation(
+        const ConsolidationTriggers& triggers,
+        const std::string& last_consolidated_at_utc,
+        std::size_t tokens_since_last_consolidation,
+        double topic_divergence = 0.0);
+
 private:
     struct Request {
         std::string session_id;
@@ -134,6 +146,7 @@ private:
 
     MemoryEngine& engine_;
     std::unique_ptr<MemoryConsolidator> consolidator_;
+    std::unique_ptr<ConsolidationPolicy> policy_;
     Config config_;
 
     mutable std::mutex state_mutex_;
