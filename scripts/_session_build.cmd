@@ -37,18 +37,30 @@ rem replaced the link rules with a direct link.exe call compensated for
 rem running ninja without vcvars64, which cannot work anyway (LNK1181 cannot
 rem find ws2_32.lib), and is no longer needed.
 setlocal
+rem Derive the repository root from this script's own location, so the same
+rem helper drives any worktree: AgentFramework, AgentFramework-latency, or the
+rem iteration worktrees under .worktrees/. A hard-coded root here used to make
+rem the script build the latency worktree even when run from the main checkout,
+rem which is a silent wrong-tree build - the worst kind.
+for %%I in ("%~dp0..") do set "REPO_ROOT=%%~fI"
+set "BUILD_DIR=%REPO_ROOT%\build\vs2022"
+if not exist "%BUILD_DIR%\build.ninja" (
+    echo [build] "%BUILD_DIR%" is not a Ninja build tree.
+    echo [build] Configure it first: "%REPO_ROOT%\scripts\configure_msvc.cmd"
+    exit /b 1
+)
 call "E:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul
 if errorlevel 1 exit /b 1
-cd /d "E:\desktop\How_to_build_a_agent\AgentFramework-latency"
-python scripts\patch_ninja_deps_prefix.py build\vs2022\CMakeFiles\rules.ninja
+cd /d "%REPO_ROOT%"
+python "%REPO_ROOT%\scripts\patch_ninja_deps_prefix.py" "%BUILD_DIR%\CMakeFiles\rules.ninja"
 set PATCH_RC=%ERRORLEVEL%
 if "%PATCH_RC%"=="1" exit /b 1
 if "%PATCH_RC%"=="2" (
     echo [build] rules.ninja deps prefix was regenerated; dropping stale objects
-    for /d %%D in (build\vs2022\CMakeFiles\*.dir) do rmdir /s /q "%%D"
+    for /d %%D in ("%BUILD_DIR%\CMakeFiles\*.dir") do rmdir /s /q "%%D"
 )
-cd /d "E:\desktop\How_to_build_a_agent\AgentFramework-latency\build\vs2022"
-set BUILD_LOG=..\_session_build.log
+cd /d "%BUILD_DIR%"
+set BUILD_LOG=%REPO_ROOT%\build\_session_build.log
 cmake --build . --config Release -j 4 -- -k 0 > "%BUILD_LOG%" 2>&1
 set BUILD_RC=%ERRORLEVEL%
 type "%BUILD_LOG%"
