@@ -46,6 +46,37 @@ bool exact_keys(const nlohmann::json& object,
     return true;
 }
 
+// exact_keys widened with a set of tolerated optional keys. Used by the
+// schema-3 frames, where `backend` / `precision` may be present or absent
+// depending on whether the index builder recorded embedding identity. The
+// frame must still name every required key and nothing outside
+// required ∪ optional, so an unknown key is still a protocol failure.
+bool keys_within(const nlohmann::json& object,
+                 std::initializer_list<const char*> required,
+                 std::initializer_list<const char*> optional) {
+    if (!object.is_object()) {
+        return false;
+    }
+    for (const auto* key : required) {
+        if (!object.contains(key)) {
+            return false;
+        }
+    }
+    for (const auto& entry : object.items()) {
+        bool known = false;
+        for (const auto* key : required) {
+            known = known || entry.key() == key;
+        }
+        for (const auto* key : optional) {
+            known = known || entry.key() == key;
+        }
+        if (!known) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool lower_hex(const std::string& text, std::size_t size) {
     if (text.size() != size) {
         return false;
@@ -391,10 +422,29 @@ Result<ReadyInfo> decode_v3_ready(const std::string& line) {
             return failure<ReadyInfo>();
         }
         const auto& payload = value.at("payload");
-        if (!exact_keys(payload,
-                        {"pack_id", "snapshot_date", "document_count",
-                         "retrieval_revision", "chunk_count", "model", "revision", "dimensions",
-                         "device", "index_ready", "embedding_ready"}) ||
+        // T19 schema-3 identity: `backend` and `precision` are optional
+        // extra keys. The index builder only writes them when the pack
+        // carries embedding identity, so a pack without them is still
+        // valid. Mirror hybrid_retriever.py: the pair is all-or-nothing
+        // and each half must be a non-empty string, which is what makes
+        // a half-updated pack detectable instead of silently accepted.
+        const bool names_backend = payload.is_object() &&
+                                   payload.contains("backend");
+        const bool names_precision = payload.is_object() &&
+                                     payload.contains("precision");
+        const bool identity_is_valid =
+            names_backend == names_precision &&
+            (!names_backend ||
+             (payload.at("backend").is_string() &&
+              !payload.at("backend").get_ref<const std::string&>().empty() &&
+              payload.at("precision").is_string() &&
+              !payload.at("precision").get_ref<const std::string&>().empty()));
+        if (!identity_is_valid ||
+            !keys_within(payload,
+                         {"pack_id", "snapshot_date", "document_count",
+                          "retrieval_revision", "chunk_count", "model", "revision",
+                          "dimensions", "device", "index_ready", "embedding_ready"},
+                         {"backend", "precision"}) ||
             !payload.at("pack_id").is_string() ||
             !payload.at("retrieval_revision").is_string() ||
             !payload.at("snapshot_date").is_string() ||

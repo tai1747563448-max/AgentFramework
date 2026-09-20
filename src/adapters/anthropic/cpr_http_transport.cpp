@@ -16,7 +16,7 @@ namespace {
 Result<HttpResponse> perform(const HttpRequest& request,
                              const Cancellation* cancellation,
                              const HttpChunkObserver* observer) {
-    const auto cancelled = [&] { return cancellation && cancellation->requested(); };
+    const auto cancelled = [&] { return cancellation && cancellation->is_cancelled(); };
     const auto cancellation_error = [] {
         return Result<HttpResponse>::failure(
             {ErrorCode::Cancelled, "HTTP request cancelled", false});

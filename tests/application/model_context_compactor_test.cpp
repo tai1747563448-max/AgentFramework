@@ -9,7 +9,7 @@ namespace {
 class RecordingModel final : public agent::ModelClient {
 public:
     agent::ModelResponse response{{agent::TextBlock{"cumulative summary"}},
-                                  agent::StopReason::EndTurn, "end_turn"};
+                                  agent::StopReason::EndTurn};
     std::vector<agent::ModelRequest> requests;
     bool fail{false};
     bool throws{false};
@@ -76,7 +76,7 @@ TEST_CASE(compactor_sends_exact_prefix_as_one_untrusted_tool_free_request) {
 TEST_CASE(compactor_accepts_exact_utf8_byte_boundary_and_terminal_stop_sequence) {
     RecordingModel model;
     agent::ModelContextCompactor compactor(model, {6, 100});
-    model.response = {{agent::TextBlock{"中文"}}, agent::StopReason::StopSequence, "stop_sequence"};
+    model.response = {{agent::TextBlock{"中文"}}, agent::StopReason::StopSequence};
     auto request = input();
     request.previous_summary.clear();
     REQUIRE(compactor.compact(request).has_value());
@@ -85,23 +85,26 @@ TEST_CASE(compactor_accepts_exact_utf8_byte_boundary_and_terminal_stop_sequence)
 }
 
 TEST_CASE(compactor_rejects_every_invalid_response_without_echoing_provider_text) {
+    // T12: ModelResponse carries the canonical StopReason only, so the
+    // former "provider string disagrees with the canonical enum" row is
+    // no longer representable at this layer and lives in the stop-reason
+    // codec tests instead.
     const std::vector<agent::ModelResponse> responses{
-        {{}, agent::StopReason::EndTurn, "end_turn"},
-        {{agent::TextBlock{""}}, agent::StopReason::EndTurn, "end_turn"},
-        {{agent::TextBlock{" \t\r\n"}}, agent::StopReason::EndTurn, "end_turn"},
-        {{agent::TextBlock{"\xE2\x80\x83"}}, agent::StopReason::EndTurn, "end_turn"},
-        {{agent::TextBlock{"\xC0\xAF"}}, agent::StopReason::EndTurn, "end_turn"},
-        {{agent::TextBlock{"\xED\xA0\x80"}}, agent::StopReason::EndTurn, "end_turn"},
-        {{agent::TextBlock{"\xF4\x90\x80\x80"}}, agent::StopReason::EndTurn, "end_turn"},
-        {{agent::TextBlock{"\xE4\xB8"}}, agent::StopReason::EndTurn, "end_turn"},
-        {{agent::TextBlock{std::string("a\0b", 3)}}, agent::StopReason::EndTurn, "end_turn"},
-        {{agent::TextBlock{"provider-secret-body"}, agent::TextBlock{"second"}}, agent::StopReason::EndTurn, "end_turn"},
-        {{agent::ToolUseBlock{{"id", "tool", agent::Value::object({})}}}, agent::StopReason::EndTurn, "end_turn"},
-        {{agent::ToolResultBlock{{"id", "provider-secret-body", false}}}, agent::StopReason::EndTurn, "end_turn"},
-        {{agent::TextBlock{"provider-secret-body"}}, agent::StopReason::ToolUse, "tool_use"},
-        {{agent::TextBlock{"provider-secret-body"}}, agent::StopReason::MaxTokens, "max_tokens"},
-        {{agent::TextBlock{"provider-secret-body"}}, agent::StopReason::Unknown, "provider-secret-body"},
-        {{agent::TextBlock{"provider-secret-body"}}, agent::StopReason::EndTurn, "max_tokens"}};
+        {{}, agent::StopReason::EndTurn},
+        {{agent::TextBlock{""}}, agent::StopReason::EndTurn},
+        {{agent::TextBlock{" \t\r\n"}}, agent::StopReason::EndTurn},
+        {{agent::TextBlock{"\xE2\x80\x83"}}, agent::StopReason::EndTurn},
+        {{agent::TextBlock{"\xC0\xAF"}}, agent::StopReason::EndTurn},
+        {{agent::TextBlock{"\xED\xA0\x80"}}, agent::StopReason::EndTurn},
+        {{agent::TextBlock{"\xF4\x90\x80\x80"}}, agent::StopReason::EndTurn},
+        {{agent::TextBlock{"\xE4\xB8"}}, agent::StopReason::EndTurn},
+        {{agent::TextBlock{std::string("a\0b", 3)}}, agent::StopReason::EndTurn},
+        {{agent::TextBlock{"provider-secret-body"}, agent::TextBlock{"second"}}, agent::StopReason::EndTurn},
+        {{agent::ToolUseBlock{{"id", "tool", agent::Value::object({})}}}, agent::StopReason::EndTurn},
+        {{agent::ToolResultBlock{{"id", "provider-secret-body", false}}}, agent::StopReason::EndTurn},
+        {{agent::TextBlock{"provider-secret-body"}}, agent::StopReason::ToolUse},
+        {{agent::TextBlock{"provider-secret-body"}}, agent::StopReason::MaxTokens},
+        {{agent::TextBlock{"provider-secret-body"}}, agent::StopReason::Unknown}};
     for (const auto& response : responses) {
         RecordingModel model;
         model.response = response;

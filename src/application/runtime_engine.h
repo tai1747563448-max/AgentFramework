@@ -179,6 +179,53 @@ private:
                                 RuntimePresentationOptions presentation,
                                 bool dry_run = false);
 
+    // T06 (v2 §3): state-dispatched handlers. Each handler advances
+    // the task by exactly one step from its named starting state and
+    // is responsible for emitting the matching ContinueReason trace
+    // sample; the dispatcher in continue_task merely routes the
+    // current status to the right handler and propagates any fatal
+    // error. Splitting the loop this way keeps continue_task under
+    // 100 lines and makes the state machine readable in isolation —
+    // each handler can be unit-tested against a fabricated TaskState
+    // without spinning up the whole dispatcher.
+    RuntimeResult handle_created(
+        std::optional<TaskState>& state,
+        const std::string& task_id,
+        RuntimeProgressObserver& observer);
+
+    RuntimeResult handle_preparing_context(
+        std::optional<TaskState>& state,
+        const std::string& task_id,
+        std::int64_t started_at_ms,
+        RuntimeProgressObserver& observer);
+
+    // presentation is a mutable reference: a text_observer that
+    // throws is retired for the rest of the task (see the catch in
+    // the streaming bridge below), and that decision has to survive
+    // across loop iterations.
+    RuntimeResult handle_awaiting_model(
+        std::optional<TaskState>& state,
+        const std::string& task_id,
+        const std::string& system_prompt,
+        std::int64_t started_at_ms,
+        RuntimeProgressObserver& observer,
+        RuntimePresentationOptions& presentation,
+        bool dry_run);
+
+    RuntimeResult handle_awaiting_tool(
+        std::optional<TaskState>& state,
+        const std::string& task_id,
+        std::int64_t started_at_ms,
+        RuntimeProgressObserver& observer);
+
+    // T06: invariant_failure is shared across handlers because each
+    // one needs to surface "the state machine hit a shape it cannot
+    // recover from" with the same error code. Hoisting it from the
+    // original lambda avoids repeating the RuntimeError literal in
+    // every handler.
+    RuntimeResult invariant_failure(std::optional<TaskState>& state,
+                                    const char* message) const;
+
     ModelClient& model_;
     ToolGateway& tools_;
     KnowledgeProvider& knowledge_;

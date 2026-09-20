@@ -29,8 +29,15 @@ class WordTokenizer:
 
 
 class OfflineEmbedding:
+    # T19 schema-3 identity: backend_identity (model, revision, backend,
+    # precision, dimensions) is the gating tuple for index reuse. The
+    # fixture is offline (numpy-backed) so backend = "numpy" and
+    # precision = "float32" exactly match what SUPPORTED_BACKENDS and
+    # SUPPORTED_PRECISIONS whitelist.
     model = "BAAI/bge-m3"
     revision = "d" * 40
+    backend = "numpy"
+    precision = "float32"
     dimensions = 1024
     tokenizer = WordTokenizer()
 
@@ -68,6 +75,12 @@ def load_fixture(root):
             "chunk_count": 45_000,
             "model": backend.model,
             "revision": backend.revision,
+            # schema-3 identity: the index must round-trip through
+            # backend/precision so the verifier and reloader can
+            # refuse a release pack whose embedding backend does not
+            # match the offline fixture.
+            "backend": backend.backend,
+            "precision": backend.precision,
             "dimensions": backend.dimensions,
             "device": "cpu",
         },

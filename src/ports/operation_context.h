@@ -30,7 +30,7 @@ struct OperationContext {
         std::chrono::steady_clock::time_point::max()};
 
     bool cancelled() const noexcept {
-        return (cancellation && cancellation->requested()) ||
+        return (cancellation && cancellation->is_cancelled()) ||
                expired();
     }
     bool expired() const noexcept {

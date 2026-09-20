@@ -20,8 +20,20 @@ function(expect_preflight_failure label expected)
         OUTPUT_VARIABLE output
         ERROR_VARIABLE error
         TIMEOUT 15)
-    if(result EQUAL 0 OR NOT "${output}${error}" MATCHES "${expected}")
+    if(result EQUAL 0)
         message(FATAL_ERROR "Knowledge Pack preflight accepted ${label}")
+    endif()
+    # PowerShell wraps its error text at the host console width, and it
+    # wraps mid-token: the literal "ValidateSet" comes back as
+    # "Validat\n  eSet" and a plain substring search never finds it. Strip
+    # whitespace from both sides so the contract is checked against the
+    # message rather than against one particular line wrapping.
+    string(REGEX REPLACE "[ \t\r\n]+" "" flattened "${output}${error}")
+    string(REGEX REPLACE "[ \t\r\n]+" "" needle "${expected}")
+    if(NOT flattened MATCHES "${needle}")
+        message(FATAL_ERROR
+            "Knowledge Pack preflight rejected ${label} for the wrong reason "
+            "(expected /${expected}/): ${flattened}")
     endif()
 endfunction()
 

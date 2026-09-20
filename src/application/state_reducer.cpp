@@ -118,6 +118,7 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                     state.pending_tool_calls.clear();
                     state.pending_tool_results.clear();
                     state.next_tool_index = 0;
+                    state.tool_dispatch_index = 0;
                     state.active_tool_call_id.reset();
                 }
                 state.accepted_model_stop_reason.reset();
@@ -228,6 +229,7 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                 if (!ordered_calls.empty()) {
                     state.pending_tool_calls = std::move(ordered_calls);
                     state.next_tool_index = 0;
+                    state.tool_dispatch_index = 0;
                     state.active_tool_call_id.reset();
                     state.pending_tool_results.clear();
                     state.status = TaskStatus::AwaitingTool;
@@ -245,23 +247,31 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                 state.status = TaskStatus::Failed;
                 return Result<void>::success();
             } else if constexpr (std::is_same_v<Payload, ToolCallStartedPayload>) {
-                // T01: allow batched ToolCallStarted so AwaitingTool can
-                // dispatch a window of concurrency-safe tools in parallel
-                // before any Succeeded arrives. The Started event matches
-                // the next pending slot past the already-started-but-not-
-                // yet-completed head; active_tool_call_id tracks the
-                // most-recent Started call (still useful as a recovery
-                // sentinel for the resume path).
-                const std::size_t started_count =
-                    state.next_tool_index + state.pending_tool_results.size();
+                // T01: ToolCallStarted targets `tool_dispatch_index`,
+                // the next slot nothing has been started for yet. It
+                // must be a separate counter from next_tool_index,
+                // which tracks completions: the batched window marks
+                // every concurrency-safe call of a window as started
+                // before the first of them succeeds, so dispatch runs
+                // ahead of completion inside a window. One-at-a-time
+                // dispatch keeps the two equal.
                 if (state.status != TaskStatus::AwaitingTool ||
-                    started_count >= state.pending_tool_calls.size() ||
+                    state.tool_dispatch_index >=
+                        state.pending_tool_calls.size() ||
                     !(typed_payload.call ==
-                      state.pending_tool_calls.at(started_count))) {
+                      state.pending_tool_calls.at(
+                          state.tool_dispatch_index))) {
                     return invalid_transition(
                         "tool call start does not match the next pending call");
                 }
-                state.active_tool_call_id = typed_payload.call.id;
+                // active_tool_call_id names the head of the not-yet-
+                // completed run, which is what the runtime's resume
+                // path re-executes. Starting a later slot of the same
+                // window must therefore leave it alone.
+                if (state.tool_dispatch_index == state.next_tool_index) {
+                    state.active_tool_call_id = typed_payload.call.id;
+                }
+                ++state.tool_dispatch_index;
                 ++state.usage.tool_calls;
                 return Result<void>::success();
             } else if constexpr (std::is_same_v<Payload, ToolCallSucceededPayload>) {
@@ -274,8 +284,16 @@ Result<void> apply_payload(TaskState& state, const EventPayload& payload) {
                 }
                 state.pending_tool_results.push_back(typed_payload.result);
                 ++state.next_tool_index;
-                if (state.next_tool_index <
-                    state.pending_tool_calls.size()) {
+                // T01: the new head is re-executable only when its
+                // ToolCallStarted is already durable (a sibling of the
+                // same batched window that has not been reached yet)
+                // and the tool budget still allows another dispatch.
+                // Otherwise active_tool_call_id stays empty so
+                // AwaitingTool either closes the round or emits the
+                // max_tool_calls terminal instead of launching work the
+                // budget no longer covers.
+                if (state.tool_dispatch_index > state.next_tool_index &&
+                    state.usage.tool_calls < state.budgets.max_tool_calls) {
                     state.active_tool_call_id =
                         state.pending_tool_calls.at(state.next_tool_index).id;
                 } else {

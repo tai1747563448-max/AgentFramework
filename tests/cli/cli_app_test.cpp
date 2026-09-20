@@ -1326,11 +1326,11 @@ TEST_CASE(system_clock_and_random_ids_follow_public_formats) {
 TEST_CASE(signal_cancellation_observes_sigint_process_wide) {
     agent::SignalCancellation first;
     agent::SignalCancellation second;
-    REQUIRE(!first.requested());
-    REQUIRE(!second.requested());
+    REQUIRE(!first.is_cancelled());
+    REQUIRE(!second.is_cancelled());
 
     REQUIRE(std::raise(SIGINT) == 0);
 
-    REQUIRE(first.requested());
-    REQUIRE(second.requested());
+    REQUIRE(first.is_cancelled());
+    REQUIRE(second.is_cancelled());
 }

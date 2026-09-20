@@ -68,7 +68,16 @@ struct TaskState {
     std::vector<Message> messages;
     EvidencePack evidence;
     std::vector<ToolCall> pending_tool_calls;
+    // Index of the next pending call to complete. Every
+    // Succeeded / Failed payload advances it by one.
     std::size_t next_tool_index{0};
+    // Index of the next pending call a ToolCallStarted may address.
+    // Batched dispatch marks a whole window of concurrency-safe
+    // calls as started before the first of them completes, so this
+    // counter runs ahead of next_tool_index inside a window and they
+    // re-converge once the window's completions are all durable.
+    // Reset alongside next_tool_index at every round boundary.
+    std::size_t tool_dispatch_index{0};
     std::optional<std::string> active_tool_call_id;
     std::vector<ToolResult> pending_tool_results;
     std::optional<std::string> final_text;
@@ -172,6 +181,7 @@ inline bool operator==(const TaskState& left, const TaskState& right) {
            left.evidence == right.evidence &&
            left.pending_tool_calls == right.pending_tool_calls &&
            left.next_tool_index == right.next_tool_index &&
+           left.tool_dispatch_index == right.tool_dispatch_index &&
            left.active_tool_call_id == right.active_tool_call_id &&
            left.pending_tool_results == right.pending_tool_results &&
            left.final_text == right.final_text && left.terminal_error == right.terminal_error &&

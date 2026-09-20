@@ -67,11 +67,11 @@ public:
     }
 
     static Result failure(RuntimeError error) {
-        return Result(false, std::move(error));
+        return Result(std::move(error));
     }
 
     bool has_value() const noexcept {
-        return has_value_;
+        return std::holds_alternative<std::monostate>(storage_);
     }
 
     void value() const {
@@ -84,23 +84,25 @@ public:
         if (has_value()) {
             throw std::logic_error("result does not contain an error");
         }
-        return *error_;
+        return std::get<RuntimeError>(storage_);
     }
 
     const RuntimeError& error() const {
         if (has_value()) {
             throw std::logic_error("result does not contain an error");
         }
-        return *error_;
+        return std::get<RuntimeError>(storage_);
     }
 
 private:
-    Result() = default;
-    Result(bool has_value, RuntimeError error)
-        : has_value_(has_value), error_(std::move(error)) {}
+    // Default state carries std::monostate to denote success; carrying
+    // a RuntimeError denotes failure. Single-field storage mirrors
+    // Result<T>'s std::variant<T, RuntimeError> so the two
+    // specialisations share the same mental model.
+    Result() : storage_(std::monostate{}) {}
+    explicit Result(RuntimeError error) : storage_(std::move(error)) {}
 
-    bool has_value_ = true;
-    std::optional<RuntimeError> error_;
+    std::variant<std::monostate, RuntimeError> storage_;
 };
 
 }  // namespace agent

@@ -22,7 +22,7 @@ SignalCancellation::SignalCancellation() {
     begin_turn();
 }
 
-bool SignalCancellation::requested() const noexcept {
+bool SignalCancellation::is_cancelled() const noexcept {
     return cancellation_requested.load(std::memory_order_relaxed);
 }
 
@@ -35,7 +35,7 @@ void SignalCancellation::end_turn() noexcept {
     std::signal(SIGINT, SIG_DFL);
 }
 
-void SignalCancellation::request_cancel() noexcept {
+void SignalCancellation::cancel() noexcept {
     cancellation_requested.store(true, std::memory_order_relaxed);
 }
 

@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <chrono>
 #include <future>
+#include <optional>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -170,6 +171,18 @@ std::string authoritative_no_match_text(const std::string& issue) {
            "adding the source.";
 }
 
+// T06 (v2 §3): trace every state-handler's reason. Hoisted out of
+// continue_task so each handler can call it directly without dragging
+// a lambda through its scope; the trace sink lives in a process
+// global so no captures are needed. Reason labels are best-effort:
+// when the runtime commits a state change the matching handler tags
+// it with the reason for that transition so the post-mortem trace
+// can replay "why did we cycle?".
+void push_reason(ContinueReason reason) {
+    emit_latency_sample(continue_reason_name(reason),
+                         "continue_reason");
+}
+
 }  // namespace
 
 RuntimeEngine::RuntimeEngine(ModelClient& model,
@@ -277,7 +290,7 @@ RuntimeResult RuntimeEngine::guard_external_call(
         return {state, std::nullopt};
     }
 
-    if (cancellation_.requested()) {
+    if (cancellation_.is_cancelled()) {
         const RuntimeError error{ErrorCode::Cancelled,
                                  "task cancellation requested", false};
         return append_event(
@@ -356,6 +369,828 @@ RuntimeResult RuntimeEngine::resume(
                          request.presentation);
 }
 
+RuntimeResult RuntimeEngine::invariant_failure(
+    std::optional<TaskState>& state,
+    const char* message) const {
+    return RuntimeResult{
+        state,
+        RuntimeError{ErrorCode::InvalidTransition, message, false}};
+}
+
+// T06 (v2 §3): state-dispatched handlers. Each advances the task by
+// one step from its named starting state, emits the matching
+// ContinueReason trace sample, and returns either the next-step
+// RuntimeResult or a fatal transition. The dispatcher in
+// continue_task below only routes by status and propagates errors;
+// it never reaches into a handler's internals.
+RuntimeResult RuntimeEngine::handle_created(
+    std::optional<TaskState>& state,
+    const std::string& task_id,
+    RuntimeProgressObserver& observer) {
+    auto transition = append_event(
+        state, task_id, ContextPreparationStartedPayload{}, observer);
+    if (transition.fatal_error.has_value()) {
+        return transition;
+    }
+    push_reason(ContinueReason::InitialCreate);
+    return {state, std::nullopt};
+}
+
+RuntimeResult RuntimeEngine::handle_preparing_context(
+    std::optional<TaskState>& state,
+    const std::string& task_id,
+    std::int64_t started_at_ms,
+    RuntimeProgressObserver& observer) {
+    auto transition =
+        guard_external_call(state, task_id, started_at_ms, observer);
+    if (transition.fatal_error.has_value() ||
+        is_terminal(state->status)) {
+        return transition;
+    }
+
+    // T0 latency trace hook: emit the submit sample the moment the
+    // turn's evidence retrieval is about to start. The task id is
+    // used as the request id so all four canonical samples line up.
+    emit_latency_sample(task_id, kStageSubmit);
+    // T2: build an OperationContext that combines the runtime
+    // cancellation token with a deadline derived from the task
+    // budget. The provider uses both to short-circuit long-running
+    // retrieval and stop spinning while the user already pressed
+    // Ctrl+C.
+    const OperationContext context{
+        &cancellation_,
+        std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(state->budgets.max_task_time_ms)};
+    auto evidence = knowledge_.retrieve(*state, context);
+    if (!evidence.has_value()) {
+        return append_event(
+            state, task_id,
+            ContextPreparationFailedPayload{evidence.error()},
+            observer);
+    }
+    if (!evidence_pack_is_valid(evidence.value())) {
+        return append_event(
+            state, task_id,
+            ContextPreparationFailedPayload{
+                {ErrorCode::ProtocolFailure,
+                 "knowledge provider returned invalid evidence",
+                 false}},
+            observer);
+    }
+
+    transition = append_event(
+        state, task_id,
+        ContextPreparedPayload{std::move(evidence.value())}, observer);
+    if (transition.fatal_error.has_value()) {
+        return transition;
+    }
+    push_reason(ContinueReason::ContextPrepared);
+    return {state, std::nullopt};
+}
+
+RuntimeResult RuntimeEngine::handle_awaiting_model(
+    std::optional<TaskState>& state,
+    const std::string& task_id,
+    const std::string& system_prompt,
+    std::int64_t started_at_ms,
+    RuntimeProgressObserver& observer,
+    RuntimePresentationOptions& presentation,
+    bool dry_run) {
+    if (state->evidence.authoritative_no_match) {
+        push_reason(ContinueReason::KnowledgeNoMatch);
+        return append_event(
+            state, task_id,
+            KnowledgeNoMatchPayload{
+                authoritative_no_match_text(state->issue)},
+            observer);
+    }
+    if (!state->model_call_in_flight &&
+        state->accepted_model_stop_reason.has_value()) {
+        switch (*state->accepted_model_stop_reason) {
+        case StopReason::EndTurn:
+        case StopReason::StopSequence:
+            if (state->messages.empty() ||
+                state->messages.back().role != Role::Assistant) {
+                return invariant_failure(
+                    state, "accepted terminal response is unavailable");
+            }
+            return append_event(
+                state, task_id,
+                TaskCompletedPayload{concatenate_text_blocks(
+                    state->messages.back().content)},
+                observer);
+        case StopReason::MaxTokens:
+            return append_event(
+                state, task_id,
+                TaskBudgetExceededPayload{
+                    "max_tokens",
+                    {ErrorCode::BudgetExceeded,
+                     "model output token budget exceeded", false}},
+                observer);
+        case StopReason::ToolUse:
+        case StopReason::Unknown:
+            return invariant_failure(
+                state, "accepted model response cannot be continued");
+        }
+    }
+
+    ModelRequest model_request;
+    if (state->model_call_in_flight) {
+        if (!state->last_model_request.has_value()) {
+            return invariant_failure(
+                state, "in-flight model request is unavailable");
+        }
+        auto transition = guard_external_call(
+            state, task_id, started_at_ms, observer);
+        if (transition.fatal_error.has_value() ||
+            is_terminal(state->status)) {
+            return transition;
+        }
+        model_request = *state->last_model_request;
+    } else {
+        auto transition = guard_external_call(
+            state, task_id, started_at_ms, observer,
+            "max_model_rounds", state->usage.model_rounds,
+            state->budgets.max_model_rounds);
+        if (transition.fatal_error.has_value() ||
+            is_terminal(state->status)) {
+            return transition;
+        }
+
+        transition = guard_external_call(
+            state, task_id, started_at_ms, observer);
+        if (transition.fatal_error.has_value() ||
+            is_terminal(state->status)) {
+            return transition;
+        }
+        auto definitions = tools_.definitions();
+        if (state->evidence.tool_use_forbidden) {
+            // Retrieved articles are untrusted data. A model may quote or
+            // summarize them, but it cannot turn their contents into an
+            // executable capability request.
+            definitions.clear();
+        }
+        if (dry_run) {
+            // T10: /plan mode. Strip tool definitions so the model
+            // is forced to respond with plain text. The user
+            // confirms the plan before the runtime is asked to
+            // execute anything.
+            definitions.clear();
+        }
+
+        model_request = ModelRequest{
+            system_prompt, state->messages, std::move(definitions),
+            state->budgets.model_timeout_ms, state->evidence};
+
+        transition = guard_external_call(
+            state, task_id, started_at_ms, observer,
+            "max_model_rounds", state->usage.model_rounds,
+            state->budgets.max_model_rounds);
+        if (transition.fatal_error.has_value() ||
+            is_terminal(state->status)) {
+            return transition;
+        }
+        transition = append_event(
+            state, task_id,
+            ModelCallStartedPayload{model_request}, observer);
+        if (transition.fatal_error.has_value()) {
+            return transition;
+        }
+    }
+
+    ModelCallOptions options;
+    options.stream = presentation.stream;
+    options.cancellation = &cancellation_;
+    // T0 latency trace: thread the task id into the cpr transport so
+    // the first_text_received and request_send samples can be matched
+    // with the submit and first_text_rendered samples of the same
+    // turn. The transport ignores the field when it is empty.
+    options.latency_request_id = task_id;
+    // Evidence-backed responses are released only by the caller after
+    // task completion and a successful session commit.
+    if (presentation.stream && presentation.text_observer &&
+        model_request.evidence.items.empty() &&
+        !model_request.evidence.tool_use_forbidden &&
+        !model_request.evidence.authoritative_no_match) {
+        const auto round = state->usage.model_rounds;
+        options.observer = [&, task_id, round](const ModelStreamEvent& event) {
+            if (!presentation.text_observer) return;
+            try {
+                presentation.text_observer({task_id, round, event});
+            } catch (...) {
+                // A presenter that throws (closed pipe, torn-down UI)
+                // is retired for the rest of the task rather than
+                // retried on every subsequent round. `presentation`
+                // outlives this handler for the whole continue_task
+                // call, so clearing the slot here is what makes the
+                // disable stick; the catch exists purely so a buggy
+                // observer cannot tear down the agent loop.
+                presentation.text_observer = nullptr;
+            }
+        };
+    }
+    auto response = model_.complete(model_request, options);
+    // A transport may report cancellation without sharing this flag;
+    // preserve its classification even if the wall budget also expired.
+    if (!response.has_value() && response.error().code == ErrorCode::Cancelled) {
+        return append_event(
+            state, task_id,
+            TaskCancelledPayload{"model request cancelled", response.error()},
+            observer);
+    }
+    auto after_model = guard_external_call(
+        state, task_id, started_at_ms, observer);
+    if (after_model.fatal_error.has_value() || is_terminal(state->status)) {
+        return after_model;
+    }
+    if (!response.has_value()) {
+        return append_event(
+            state, task_id,
+            ModelCallFailedPayload{response.error()}, observer);
+    }
+
+    const auto protocol_failure = [&](const char* message) {
+        return append_event(
+            state, task_id,
+            ModelCallFailedPayload{
+                {ErrorCode::ProtocolFailure, message, false}},
+            observer);
+    };
+    // T12 (v2 §3): provider-neutral stop reason check. The
+    // canonical enum is the only thing the runtime sees; the
+    // adapter is responsible for mapping its provider-specific
+    // string into this enum and rejecting mismatches before the
+    // response is ever returned to the runtime.
+    if (!is_known_stop_reason(response.value().stop_reason)) {
+        return protocol_failure(
+            "model returned an unknown stop reason");
+    }
+    if (!response_text_blocks_are_valid(response.value())) {
+        return protocol_failure(
+            "model response contains an empty text block");
+    }
+    if (!response_tool_uses_are_valid(response.value())) {
+        return protocol_failure(
+            "model response contains an invalid tool-use block");
+    }
+    if (contains_tool_result(response.value())) {
+        return protocol_failure(
+            "model response contains an invalid tool-result block");
+    }
+
+    const bool has_tool_call = contains_tool_call(response.value());
+    const auto final_text = concatenate_text(response.value());
+    if (has_tool_call && state->evidence.tool_use_forbidden) {
+        return protocol_failure(
+            "model tool use is forbidden while retrieval evidence is active");
+    }
+
+    switch (response.value().stop_reason) {
+    case StopReason::Unknown:
+        return protocol_failure(
+            "model returned an unknown stop reason");
+    case StopReason::ToolUse:
+        if (!has_tool_call) {
+            return protocol_failure(
+                "tool-use stop did not contain a tool-use block");
+        }
+        break;
+    case StopReason::EndTurn:
+    case StopReason::StopSequence:
+        if (has_tool_call || final_text.empty()) {
+            return protocol_failure(
+                "terminal text stop requires nonempty text and no tools");
+        }
+
+        break;
+    case StopReason::MaxTokens:
+        if (has_tool_call) {
+            return protocol_failure(
+                "max-tokens stop cannot contain tool-use blocks");
+        }
+
+        break;
+    }
+
+    // The last cancellation/time check is the response acceptance
+    // point. Cancellation after the durable success does not roll it back.
+    auto transition = guard_external_call(
+        state, task_id, started_at_ms, observer);
+    if (transition.fatal_error.has_value() || is_terminal(state->status)) {
+        return transition;
+    }
+    const auto stop_reason = response.value().stop_reason;
+    // T25: detect the model's CompactRequestBlock before moving
+    // the response into the event. Presence triggers the
+    // session-level reactive compact (chain runs at the next
+    // compaction point — typically right after the model call).
+    bool compact_requested = false;
+    for (const auto& block : response.value().content) {
+        if (std::holds_alternative<CompactRequestBlock>(block)) {
+            compact_requested = true;
+            break;
+        }
+    }
+    // T19: postModelCall hook (cost-tracker + future audit).
+    // The hook chain runs synchronously on the calling thread,
+    // after the model response has been durably recorded. The
+    // cost tracker uses this slot to append a usage.jsonl row
+    // without coupling the runtime to the sink.
+    //
+    // The model response is moved into the ModelCallSucceededPayload
+    // below, so the hook's reference must be captured BEFORE the
+    // move — otherwise response_ref would alias a moved-from
+    // ModelResponse whose input_tokens / output_tokens are zeroed,
+    // silently corrupting cost_tracker rows. We only allocate the
+    // local copy when a hook chain is actually attached, since the
+    // ModelResponse copy can be non-trivial.
+    std::optional<ModelResponse> response_ref;
+    if (hook_chain_) {
+        response_ref = response.value();
+    }
+    transition = append_event(
+        state, task_id,
+        ModelCallSucceededPayload{std::move(response.value())},
+        observer);
+    if (transition.fatal_error.has_value()) {
+        return transition;
+    }
+    if (hook_chain_) {
+        HookPostModelCall post{
+            state->session_link.has_value()
+                ? state->session_link->session_id
+                : std::string{},
+            task_id, &*response_ref, false};
+        hook_chain_->run_post_model_call(post);
+    }
+    // T24: pre-dispatch concurrency-safe tool calls. The streaming
+    // tool scheduler library is wired here so future
+    // protocol extensions can hand pre-computed futures to
+    // AwaitingTool without re-running the tools. Until then
+    // the scheduler runs in observation mode: it fires
+    // std::async for every concurrency-safe call and joins
+    // them immediately, leaving the AwaitingTool batched
+    // window to do its own dispatch. This keeps the cost
+    // overhead of the scheduler to zero on the hot path
+    // while exposing the parallelism window for the unit
+    // tests.
+    if (stop_reason == StopReason::ToolUse && !state->pending_tool_calls.empty()) {
+        ToolExecutionContext tool_context{state->workspace_utf8};
+        emit_latency_sample(task_id, "pre_dispatch_window");
+        (void)tool_context;
+    }
+    if (compact_requested && reactive_compact_trigger_) {
+        try {
+            reactive_compact_trigger_();
+        } catch (...) {
+            // Trigger callback must never break the runtime loop.
+        }
+    }
+    if (stop_reason == StopReason::EndTurn ||
+        stop_reason == StopReason::StopSequence) {
+        // T10: dry_run plans are reported to the caller through
+        // TaskCompletedPayload just like a real completion. The
+        // AwaitingTool path is unreachable because the plan never
+        // emits tool_use blocks (the model is instructed via the
+        // system prompt to write a plan instead of running tools).
+        return append_event(state, task_id,
+            TaskCompletedPayload{final_text}, observer);
+    }
+    if (stop_reason == StopReason::MaxTokens) {
+        push_reason(ContinueReason::BudgetExceeded);
+        return append_event(state, task_id,
+            TaskBudgetExceededPayload{
+                "max_tokens", {ErrorCode::BudgetExceeded,
+                "model output token budget exceeded", false}}, observer);
+    }
+    push_reason(ContinueReason::ModelResponseAccepted);
+    return {state, std::nullopt};
+}
+
+RuntimeResult RuntimeEngine::handle_awaiting_tool(
+    std::optional<TaskState>& state,
+    const std::string& task_id,
+    std::int64_t started_at_ms,
+    RuntimeProgressObserver& observer) {
+    if (!state->active_tool_call_id.has_value() &&
+        state->next_tool_index == state->pending_tool_calls.size()) {
+        auto transition = append_event(
+            state, task_id, ContextPreparationStartedPayload{},
+            observer);
+        if (transition.fatal_error.has_value()) {
+            return transition;
+        }
+        push_reason(ContinueReason::ToolsCompletedRound);
+        return {state, std::nullopt};
+    }
+
+    if (state->next_tool_index >=
+        state->pending_tool_calls.size()) {
+        return invariant_failure(
+            state, "awaiting tool state has no pending call");
+    }
+    // Recovery path: when active_tool_call_id is set, the
+    // reducer previously appended a ToolCallStarted but no
+    // matching Succeeded/Failed (resume from a partially
+    // dispatched call). Re-execute that single call before
+    // touching the batched window so the event log stays
+    // linear.
+    if (state->active_tool_call_id.has_value()) {
+        ToolCall call =
+            state->pending_tool_calls.at(state->next_tool_index);
+        if (*state->active_tool_call_id != call.id) {
+            return invariant_failure(
+                state, "active tool identity does not match pending call");
+        }
+        auto transition = guard_external_call(
+            state, task_id, started_at_ms, observer);
+        if (transition.fatal_error.has_value() ||
+            is_terminal(state->status)) {
+            return transition;
+        }
+        // T13: preToolUse hook chain. A deny causes an immediate
+        // failed result with denial_reason; a mutate rewrites
+        // the call before execute(). The chain runs synchronously
+        // on the calling thread so concurrent dispatch is safe.
+        if (hook_chain_) {
+            HookPreToolUse pre{
+                state->session_link.has_value()
+                    ? state->session_link->session_id
+                    : std::string{},
+                task_id, &call, false, {}};
+            hook_chain_->run_pre_tool_use(pre);
+            if (pre.denied) {
+                auto denied_result = ToolResult{
+                    call.id,
+                    std::string("hook denied: ") + pre.denial_reason,
+                    true};
+                return append_event(
+                    state, task_id,
+                    ToolCallSucceededPayload{
+                        std::move(denied_result)},
+                    observer);
+            }
+        }
+        // T11: permission check on the single-call recovery path
+        // mirrors the batched window below. Ask is treated as
+        // Deny until T15 wires the interactive confirm loop.
+        if (permission_) {
+            const auto decision = permission_->check(
+                call,
+                ToolExecutionContext{state->workspace_utf8});
+            if (decision != PermissionDecision::Allow) {
+                auto denied_result = ToolResult{
+                    call.id,
+                    decision == PermissionDecision::Deny
+                        ? std::string("permission denied")
+                        : std::string("permission required"),
+                    true};
+                return append_event(
+                    state, task_id,
+                    ToolCallSucceededPayload{
+                        std::move(denied_result)},
+                    observer);
+            }
+        }
+        // T21: dangerous-pattern gate. Runs after permission
+        // (so audit hooks still see the call) but before the
+        // gateway execute(), so a hit never reaches the host.
+        if (const auto* hit = match_dangerous_pattern(
+                call.name, call.arguments)) {
+            return append_event(
+                state, task_id,
+                TaskCancelledPayload{
+                    std::string("dangerous_pattern: ") + hit->id,
+                    {ErrorCode::InvalidTransition,
+                      "tool call matches dangerous_pattern rule",
+                      false}},
+                observer);
+        }
+        auto tool_result = tools_.execute(
+            call, ToolExecutionContext{state->workspace_utf8});
+        if (!tool_result.has_value()) {
+            return append_event(
+                state, task_id,
+                ToolCallFailedPayload{call.id, tool_result.error()},
+                observer);
+        }
+        if (tool_result.value().tool_call_id != call.id) {
+            return append_event(
+                state, task_id,
+                ToolCallFailedPayload{
+                    call.id,
+                    {ErrorCode::ProtocolFailure,
+                     "tool result ID does not match active tool call",
+                     false}},
+                observer);
+        }
+        // T13: postToolUse hook chain. Hooks may rewrite the
+        // result content; the mutated flag lets the reducer know
+        // to track the rewrite.
+        if (hook_chain_) {
+            HookPostToolUse post{
+                state->session_link.has_value()
+                    ? state->session_link->session_id
+                    : std::string{},
+                task_id, call,
+                &tool_result.value(), false};
+            hook_chain_->run_post_tool_use(post);
+        }
+        return append_event(
+            state, task_id,
+            ToolCallSucceededPayload{std::move(tool_result.value())},
+            observer);
+    }
+
+    // T01: batched dispatch window. A window only ever batches a
+    // contiguous run of concurrency-safe calls (those are the ones
+    // std::async can run in parallel); a call that is not
+    // concurrency-safe gets a window of its own. That keeps the
+    // durable log one-Started-then-one-completion for every mutating
+    // tool, so a crash inside a window can never leave several
+    // mutating Started events with no results to reconcile.
+    const std::size_t window_budget = std::max<std::size_t>(
+        1, state->budgets.max_parallel_tools);
+    const std::size_t remaining_calls =
+        state->pending_tool_calls.size() - state->next_tool_index;
+    const auto is_concurrency_safe = [&](std::size_t index) {
+        return tools_.tool_is_concurrency_safe(
+            state->pending_tool_calls.at(index).name);
+    };
+    std::size_t window_size = 1;
+    if (is_concurrency_safe(state->next_tool_index)) {
+        while (window_size < window_budget &&
+               window_size < remaining_calls &&
+               is_concurrency_safe(state->next_tool_index + window_size)) {
+            ++window_size;
+        }
+    }
+
+    // Cancellation and the wall-clock budget outrank the count
+    // budget. A user who already pressed Ctrl+C, or a task whose wall
+    // time ran out, must terminate with that verdict rather than
+    // being reclassified as max_tool_calls just because the next
+    // window would have overshot the tool count.
+    auto transition = guard_external_call(
+        state, task_id, started_at_ms, observer,
+        "max_tool_calls", state->usage.tool_calls,
+        state->budgets.max_tool_calls);
+    if (transition.fatal_error.has_value() ||
+        is_terminal(state->status)) {
+        return transition;
+    }
+    // The guard above proves usage.tool_calls < max_tool_calls, so a
+    // window that would overshoot the allowance is clamped rather
+    // than rejected: only the guard may emit the max_tool_calls
+    // terminal, because the reducer requires usage.tool_calls to have
+    // actually reached the limit for that payload. Whatever the clamp
+    // leaves undone is caught by the same guard on the next pass.
+    window_size = std::min(
+        window_size,
+        state->budgets.max_tool_calls - state->usage.tool_calls);
+
+    // Emit ToolCallStarted for every call in the window before
+    // any execute() runs. The reducer keeps its own dispatch
+    // cursor, so it accepts the whole batched window in order
+    // even though no call has completed yet.
+    for (std::size_t offset = 0; offset < window_size; ++offset) {
+        const ToolCall& call = state->pending_tool_calls.at(
+            state->next_tool_index + offset);
+        transition = append_event(
+            state, task_id, ToolCallStartedPayload{call}, observer);
+        if (transition.fatal_error.has_value()) {
+            return transition;
+        }
+    }
+
+    // T13: preToolUse hooks run synchronously on the calling
+    // thread, before partition, so a denied call never enters
+    // the dispatch pool. A mutate-rewrite is reflected in the
+    // local copy used by execute(). The hook chain is shared
+    // across the parallel and serial dispatch so the same hook
+    // sees every call in the window.
+    std::vector<bool> pre_denied(window_size, false);
+    std::vector<std::string> pre_denial_reason(window_size);
+    if (hook_chain_) {
+        const auto session_id =
+            state->session_link.has_value()
+                ? state->session_link->session_id
+                : std::string{};
+        for (std::size_t offset = 0; offset < window_size; ++offset) {
+            ToolCall& call =
+                state->pending_tool_calls.at(state->next_tool_index +
+                                             offset);
+            HookPreToolUse pre{session_id, task_id, &call, false, {}};
+            hook_chain_->run_pre_tool_use(pre);
+            if (pre.denied) {
+                pre_denied[offset] = true;
+                pre_denial_reason[offset] = pre.denial_reason;
+            }
+        }
+    }
+
+    // T21: dangerous-pattern scan. Runs after preToolUse (so
+    // audit hooks still observe every attempted call) but
+    // before any execute(). A hit cancels the task — the
+    // refusal is louder than a permission "deny" because the
+    // agent believes the model has been guided off-rails.
+    std::vector<bool> dangerous_hit(window_size, false);
+    std::vector<std::string> dangerous_reason(window_size);
+    for (std::size_t offset = 0; offset < window_size; ++offset) {
+        if (pre_denied[offset]) continue;
+        const ToolCall& call =
+            state->pending_tool_calls.at(state->next_tool_index +
+                                         offset);
+        if (const auto* hit = match_dangerous_pattern(
+                call.name, call.arguments)) {
+            dangerous_hit[offset] = true;
+            dangerous_reason[offset] = hit->id;
+        }
+    }
+    for (std::size_t offset = 0; offset < window_size; ++offset) {
+        if (!dangerous_hit[offset]) continue;
+        return append_event(
+            state, task_id,
+            TaskCancelledPayload{
+                std::string("dangerous_pattern: ") +
+                    dangerous_reason[offset],
+                {ErrorCode::InvalidTransition,
+                 "tool call matches dangerous_pattern rule",
+                 false}},
+            observer);
+    }
+
+    // T11: permission check, evaluated after the preToolUse
+    // hook chain so audit-logging hooks can still observe every
+    // attempted call. A Deny / Ask decision synthesises a failed
+    // ToolResult (same path as a hook denial) and never invokes
+    // the gateway. Ask is treated as Deny with reason
+    // "permission required" until the REPL wires an interactive
+    // confirm loop (T15). When permission_ is null the check is
+    // a no-op so existing tests / non-interactive callers keep
+    // their historical behaviour.
+    std::vector<bool> permission_denied(window_size, false);
+    std::vector<std::string> permission_reason(window_size);
+    // Partition the window: tools that opted into
+    // concurrency_safe run in parallel; everything else
+    // (replace_text / write_file and any future mutating tool)
+    // runs serially in next_tool_index order.
+    std::vector<std::optional<Result<ToolResult>>> results(window_size);
+    struct PendingFuture {
+        std::size_t offset;
+        std::future<Result<ToolResult>> future;
+    };
+    std::vector<PendingFuture> futures;
+    futures.reserve(window_size);
+    std::vector<std::size_t> serial_offsets;
+    serial_offsets.reserve(window_size);
+    const ToolExecutionContext tool_context{state->workspace_utf8};
+    if (permission_) {
+        for (std::size_t offset = 0; offset < window_size; ++offset) {
+            const ToolCall& call = state->pending_tool_calls.at(
+                state->next_tool_index + offset);
+            const auto decision = permission_->check(
+                call, tool_context);
+            if (decision != PermissionDecision::Allow) {
+                permission_denied[offset] = true;
+                permission_reason[offset] =
+                    decision == PermissionDecision::Deny
+                        ? "permission denied"
+                        : "permission required";
+            }
+        }
+    }
+    for (std::size_t offset = 0; offset < window_size; ++offset) {
+        if (pre_denied[offset]) continue;  // skip pre-denied
+        if (permission_denied[offset]) continue;  // skip permission-denied
+        const ToolCall& call = state->pending_tool_calls.at(
+            state->next_tool_index + offset);
+        if (tools_.tool_is_concurrency_safe(call.name)) {
+            futures.push_back(
+                {offset,
+                 std::async(std::launch::async,
+                            [&tools = tools_, call,
+                             tool_context] {
+                                return tools.execute(call,
+                                                      tool_context);
+                            })});
+        } else {
+            serial_offsets.push_back(offset);
+        }
+    }
+    // Collect the parallel futures. future::get blocks until
+    // each call's std::async task finishes; the std::async
+    // launch above already started them concurrently so wall
+    // time approximates max(individual durations) rather than
+    // their sum.
+    for (auto& pending : futures) {
+        try {
+            results[pending.offset] = pending.future.get();
+        } catch (...) {
+            results[pending.offset] = Result<ToolResult>::failure(
+                {ErrorCode::PersistenceFailure,
+                 "tool dispatch threw an exception", false});
+        }
+    }
+    // Run the serial tools in window order so a slow
+    // mutating tool still blocks before the next parallel
+    // batch starts.
+    for (const std::size_t offset : serial_offsets) {
+        const ToolCall& call = state->pending_tool_calls.at(
+            state->next_tool_index + offset);
+        results[offset] = tools_.execute(call, tool_context);
+    }
+    // Pre-denied slots: synthesise a failed result that flows
+    // through the same event-writing path as a real gateway
+    // failure.
+    for (std::size_t offset = 0; offset < window_size; ++offset) {
+        if (!pre_denied[offset]) continue;
+        const ToolCall& call = state->pending_tool_calls.at(
+            state->next_tool_index + offset);
+        ToolResult denied{call.id,
+                          std::string("hook denied: ") +
+                              pre_denial_reason[offset],
+                          true};
+        results[offset] = Result<ToolResult>::success(
+            std::move(denied));
+    }
+
+    // T11: permission-denied slots synthesise a result
+    // mirroring the hook-deny path. Both Deny and Ask funnel
+    // here until T15 introduces an interactive confirm loop.
+    for (std::size_t offset = 0; offset < window_size; ++offset) {
+        if (!permission_denied[offset]) continue;
+        const ToolCall& call = state->pending_tool_calls.at(
+            state->next_tool_index + offset);
+        ToolResult denied{call.id,
+                          permission_reason[offset],
+                          true};
+        results[offset] = Result<ToolResult>::success(
+            std::move(denied));
+    }
+
+    // Emit ToolCallSucceeded / ToolCallFailed in
+    // next_tool_index order so the reducer advances
+    // pending_tool_calls deterministically.
+    for (std::size_t offset = 0; offset < window_size; ++offset) {
+        const ToolCall& call = state->pending_tool_calls.at(
+            state->next_tool_index + offset);
+        auto& tool_result = results[offset];
+        if (!tool_result.has_value() || !tool_result->has_value()) {
+            transition = append_event(
+                state, task_id,
+                ToolCallFailedPayload{
+                    call.id,
+                    tool_result.has_value()
+                        ? tool_result->error()
+                        : RuntimeError{
+                              ErrorCode::PersistenceFailure,
+                              "tool dispatch produced no result",
+                              false}},
+                observer);
+        } else if (tool_result->value().tool_call_id != call.id) {
+            transition = append_event(
+                state, task_id,
+                ToolCallFailedPayload{
+                    call.id,
+                    {ErrorCode::ProtocolFailure,
+                     "tool result ID does not match active tool call",
+                     false}},
+                observer);
+        } else {
+            // T13: postToolUse hook chain rewrites may run after
+            // dispatch completes. Hooks may mutate the content
+            // (e.g. redacting secrets); the mutated flag is left
+            // as a future hook for the reducer to track the
+            // rewrite in trace samples.
+            if (hook_chain_) {
+                const auto session_id =
+                    state->session_link.has_value()
+                        ? state->session_link->session_id
+                        : std::string{};
+                HookPostToolUse post{session_id, task_id, call,
+                                     &tool_result->value(), false};
+                hook_chain_->run_post_tool_use(post);
+            }
+            transition = append_event(
+                state, task_id,
+                ToolCallSucceededPayload{
+                    std::move(tool_result->value())},
+                observer);
+        }
+        if (transition.fatal_error.has_value()) {
+            return transition;
+        }
+    }
+    push_reason(ContinueReason::AwaitingToolNext);
+    return {state, std::nullopt};
+}
+
+// T06 (v2 §3): dispatcher. The body is intentionally thin: it
+// routes the current status to a handler, propagates fatal errors
+// and terminal-state short-circuits, and loops until the reducer
+// lands the task in a terminal state. Any state-specific logic
+// belongs in the matching handler, not here.
 RuntimeResult RuntimeEngine::continue_task(
     std::optional<TaskState>& state,
     const std::string& system_prompt,
@@ -363,783 +1198,37 @@ RuntimeResult RuntimeEngine::continue_task(
     RuntimeProgressObserver& observer,
     RuntimePresentationOptions presentation,
     bool dry_run) {
-    const auto invariant_failure = [&](const char* message) {
-        return RuntimeResult{
-            state,
-            RuntimeError{ErrorCode::InvalidTransition, message, false}};
-    };
-
-    // T06: trace every loop iteration's reason. The label is best-
-    // effort: when the runtime commits a state change we tag it
-    // with the reason for that transition so the post-mortem trace
-    // can replay "why did we cycle?".
-    auto push_reason = [](ContinueReason reason) {
-        // Hook the trace sink only — the runtime does not need a
-        // structured reason log because the same information is
-        // already encoded in the durable event stream.
-        emit_latency_sample(continue_reason_name(reason),
-                             "continue_reason");
-    };
-
     while (!is_terminal(state->status)) {
         const std::string task_id = state->task_id;
-
-        if (state->status == TaskStatus::Created) {
-            auto transition = append_event(
-                state, task_id, ContextPreparationStartedPayload{}, observer);
-            if (transition.fatal_error.has_value()) {
-                return transition;
-            }
-            push_reason(ContinueReason::InitialCreate);
-            continue;
+        RuntimeResult step;
+        switch (state->status) {
+        case TaskStatus::Created:
+            step = handle_created(state, task_id, observer);
+            break;
+        case TaskStatus::PreparingContext:
+            step = handle_preparing_context(state, task_id, started_at_ms,
+                                            observer);
+            break;
+        case TaskStatus::AwaitingModel:
+            step = handle_awaiting_model(state, task_id, system_prompt,
+                                         started_at_ms, observer,
+                                         presentation, dry_run);
+            break;
+        case TaskStatus::AwaitingTool:
+            step = handle_awaiting_tool(state, task_id, started_at_ms,
+                                        observer);
+            break;
+        default:
+            return invariant_failure(
+                state, "runtime reached an unknown task state");
         }
-
-        if (state->status == TaskStatus::PreparingContext) {
-            auto transition =
-                guard_external_call(state, task_id, started_at_ms, observer);
-            if (transition.fatal_error.has_value() ||
-                is_terminal(state->status)) {
-                return transition;
-            }
-
-            // T0 latency trace hook: emit the submit sample the moment the
-            // turn's evidence retrieval is about to start. The task id is
-            // used as the request id so all four canonical samples line up.
-            emit_latency_sample(task_id, kStageSubmit);
-            // T2: build an OperationContext that combines the runtime
-            // cancellation token with a deadline derived from the task
-            // budget. The provider uses both to short-circuit long-running
-            // retrieval and stop spinning while the user already pressed
-            // Ctrl+C.
-            const OperationContext context{
-                &cancellation_,
-                std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(state->budgets.max_task_time_ms)};
-            auto evidence = knowledge_.retrieve(*state, context);
-            if (!evidence.has_value()) {
-                return append_event(
-                    state, task_id,
-                    ContextPreparationFailedPayload{evidence.error()},
-                    observer);
-            }
-            if (!evidence_pack_is_valid(evidence.value())) {
-                return append_event(
-                    state, task_id,
-                    ContextPreparationFailedPayload{
-                        {ErrorCode::ProtocolFailure,
-                         "knowledge provider returned invalid evidence",
-                         false}},
-                    observer);
-            }
-
-            transition = append_event(
-                state, task_id,
-                ContextPreparedPayload{std::move(evidence.value())}, observer);
-            if (transition.fatal_error.has_value()) {
-                return transition;
-            }
-            push_reason(ContinueReason::ContextPrepared);
-            continue;
+        if (step.fatal_error.has_value()) {
+            return step;
         }
-
-        if (state->status == TaskStatus::AwaitingModel) {
-            if (state->evidence.authoritative_no_match) {
-                push_reason(ContinueReason::KnowledgeNoMatch);
-                return append_event(
-                    state, task_id,
-                    KnowledgeNoMatchPayload{
-                        authoritative_no_match_text(state->issue)},
-                    observer);
-            }
-            if (!state->model_call_in_flight &&
-                state->accepted_model_stop_reason.has_value()) {
-                switch (*state->accepted_model_stop_reason) {
-                case StopReason::EndTurn:
-                case StopReason::StopSequence:
-                    if (state->messages.empty() ||
-                        state->messages.back().role != Role::Assistant) {
-                        return invariant_failure(
-                            "accepted terminal response is unavailable");
-                    }
-                    return append_event(
-                        state, task_id,
-                        TaskCompletedPayload{concatenate_text_blocks(
-                            state->messages.back().content)},
-                        observer);
-                case StopReason::MaxTokens:
-                    return append_event(
-                        state, task_id,
-                        TaskBudgetExceededPayload{
-                            "max_tokens",
-                            {ErrorCode::BudgetExceeded,
-                             "model output token budget exceeded", false}},
-                        observer);
-                case StopReason::ToolUse:
-                case StopReason::Unknown:
-                    return invariant_failure(
-                        "accepted model response cannot be continued");
-                }
-            }
-
-            ModelRequest model_request;
-            if (state->model_call_in_flight) {
-                if (!state->last_model_request.has_value()) {
-                    return invariant_failure(
-                        "in-flight model request is unavailable");
-                }
-                auto transition = guard_external_call(
-                    state, task_id, started_at_ms, observer);
-                if (transition.fatal_error.has_value() ||
-                    is_terminal(state->status)) {
-                    return transition;
-                }
-                model_request = *state->last_model_request;
-            } else {
-                auto transition = guard_external_call(
-                    state, task_id, started_at_ms, observer,
-                    "max_model_rounds", state->usage.model_rounds,
-                    state->budgets.max_model_rounds);
-                if (transition.fatal_error.has_value() ||
-                    is_terminal(state->status)) {
-                    return transition;
-                }
-
-                transition = guard_external_call(
-                    state, task_id, started_at_ms, observer);
-                if (transition.fatal_error.has_value() ||
-                    is_terminal(state->status)) {
-                    return transition;
-                }
-                auto definitions = tools_.definitions();
-                if (state->evidence.tool_use_forbidden) {
-                    // Retrieved articles are untrusted data. A model may quote or
-                    // summarize them, but it cannot turn their contents into an
-                    // executable capability request.
-                    definitions.clear();
-                }
-                if (dry_run) {
-                    // T10: /plan mode. Strip tool definitions so the model
-                    // is forced to respond with plain text. The user
-                    // confirms the plan before the runtime is asked to
-                    // execute anything.
-                    definitions.clear();
-                }
-
-                model_request = ModelRequest{
-                    system_prompt, state->messages, std::move(definitions),
-                    state->budgets.model_timeout_ms, state->evidence};
-
-                transition = guard_external_call(
-                    state, task_id, started_at_ms, observer,
-                    "max_model_rounds", state->usage.model_rounds,
-                    state->budgets.max_model_rounds);
-                if (transition.fatal_error.has_value() ||
-                    is_terminal(state->status)) {
-                    return transition;
-                }
-                transition = append_event(
-                    state, task_id,
-                    ModelCallStartedPayload{model_request}, observer);
-                if (transition.fatal_error.has_value()) {
-                    return transition;
-                }
-            }
-
-            ModelCallOptions options;
-            options.stream = presentation.stream;
-            options.cancellation = &cancellation_;
-            // T0 latency trace: thread the task id into the cpr transport so
-            // the first_text_received and request_send samples can be matched
-            // with the submit and first_text_rendered samples of the same
-            // turn. The transport ignores the field when it is empty.
-            options.latency_request_id = task_id;
-            // Evidence-backed responses are released only by the caller after
-            // task completion and a successful session commit.
-            if (presentation.stream && presentation.text_observer &&
-                model_request.evidence.items.empty() &&
-                !model_request.evidence.tool_use_forbidden &&
-                !model_request.evidence.authoritative_no_match) {
-                const auto round = state->usage.model_rounds;
-                options.observer = [&, task_id, round](const ModelStreamEvent& event) {
-                    if (!presentation.text_observer) return;
-                    try {
-                        presentation.text_observer({task_id, round, event});
-                    } catch (...) {
-                        presentation.text_observer = nullptr;
-                    }
-                };
-            }
-            auto response = model_.complete(model_request, options);
-            // A transport may report cancellation without sharing this flag;
-            // preserve its classification even if the wall budget also expired.
-            if (!response.has_value() && response.error().code == ErrorCode::Cancelled) {
-                return append_event(
-                    state, task_id,
-                    TaskCancelledPayload{"model request cancelled", response.error()},
-                    observer);
-            }
-            auto after_model = guard_external_call(
-                state, task_id, started_at_ms, observer);
-            if (after_model.fatal_error.has_value() || is_terminal(state->status)) {
-                return after_model;
-            }
-            if (!response.has_value()) {
-                return append_event(
-                    state, task_id,
-                    ModelCallFailedPayload{response.error()}, observer);
-            }
-
-            const auto protocol_failure = [&](const char* message) {
-                return append_event(
-                    state, task_id,
-                    ModelCallFailedPayload{
-                        {ErrorCode::ProtocolFailure, message, false}},
-                    observer);
-            };
-            // T12 (v2 §3): provider-neutral stop reason check. The
-            // canonical enum is the only thing the runtime sees; the
-            // adapter is responsible for mapping its provider-specific
-            // string into this enum and rejecting mismatches before the
-            // response is ever returned to the runtime.
-            if (!is_known_stop_reason(response.value().stop_reason)) {
-                return protocol_failure(
-                    "model returned an unknown stop reason");
-            }
-            if (!response_text_blocks_are_valid(response.value())) {
-                return protocol_failure(
-                    "model response contains an empty text block");
-            }
-            if (!response_tool_uses_are_valid(response.value())) {
-                return protocol_failure(
-                    "model response contains an invalid tool-use block");
-            }
-            if (contains_tool_result(response.value())) {
-                return protocol_failure(
-                    "model response contains an invalid tool-result block");
-            }
-
-            const bool has_tool_call = contains_tool_call(response.value());
-            const auto final_text = concatenate_text(response.value());
-            if (has_tool_call && state->evidence.tool_use_forbidden) {
-                return protocol_failure(
-                    "model tool use is forbidden while retrieval evidence is active");
-            }
-
-            switch (response.value().stop_reason) {
-            case StopReason::Unknown:
-                return protocol_failure(
-                    "model returned an unknown stop reason");
-            case StopReason::ToolUse:
-                if (!has_tool_call) {
-                    return protocol_failure(
-                        "tool-use stop did not contain a tool-use block");
-                }
-                break;
-            case StopReason::EndTurn:
-            case StopReason::StopSequence:
-                if (has_tool_call || final_text.empty()) {
-                    return protocol_failure(
-                        "terminal text stop requires nonempty text and no tools");
-                }
-
-                break;
-            case StopReason::MaxTokens:
-                if (has_tool_call) {
-                    return protocol_failure(
-                        "max-tokens stop cannot contain tool-use blocks");
-                }
-
-                break;
-            }
-
-            // The last cancellation/time check is the response acceptance
-            // point. Cancellation after the durable success does not roll it back.
-            auto transition = guard_external_call(
-                state, task_id, started_at_ms, observer);
-            if (transition.fatal_error.has_value() || is_terminal(state->status)) {
-                return transition;
-            }
-            const auto stop_reason = response.value().stop_reason;
-            // T25: detect the model's CompactRequestBlock before moving
-            // the response into the event. Presence triggers the
-            // session-level reactive compact (chain runs at the next
-            // compaction point — typically right after the model call).
-            bool compact_requested = false;
-            for (const auto& block : response.value().content) {
-                if (std::holds_alternative<CompactRequestBlock>(block)) {
-                    compact_requested = true;
-                    break;
-                }
-            }
-            transition = append_event(
-                state, task_id,
-                ModelCallSucceededPayload{std::move(response.value())},
-                observer);
-            if (transition.fatal_error.has_value()) {
-                return transition;
-            }
-            // T19: postModelCall hook (cost-tracker + future audit).
-            // The hook chain runs synchronously on the calling thread,
-            // after the model response has been durably recorded. The
-            // cost tracker uses this slot to append a usage.jsonl row
-            // without coupling the runtime to the sink.
-            if (hook_chain_) {
-                ModelResponse response_ref = state->last_model_request.has_value() &&
-                    state->accepted_model_stop_reason.has_value()
-                    ? response.value()
-                    : response.value();
-                HookPostModelCall post{
-                    state->session_link.has_value()
-                        ? state->session_link->session_id
-                        : std::string{},
-                    task_id, &response_ref, false};
-                hook_chain_->run_post_model_call(post);
-            }
-            // T24: pre-dispatch concurrency-safe tool calls. The streaming
-            // tool scheduler library is wired here so future
-            // protocol extensions can hand pre-computed futures to
-            // AwaitingTool without re-running the tools. Until then
-            // the scheduler runs in observation mode: it fires
-            // std::async for every concurrency-safe call and joins
-            // them immediately, leaving the AwaitingTool batched
-            // window to do its own dispatch. This keeps the cost
-            // overhead of the scheduler to zero on the hot path
-            // while exposing the parallelism window for the unit
-            // tests.
-            if (stop_reason == StopReason::ToolUse && !state->pending_tool_calls.empty()) {
-                ToolExecutionContext tool_context{state->workspace_utf8};
-                emit_latency_sample(task_id, "pre_dispatch_window");
-                (void)tool_context;
-            }
-            if (compact_requested && reactive_compact_trigger_) {
-                try {
-                    reactive_compact_trigger_();
-                } catch (...) {
-                    // Trigger callback must never break the runtime loop.
-                }
-            }
-            if (stop_reason == StopReason::EndTurn ||
-                stop_reason == StopReason::StopSequence) {
-                // T10: dry_run plans are reported to the caller through
-                // TaskCompletedPayload just like a real completion. The
-                // AwaitingTool path is unreachable because the plan never
-                // emits tool_use blocks (the model is instructed via the
-                // system prompt to write a plan instead of running tools).
-                return append_event(state, task_id,
-                    TaskCompletedPayload{final_text}, observer);
-            }
-            if (stop_reason == StopReason::MaxTokens) {
-                push_reason(ContinueReason::BudgetExceeded);
-                return append_event(state, task_id,
-                    TaskBudgetExceededPayload{
-                        "max_tokens", {ErrorCode::BudgetExceeded,
-                        "model output token budget exceeded", false}}, observer);
-            }
-            push_reason(ContinueReason::ModelResponseAccepted);
-            continue;
+        if (is_terminal(state->status)) {
+            return step;
         }
-
-        if (state->status == TaskStatus::AwaitingTool) {
-            if (!state->active_tool_call_id.has_value() &&
-                state->next_tool_index == state->pending_tool_calls.size()) {
-                auto transition = append_event(
-                    state, task_id, ContextPreparationStartedPayload{},
-                    observer);
-                if (transition.fatal_error.has_value()) {
-                    return transition;
-                }
-                push_reason(ContinueReason::ToolsCompletedRound);
-                continue;
-            }
-
-            if (state->next_tool_index >=
-                state->pending_tool_calls.size()) {
-                return invariant_failure(
-                    "awaiting tool state has no pending call");
-            }
-            // Recovery path: when active_tool_call_id is set, the
-            // reducer previously appended a ToolCallStarted but no
-            // matching Succeeded/Failed (resume from a partially
-            // dispatched call). Re-execute that single call before
-            // touching the batched window so the event log stays
-            // linear.
-            if (state->active_tool_call_id.has_value()) {
-                ToolCall call =
-                    state->pending_tool_calls.at(state->next_tool_index);
-                if (*state->active_tool_call_id != call.id) {
-                    return invariant_failure(
-                        "active tool identity does not match pending call");
-                }
-                auto transition = guard_external_call(
-                    state, task_id, started_at_ms, observer);
-                if (transition.fatal_error.has_value() ||
-                    is_terminal(state->status)) {
-                    return transition;
-                }
-                // T13: preToolUse hook chain. A deny causes an immediate
-                // failed result with denial_reason; a mutate rewrites
-                // the call before execute(). The chain runs synchronously
-                // on the calling thread so concurrent dispatch is safe.
-                if (hook_chain_) {
-                    HookPreToolUse pre{
-                        state->session_link.has_value()
-                            ? state->session_link->session_id
-                            : std::string{},
-                        task_id, &call, false, {}};
-                    hook_chain_->run_pre_tool_use(pre);
-                    if (pre.denied) {
-                        auto denied_result = ToolResult{
-                            call.id,
-                            std::string("hook denied: ") + pre.denial_reason,
-                            true};
-                        return append_event(
-                            state, task_id,
-                            ToolCallSucceededPayload{
-                                std::move(denied_result)},
-                            observer);
-                    }
-                }
-                // T11: permission check on the single-call recovery path
-                // mirrors the batched window below. Ask is treated as
-                // Deny until T15 wires the interactive confirm loop.
-                if (permission_) {
-                    const auto decision = permission_->check(
-                        call,
-                        ToolExecutionContext{state->workspace_utf8});
-                    if (decision != PermissionDecision::Allow) {
-                        auto denied_result = ToolResult{
-                            call.id,
-                            decision == PermissionDecision::Deny
-                                ? std::string("permission denied")
-                                : std::string("permission required"),
-                            true};
-                        return append_event(
-                            state, task_id,
-                            ToolCallSucceededPayload{
-                                std::move(denied_result)},
-                            observer);
-                    }
-                }
-                // T21: dangerous-pattern gate. Runs after permission
-                // (so audit hooks still see the call) but before the
-                // gateway execute(), so a hit never reaches the host.
-                if (const auto* hit = match_dangerous_pattern(
-                        call.name, call.arguments)) {
-                    return append_event(
-                        state, task_id,
-                        TaskCancelledPayload{
-                            std::string("dangerous_pattern: ") + hit->id,
-                            {ErrorCode::InvalidTransition,
-                              "tool call matches dangerous_pattern rule",
-                              false}},
-                        observer);
-                }
-                auto tool_result = tools_.execute(
-                    call, ToolExecutionContext{state->workspace_utf8});
-                if (!tool_result.has_value()) {
-                    return append_event(
-                        state, task_id,
-                        ToolCallFailedPayload{call.id, tool_result.error()},
-                        observer);
-                }
-                if (tool_result.value().tool_call_id != call.id) {
-                    return append_event(
-                        state, task_id,
-                        ToolCallFailedPayload{
-                            call.id,
-                            {ErrorCode::ProtocolFailure,
-                             "tool result ID does not match active tool call",
-                             false}},
-                        observer);
-                }
-                // T13: postToolUse hook chain. Hooks may rewrite the
-                // result content; the mutated flag lets the reducer know
-                // to track the rewrite.
-                if (hook_chain_) {
-                    HookPostToolUse post{
-                        state->session_link.has_value()
-                            ? state->session_link->session_id
-                            : std::string{},
-                        task_id, call,
-                        &tool_result.value(), false};
-                    hook_chain_->run_post_tool_use(post);
-                }
-                return append_event(
-                    state, task_id,
-                    ToolCallSucceededPayload{std::move(tool_result.value())},
-                    observer);
-            }
-
-            // T01: batched dispatch window. The window size is bounded by
-            // max_parallel_tools; concurrency-safe tools run via
-            // std::async inside the window while mutating tools run
-            // serially. Event order is preserved by emitting all
-            // ToolCallStarted before any execute() call and all
-            // Succeeded/Failed in next_tool_index order.
-            const std::size_t window_budget = std::max<std::size_t>(
-                1, state->budgets.max_parallel_tools);
-            const std::size_t remaining_calls =
-                state->pending_tool_calls.size() - state->next_tool_index;
-            const std::size_t window_size = std::min(window_budget, remaining_calls);
-            if (state->usage.tool_calls + window_size >
-                state->budgets.max_tool_calls) {
-                return append_event(
-                    state, task_id,
-                    TaskBudgetExceededPayload{
-                        "max_tool_calls",
-                        {ErrorCode::BudgetExceeded,
-                         "tool call budget exceeded", false}},
-                    observer);
-            }
-            auto transition = guard_external_call(
-                state, task_id, started_at_ms, observer,
-                "max_tool_calls", state->usage.tool_calls,
-                state->budgets.max_tool_calls);
-            if (transition.fatal_error.has_value() ||
-                is_terminal(state->status)) {
-                return transition;
-            }
-
-            // Emit ToolCallStarted for every call in the window before
-            // any execute() runs. The reducer accepts batched Started
-            // events as long as the call matches the next pending slot
-            // past any already-started-but-not-yet-completed head.
-            for (std::size_t offset = 0; offset < window_size; ++offset) {
-                const ToolCall& call = state->pending_tool_calls.at(
-                    state->next_tool_index + offset);
-                transition = append_event(
-                    state, task_id, ToolCallStartedPayload{call}, observer);
-                if (transition.fatal_error.has_value()) {
-                    return transition;
-                }
-            }
-
-            // T13: preToolUse hooks run synchronously on the calling
-            // thread, before partition, so a denied call never enters
-            // the dispatch pool. A mutate-rewrite is reflected in the
-            // local copy used by execute(). The hook chain is shared
-            // across the parallel and serial dispatch so the same hook
-            // sees every call in the window.
-            std::vector<bool> pre_denied(window_size, false);
-            std::vector<std::string> pre_denial_reason(window_size);
-            if (hook_chain_) {
-                const auto session_id =
-                    state->session_link.has_value()
-                        ? state->session_link->session_id
-                        : std::string{};
-                for (std::size_t offset = 0; offset < window_size; ++offset) {
-                    ToolCall& call =
-                        state->pending_tool_calls.at(state->next_tool_index +
-                                                     offset);
-                    HookPreToolUse pre{session_id, task_id, &call, false, {}};
-                    hook_chain_->run_pre_tool_use(pre);
-                    if (pre.denied) {
-                        pre_denied[offset] = true;
-                        pre_denial_reason[offset] = pre.denial_reason;
-                    }
-                }
-            }
-
-            // T21: dangerous-pattern scan. Runs after preToolUse (so
-            // audit hooks still observe every attempted call) but
-            // before any execute(). A hit cancels the task — the
-            // refusal is louder than a permission "deny" because the
-            // agent believes the model has been guided off-rails.
-            std::vector<bool> dangerous_hit(window_size, false);
-            std::vector<std::string> dangerous_reason(window_size);
-            for (std::size_t offset = 0; offset < window_size; ++offset) {
-                if (pre_denied[offset]) continue;
-                const ToolCall& call =
-                    state->pending_tool_calls.at(state->next_tool_index +
-                                                 offset);
-                if (const auto* hit = match_dangerous_pattern(
-                        call.name, call.arguments)) {
-                    dangerous_hit[offset] = true;
-                    dangerous_reason[offset] = hit->id;
-                }
-            }
-            for (std::size_t offset = 0; offset < window_size; ++offset) {
-                if (!dangerous_hit[offset]) continue;
-                return append_event(
-                    state, task_id,
-                    TaskCancelledPayload{
-                        std::string("dangerous_pattern: ") +
-                            dangerous_reason[offset],
-                        {ErrorCode::InvalidTransition,
-                         "tool call matches dangerous_pattern rule",
-                         false}},
-                    observer);
-            }
-
-            // T11: permission check, evaluated after the preToolUse
-            // hook chain so audit-logging hooks can still observe every
-            // attempted call. A Deny / Ask decision synthesises a failed
-            // ToolResult (same path as a hook denial) and never invokes
-            // the gateway. Ask is treated as Deny with reason
-            // "permission required" until the REPL wires an interactive
-            // confirm loop (T15). When permission_ is null the check is
-            // a no-op so existing tests / non-interactive callers keep
-            // their historical behaviour.
-            std::vector<bool> permission_denied(window_size, false);
-            std::vector<std::string> permission_reason(window_size);
-            // Partition the window: tools that opted into
-            // concurrency_safe run in parallel; everything else
-            // (replace_text / write_file and any future mutating tool)
-            // runs serially in next_tool_index order.
-            std::vector<std::optional<Result<ToolResult>>> results(window_size);
-            struct PendingFuture {
-                std::size_t offset;
-                std::future<Result<ToolResult>> future;
-            };
-            std::vector<PendingFuture> futures;
-            futures.reserve(window_size);
-            std::vector<std::size_t> serial_offsets;
-            serial_offsets.reserve(window_size);
-            const ToolExecutionContext tool_context{state->workspace_utf8};
-            if (permission_) {
-                for (std::size_t offset = 0; offset < window_size; ++offset) {
-                    const ToolCall& call = state->pending_tool_calls.at(
-                        state->next_tool_index + offset);
-                    const auto decision = permission_->check(
-                        call, tool_context);
-                    if (decision != PermissionDecision::Allow) {
-                        permission_denied[offset] = true;
-                        permission_reason[offset] =
-                            decision == PermissionDecision::Deny
-                                ? "permission denied"
-                                : "permission required";
-                    }
-                }
-            }
-            for (std::size_t offset = 0; offset < window_size; ++offset) {
-                if (pre_denied[offset]) continue;  // skip pre-denied
-                if (permission_denied[offset]) continue;  // skip permission-denied
-                const ToolCall& call = state->pending_tool_calls.at(
-                    state->next_tool_index + offset);
-                if (tools_.tool_is_concurrency_safe(call.name)) {
-                    futures.push_back(
-                        {offset,
-                         std::async(std::launch::async,
-                                    [&tools = tools_, call,
-                                     tool_context] {
-                                        return tools.execute(call,
-                                                              tool_context);
-                                    })});
-                } else {
-                    serial_offsets.push_back(offset);
-                }
-            }
-            // Collect the parallel futures. future::get blocks until
-            // each call's std::async task finishes; the std::async
-            // launch above already started them concurrently so wall
-            // time approximates max(individual durations) rather than
-            // their sum.
-            for (auto& pending : futures) {
-                try {
-                    results[pending.offset] = pending.future.get();
-                } catch (...) {
-                    results[pending.offset] = Result<ToolResult>::failure(
-                        {ErrorCode::PersistenceFailure,
-                         "tool dispatch threw an exception", false});
-                }
-            }
-            // Run the serial tools in window order so a slow
-            // mutating tool still blocks before the next parallel
-            // batch starts.
-            for (const std::size_t offset : serial_offsets) {
-                const ToolCall& call = state->pending_tool_calls.at(
-                    state->next_tool_index + offset);
-                results[offset] = tools_.execute(call, tool_context);
-            }
-            // Pre-denied slots: synthesise a failed result that flows
-            // through the same event-writing path as a real gateway
-            // failure.
-            for (std::size_t offset = 0; offset < window_size; ++offset) {
-                if (!pre_denied[offset]) continue;
-                const ToolCall& call = state->pending_tool_calls.at(
-                    state->next_tool_index + offset);
-                ToolResult denied{call.id,
-                                  std::string("hook denied: ") +
-                                      pre_denial_reason[offset],
-                                  true};
-                results[offset] = Result<ToolResult>::success(
-                    std::move(denied));
-            }
-
-            // T11: permission-denied slots synthesise a result
-            // mirroring the hook-deny path. Both Deny and Ask funnel
-            // here until T15 introduces an interactive confirm loop.
-            for (std::size_t offset = 0; offset < window_size; ++offset) {
-                if (!permission_denied[offset]) continue;
-                const ToolCall& call = state->pending_tool_calls.at(
-                    state->next_tool_index + offset);
-                ToolResult denied{call.id,
-                                  permission_reason[offset],
-                                  true};
-                results[offset] = Result<ToolResult>::success(
-                    std::move(denied));
-            }
-
-            // Emit ToolCallSucceeded / ToolCallFailed in
-            // next_tool_index order so the reducer advances
-            // pending_tool_calls deterministically.
-            for (std::size_t offset = 0; offset < window_size; ++offset) {
-                const ToolCall& call = state->pending_tool_calls.at(
-                    state->next_tool_index + offset);
-                auto& tool_result = results[offset];
-                if (!tool_result.has_value() || !tool_result->has_value()) {
-                    transition = append_event(
-                        state, task_id,
-                        ToolCallFailedPayload{
-                            call.id,
-                            tool_result.has_value()
-                                ? tool_result->error()
-                                : RuntimeError{
-                                      ErrorCode::PersistenceFailure,
-                                      "tool dispatch produced no result",
-                                      false}},
-                        observer);
-                } else if (tool_result->value().tool_call_id != call.id) {
-                    transition = append_event(
-                        state, task_id,
-                        ToolCallFailedPayload{
-                            call.id,
-                            {ErrorCode::ProtocolFailure,
-                             "tool result ID does not match active tool call",
-                             false}},
-                        observer);
-                } else {
-                    // T13: postToolUse hook chain rewrites may run after
-                    // dispatch completes. Hooks may mutate the content
-                    // (e.g. redacting secrets); the mutated flag is left
-                    // as a future hook for the reducer to track the
-                    // rewrite in trace samples.
-                    if (hook_chain_) {
-                        const auto session_id =
-                            state->session_link.has_value()
-                                ? state->session_link->session_id
-                                : std::string{};
-                        HookPostToolUse post{session_id, task_id, call,
-                                             &tool_result->value(), false};
-                        hook_chain_->run_post_tool_use(post);
-                    }
-                    transition = append_event(
-                        state, task_id,
-                        ToolCallSucceededPayload{
-                            std::move(tool_result->value())},
-                        observer);
-                }
-                if (transition.fatal_error.has_value()) {
-                    return transition;
-                }
-            }
-            push_reason(ContinueReason::AwaitingToolNext);
-            continue;
-        }
-
-        return invariant_failure("runtime reached an unknown task state");
     }
-
     return {state, std::nullopt};
 }
 

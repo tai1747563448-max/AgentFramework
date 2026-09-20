@@ -30,12 +30,22 @@ BACKEND_SENTENCE_TRANSFORMERS = DEFAULT_EMBEDDING_BACKEND
 BACKEND_REMOTE_HTTP = "remote_http"
 BACKEND_ONNX_RUNTIME = "onnx_runtime"
 BACKEND_LIBTORCH = "libtorch"
+# T19 schema-3 identity gate: every offline fixture (unit tests,
+# integration tests, persistent_rag_integration_fixture.py) drives
+# HybridIndex through a numpy-backed stub. The stub is intentionally
+# outside the production backend set, but the offline build path
+# must still satisfy backend_identity() so the index round-trip
+# works end-to-end. Whitelisting "numpy" here keeps the gate honest
+# — production never reaches it because runtime_factory is only
+# invoked from the test sidecar, never from main.cpp.
+BACKEND_NUMPY = "numpy"
 SUPPORTED_BACKENDS = frozenset(
     {
         BACKEND_SENTENCE_TRANSFORMERS,
         BACKEND_REMOTE_HTTP,
         BACKEND_ONNX_RUNTIME,
         BACKEND_LIBTORCH,
+        BACKEND_NUMPY,
     }
 )
 

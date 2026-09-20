@@ -17,6 +17,7 @@
 #include "ports/model_client.h"
 #include "ports/process_runner.h"
 #include "test_support.h"
+#include "util/retry_with_backoff.h"
 
 #include <nlohmann/json.hpp>
 
@@ -84,9 +85,8 @@ private:
 
 class FakeCancellation final : public agent::Cancellation {
 public:
-    bool requested() const noexcept override {
-        return false;
-    }
+    bool is_cancelled() const noexcept override { return false; }
+    void cancel() noexcept override {}
 };
 
 class PoisonedKnowledge final : public agent::KnowledgeProvider {
@@ -214,7 +214,7 @@ agent::RunRequest run_request(std::string issue,
 
 agent::ModelResponse text_response(std::string text) {
     return {{agent::TextBlock{std::move(text)}}, agent::StopReason::EndTurn,
-            "end_turn", 5, 3, "provider-request-integration"};
+            5, 3, "provider-request-integration"};
 }
 
 agent::ToolCall list_call(std::string id, std::string path) {
@@ -260,7 +260,7 @@ agent::ToolCall build_call(std::string id) {
 agent::ModelResponse tool_response(agent::ToolCall call,
                                    std::string request_id) {
     return {{agent::ToolUseBlock{std::move(call)}},
-            agent::StopReason::ToolUse, "tool_use", 5, 3,
+            agent::StopReason::ToolUse, 5, 3,
             std::move(request_id)};
 }
 
@@ -684,7 +684,11 @@ TEST_CASE(provider_secret_never_reaches_cli_events_or_errors) {
          "--issue", u8"验证秘密边界"});
 
     REQUIRE(code == agent::ExitCode::TaskFailed);
-    REQUIRE(http.post_calls == 1);
+    // T02 retries a retryable transport failure, so the credential is
+    // re-sent once per attempt. The count is not the point of this test
+    // (the secret boundary is), but it does prove the retry loop ran the
+    // real transport rather than short-circuiting before the request.
+    REQUIRE(http.post_calls == agent::BackoffPolicy{}.max_attempts);
     REQUIRE(http.received_expected_credential);
     REQUIRE(captured_result.has_value());
     REQUIRE(captured_result->state.has_value());

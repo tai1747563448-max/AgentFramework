@@ -22,6 +22,18 @@
 namespace agent {
 namespace {
 
+// Bounded wait handed to the maintenance scheduler at the two points where
+// the CLI must observe a settled memory store: right after the startup
+// catch-up, and on the way out.
+//
+// Maintenance runs on a background worker, so without a wait the REPL would
+// race it - a /forget typed at the first prompt could be applied before the
+// catch-up it was supposed to affect has committed, and the exit path would
+// drop the very request it just queued, meaning the final consolidation never
+// reaches the provider. Five seconds is long enough for one extraction call
+// against a responsive provider while still bounding how long the CLI blocks.
+constexpr std::chrono::milliseconds kMaintenanceDrainTimeout{5'000};
+
 std::string trim(std::string text) {
     const auto not_space = [](unsigned char character) {
         return std::isspace(character) == 0;
@@ -403,7 +415,12 @@ int InteractiveCli::run() {
         return exit_for_error(listed.error());
     }
     // Catch up all sessions; durable checkpoints prevent duplicate work.
+    // Wait for the queued catch-up before the first prompt: the user's first
+    // command has to see a memory store that already reflects the resumed
+    // turns, otherwise /forget can race a commit that is about to land.
     for (const auto& session : listed.value()) consolidate(session);
+    if (commands_.drain_for_exit && !listed.value().empty())
+        commands_.drain_for_exit(kMaintenanceDrainTimeout);
 
     SessionState current;
     if (listed.value().empty()) {
@@ -443,7 +460,7 @@ int InteractiveCli::run() {
             output_ << '\n';
             consolidate(current);
             if (commands_.drain_for_exit)
-                commands_.drain_for_exit(std::chrono::milliseconds(0));
+                commands_.drain_for_exit(kMaintenanceDrainTimeout);
             return ExitCode::Success;
         }
         line = trim(std::move(line));
@@ -453,7 +470,7 @@ int InteractiveCli::run() {
         if (line == "/exit") {
             consolidate(current);
             if (commands_.drain_for_exit)
-                commands_.drain_for_exit(std::chrono::milliseconds(0));
+                commands_.drain_for_exit(kMaintenanceDrainTimeout);
             return ExitCode::Success;
         }
         if (line == "/status") {

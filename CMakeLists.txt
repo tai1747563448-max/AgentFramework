@@ -4,6 +4,19 @@ project(AgentFramework VERSION 0.1.0 LANGUAGES CXX)
 find_package(Threads REQUIRED)
 find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
 
+# Python3 find_package has a habit of caching stale virtualenv paths
+# from earlier sessions (e.g. build/pytest-venv/Scripts/python.exe)
+# even when that venv no longer exists on disk, which then leaks into
+# AGENT_JSONL_PYTHON_EXECUTABLE and causes every reproc_jsonl_process
+# test to fail with "cannot start python". Fall back to whatever
+# `python` is on PATH when the cached executable does not actually
+# resolve — reproc's tests need a working interpreter to spawn.
+if(Python3_EXECUTABLE AND NOT EXISTS "${Python3_EXECUTABLE}")
+    find_program(Python3_EXECUTABLE python python3 python3.11 python3.10
+        PATHS ENV PATH
+        NO_DEFAULT_PATH)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -153,11 +166,21 @@ add_executable(agent src/main.cpp)
 target_link_libraries(agent PRIVATE agent_runtime)
 set_target_properties(agent PROPERTIES OUTPUT_NAME AgentFramework)
 if(WIN32)
+    # Copy the shared libraries the executable needs next to it, so the Ready
+    # package and the process tests can run AgentFramework.exe in place.
+    #
+    # Deliberately no -P helper script here. Passing the DLL list as a single
+    # `-DDLLS=a|b` argument forced CMake to quote that argument, and those
+    # embedded quotes made the nested `cmd /C "cd /D <dir> && ..."` that the
+    # Ninja generator appends to the link edge unparseable: the link rule
+    # failed with `'E:' is not recognized as an internal or external command`
+    # (exit 255) even though link.exe had already produced the executable.
+    # Handing the genex over as an expanded argument list keeps the generated
+    # command free of embedded quotes.
     add_custom_command(TARGET agent POST_BUILD
-        COMMAND ${CMAKE_COMMAND}
-            "-DDLLS=$<JOIN:$<TARGET_RUNTIME_DLLS:agent>,|>"
-            "-DTARGET_DIR=$<TARGET_FILE_DIR:agent>"
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_runtime_dlls.cmake"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_RUNTIME_DLLS:agent>" "$<TARGET_FILE_DIR:agent>"
+        COMMAND_EXPAND_LISTS
         VERBATIM)
 endif()
 if(MSVC)

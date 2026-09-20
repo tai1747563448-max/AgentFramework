@@ -9,10 +9,12 @@ namespace {
 
 class CountingCancellation final : public agent::Cancellation {
 public:
-    explicit CountingCancellation(bool requested) : requested_(requested) {}
-    bool requested() const noexcept override { return requested_; }
+    explicit CountingCancellation(bool is_cancelled)
+        : is_cancelled_(is_cancelled) {}
+    bool is_cancelled() const noexcept override { return is_cancelled_; }
+    void cancel() noexcept override {}
 private:
-    bool requested_;
+    bool is_cancelled_;
 };
 
 }  // namespace

@@ -219,7 +219,8 @@ TEST_CASE(verified_pack_lease_short_circuits_on_cancellation_mid_hash) {
 
     class TestCancellation final : public agent::Cancellation {
     public:
-        bool requested() const noexcept override { return flag_.load(); }
+        bool is_cancelled() const noexcept override { return flag_.load(); }
+        void cancel() noexcept override { flag_.store(true); }
         void fire() noexcept { flag_.store(true); }
     private:
         std::atomic<bool> flag_{false};

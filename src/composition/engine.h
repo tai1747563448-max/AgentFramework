@@ -39,6 +39,11 @@ class MemoryEngine;
 class HookChain;
 class Permission;
 class ModelClient;
+class SessionEngine;
+class SessionStore;
+class ContextCompactor;
+class Sandbox;
+class JsonlEventStore;
 
 struct EngineConfig {
     // Workspace the engine will operate in. Empty means the caller
@@ -52,6 +57,12 @@ struct EngineConfig {
     SessionContextSettings session_context;
     MemoryPolicyConfig memory_policy{1024, {}};
     RuntimeBudgets budgets;
+    // Fail-open MCP server list parsed by build_engine. Format:
+    //   "name1=/path/to/server1 args;name2=/path/to/server2"
+    // Empty disables MCP. Bootstrap failures are logged but never
+    // fail build_engine; the CLI must keep starting when an MCP
+    // server is misconfigured.
+    std::string mcp_servers;
 };
 
 class Engine {
@@ -63,11 +74,14 @@ public:
            std::unique_ptr<ModelClient> model,
            std::unique_ptr<ToolGateway> tools,
            std::unique_ptr<KnowledgeProvider> knowledge,
-           std::unique_ptr<EventStore> events,
+           std::unique_ptr<JsonlEventStore> events,
            std::unique_ptr<Clock> clock,
            std::unique_ptr<IdGenerator> ids,
            std::unique_ptr<Cancellation> cancellation,
-           std::unique_ptr<MemoryEngine> memory);
+           std::unique_ptr<MemoryEngine> memory,
+           std::unique_ptr<SessionStore> sessions,
+           std::unique_ptr<ContextCompactor> compactor,
+           std::unique_ptr<Sandbox> sandbox);
 
     ~Engine();
     Engine(const Engine&) = delete;
@@ -82,19 +96,28 @@ public:
                           bool use_memory = true);
 
     // resume replays a durable event log into the runtime. The
-    // events argument carries the persisted task history.
+    // events argument carries the persisted task history; the
+    // session_id parameter selects the workspace owner.
     RuntimeResult resume(const std::string& session_id,
                          const std::vector<RuntimeEvent>& events,
                          const std::string& fallback_system_prompt,
                          RuntimeProgressObserver observer = {});
 
-    // cancel triggers the shared Cancellation token. Subsequent
-    // ask / resume calls observe cancellation between external calls.
+    // cancel flips the shared Cancellation token through the port.
+    // Subsequent ask / resume calls observe cancellation between
+    // external calls without any downcast.
     void cancel();
 
     const EngineConfig& config() const noexcept { return config_; }
 
 private:
+    // Lazily constructs session_engine_ on first ask/resume. The
+    // dependency chain (sessions_, compactor_, memory_) is owned by
+    // the Engine so the SessionEngine can borrow raw references
+    // without lifetime concerns; the Engine owns session_engine_ to
+    // keep the reference graph rooted here.
+    SessionEngine& ensure_session_engine();
+
     EngineConfig config_;
     std::unique_ptr<RuntimeEngine> runtime_;
     std::shared_ptr<HookChain> hook_chain_;
@@ -102,11 +125,28 @@ private:
     std::unique_ptr<ModelClient> model_;
     std::unique_ptr<ToolGateway> tools_;
     std::unique_ptr<KnowledgeProvider> knowledge_;
-    std::unique_ptr<EventStore> events_;
+    // Held as the concrete JsonlEventStore (not the EventStore port)
+    // because the SessionEngine load-task closure needs event_path()
+    // and read_task(), which are adapter-level methods. The runtime
+    // still consumes only the EventStore surface.
+    std::unique_ptr<JsonlEventStore> events_;
     std::unique_ptr<Clock> clock_;
     std::unique_ptr<IdGenerator> ids_;
     std::unique_ptr<Cancellation> cancellation_;
     std::unique_ptr<MemoryEngine> memory_;
+    // Sessions and compactor are owned so the SessionEngine has
+    // stable references for the Engine's lifetime; constructed in
+    // build_engine before the SessionEngine helper runs.
+    std::unique_ptr<SessionStore> sessions_;
+    std::unique_ptr<ContextCompactor> compactor_;
+    // Sandbox is held best-effort: the Engine facade advertises that
+    // a sandbox is available without yet forcing its use on every
+    // tool call (the tool gateway does not consume the Sandbox port
+    // today). Future T22 work will thread this through WorkspaceToolGateway.
+    std::unique_ptr<Sandbox> sandbox_;
+    // Lazily-constructed SessionEngine. Declared after the ports it
+    // borrows so destruction order keeps the references valid.
+    std::unique_ptr<SessionEngine> session_engine_;
 };
 
 // build_engine assembles the engine from the supplied config. The

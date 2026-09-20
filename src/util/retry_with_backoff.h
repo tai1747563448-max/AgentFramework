@@ -63,7 +63,7 @@ auto retry_with_backoff(const BackoffPolicy& policy,
             attempt_number >= policy.max_attempts) {
             return result;
         }
-        if (cancellation != nullptr && cancellation->requested()) {
+        if (cancellation != nullptr && cancellation->is_cancelled()) {
             return result;
         }
         const std::int64_t raw_ms =
